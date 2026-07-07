@@ -100,8 +100,14 @@ Labels are appended to `labels.csv`, so you can stop and continue later.
 uv run storeguard make-dataset --videos ~/store_videos --labels labels.csv --out data/clips
 ```
 
-This cuts every labeled segment into a small mp4 under
-`data/clips/<class>/` and prints a per-class count table.
+For every labeled segment this runs the YOLO person detector, follows the
+main (most-visible) person, and writes a small mp4 of letterboxed person
+crops — the same crop geometry the classifier sees in production — under
+`data/clips/<class>/`, printing a per-class count table at the end.
+
+> Note: the detector weights (`yolo11n.pt`) are downloaded automatically on
+> first use (needs internet once). Segments where no person is detected are
+> skipped with a warning.
 
 ### 2.3 Train (`train`)
 
@@ -179,9 +185,38 @@ The store PC is on the same LAN/WiFi as the cameras, so RTSP works there.
    cd C:\storeguard
    uv sync
    ```
+4. **If the PC has an NVIDIA GPU** — important: on Windows a plain
+   `uv sync` installs the **CPU-only** torch build, so CUDA would never be
+   used and `device: auto` would silently fall back to `cpu`. To get the
+   CUDA build, add this to the end of `pyproject.toml` on the store PC
+   (`cu126` suits most current NVIDIA drivers; see
+   <https://pytorch.org/get-started/locally/> for other CUDA versions):
 
-**Linux**: same idea — `curl -LsSf https://astral.sh/uv/install.sh | sh`,
-copy the project to e.g. `/opt/storeguard`, then `uv sync`.
+   ```toml
+   [[tool.uv.index]]
+   name = "pytorch-cuda"
+   url = "https://download.pytorch.org/whl/cu126"
+   explicit = true
+
+   [tool.uv.sources]
+   torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+   torchvision = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+   ```
+
+   then run `uv sync` again and verify CUDA is actually picked up:
+
+   ```powershell
+   uv run python -c "import torch; print(torch.cuda.is_available())"
+   ```
+
+   It must print `True` — otherwise the GPU will sit idle while the CPU
+   struggles.
+
+**Linux**: same idea — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+(this installs `uv` into `~/.local/bin` of the current user), copy the
+project to e.g. `/opt/storeguard`, then `uv sync`. For an NVIDIA GPU on
+Linux no extra step is needed — the default torch wheels already bundle
+CUDA.
 
 > Note: on the first `run`, ultralytics downloads `yolo11n.pt`
 > automatically (needs internet once). If the store PC is offline, copy your
@@ -200,6 +235,16 @@ rtsp://user:password@CAMERA_IP:554/Streaming/Channels/101
 - `102` = camera 1, substream (lower quality — lighter on CPU)
 - On an NVR, channels go `101`, `201`, `301`, … (`201` = camera 2 main
   stream, etc.)
+- **If the password contains special characters** (`@`, `/`, `:`, `?`, `#`,
+  `&`, `%` — common with Hikvision's forced strong passwords), they must be
+  **percent-encoded** in the URL: `@` → `%40`, `/` → `%2F`, `:` → `%3A`,
+  `?` → `%3F`, `#` → `%23`, `&` → `%26`, `%` → `%25`. E.g. the password
+  `Pa@ss/1` becomes `rtsp://admin:Pa%40ss%2F1@192.168.1.64:554/…`.
+  Alternatively set a camera password without such characters.
+- **A wrong URL fails silently**: after the one-time "Camera started"
+  banner the stream just retries forever and no detections or errors ever
+  appear — the system looks healthy while doing nothing. So always test
+  each URL first.
 
 Test a URL quickly with VLC (Media → Open Network Stream) on the store PC.
 
@@ -288,7 +333,12 @@ uv run storeguard run --config configs/storeguard.yaml
 
 ### 4.7 Autostart on Linux (systemd)
 
-Create `/etc/systemd/system/storeguard.service`:
+Create `/etc/systemd/system/storeguard.service`. Note that the
+`curl … astral.sh/uv/install.sh` installer from step 4.1 puts `uv` into
+`~/.local/bin` of the user who ran it (not `/usr/local/bin`), so the
+service must run as that user and `ExecStart` must use that user's `uv`
+path — check the exact location with `which uv`. With a user named
+`store`:
 
 ```ini
 [Unit]
@@ -297,8 +347,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# The user that installed uv (its copy lives in /home/store/.local/bin).
+User=store
 WorkingDirectory=/opt/storeguard
-ExecStart=/usr/local/bin/uv run storeguard run --config configs/storeguard.yaml
+ExecStart=/home/store/.local/bin/uv run storeguard run --config configs/storeguard.yaml
 Restart=always
 RestartSec=10
 
@@ -342,8 +394,11 @@ Each alert is a text message plus the saved mp4 clip of the event.
   `process_every: 2` or `3` in the config (process every 2nd–3rd frame).
   Using the camera substream (`…/Channels/102`) also reduces load.
 - **4+ cameras**, or if you need faster reaction: use an NVIDIA GPU
-  (e.g. **RTX 3050 or better**) and keep `device: auto` — CUDA will be
-  picked up automatically.
+  (e.g. **RTX 3050 or better**) and keep `device: auto`. On **Windows**
+  you must also install the CUDA torch build (see step 4.1 — a plain
+  `uv sync` installs CPU-only torch there and the GPU is silently ignored);
+  verify with
+  `uv run python -c "import torch; print(torch.cuda.is_available())"`.
 - RAM: 8 GB minimum, 16 GB comfortable.
 
 ## Legal note
@@ -394,7 +449,9 @@ storeguard train        --data data/clips --out models/action.pt [--epochs 30] [
    выполнить `uv sync`. Узнать у администратора IP и пароли камер; формат
    RTSP для Hikvision:
    `rtsp://user:password@IP:554/Streaming/Channels/101` (`102` — субпоток,
-   `201` — вторая камера регистратора). Нарисовать зоны каждой камеры
+   `201` — вторая камера регистратора). Спецсимволы в пароле (`@`, `/`,
+   `:`, `?`, `#`, `&`, `%`) нужно percent-кодировать (`@` → `%40` и т.д.) —
+   иначе поток молча не откроется. Нарисовать зоны каждой камеры
    (`storeguard draw-zones`; имена зон: `shelf…` — полки, `checkout` —
    касса, `exit` — выход, `register…` — денежный ящик), заполнить
    `configs/storeguard.yaml`, проверить с `--show`, затем запустить без
@@ -403,7 +460,8 @@ storeguard train        --data data/clips --out models/action.pt [--epochs 30] [
    chat_id через `getUpdates`, вписать в конфиг, `enabled: true`.
 6. **Железо:** 1–2 камеры — достаточно обычного CPU (`process_every: 2-3`,
    модель `yolo11n`); 4+ камер или быстрее реакция — нужна NVIDIA GPU
-   (например, RTX 3050+).
+   (например, RTX 3050+). На Windows обычный `uv sync` ставит CPU-версию
+   torch — для GPU нужно подключить CUDA-сборку (см. шаг 4.1).
 7. **Юридически:** повесить таблички о видеонаблюдении и письменно
    уведомить сотрудников — стандартная практика по закону о персональных
    данных.
