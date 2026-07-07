@@ -2,17 +2,23 @@
 
 Each worker wires together the full per-camera pipeline:
 
-    VideoStream -> frame skipping -> PersonTracker -> scenarios -> AlertSink
+    VideoStream -> frame skipping -> PersonTracker -> scenarios -> alert queue
 
 Every camera gets its own :class:`PersonTracker` (tracker state is
 per-stream) and its own clip buffers, while the trained
 :class:`ActionClassifier` is loaded once and shared by all cameras behind a
-lock.  ``run()`` blocks until all cameras finish (video files reach EOF) or
-the user presses Ctrl+C, then shuts everything down gracefully.
+lock.  Alert delivery (clip encoding + Telegram I/O, which can block for
+tens of seconds) runs on a dedicated background thread so the per-frame
+loops never stall, and in ``--show`` mode all cv2 windows are driven from
+the main thread (OpenCV HighGUI is not thread-safe; on macOS off-main-thread
+windows abort the process).  ``run()`` blocks until all cameras finish
+(video files reach EOF) or the user presses Ctrl+C, then shuts everything
+down gracefully.
 """
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import traceback
@@ -52,6 +58,31 @@ class _SharedActionModel:
         """Run ``ActionClassifier.predict`` under the shared lock."""
         with self._lock:
             return self._model.predict(clip)
+
+
+class _DisplayHub:
+    """Marshals preview frames from camera threads to the main thread.
+
+    OpenCV HighGUI is not thread-safe — on macOS creating or updating a
+    window off the main thread aborts the process — so camera workers only
+    *submit* their rendered frames here and the main loop in :func:`run`
+    displays them and pumps ``cv2.waitKey``.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frames: dict[str, np.ndarray] = {}
+
+    def submit(self, window: str, frame: np.ndarray) -> None:
+        """Store the latest rendered frame for ``window`` (worker threads)."""
+        with self._lock:
+            self._frames[window] = frame
+
+    def drain(self) -> dict[str, np.ndarray]:
+        """Return and clear all pending frames (main thread only)."""
+        with self._lock:
+            frames, self._frames = self._frames, {}
+            return frames
 
 
 _model_lock = threading.Lock()
@@ -193,11 +224,17 @@ def _draw_overlays(
 def _camera_worker(
     cam: CameraCfg,
     app: AppCfg,
-    sink: AlertSink,
+    alert_q: queue.Queue,
     stop: threading.Event,
-    show: bool,
+    display: _DisplayHub | None,
 ) -> None:
-    """Process one camera until EOF, stop signal or an unrecoverable error."""
+    """Process one camera until EOF, stop signal or an unrecoverable error.
+
+    Events are pushed onto ``alert_q`` (delivered by the background delivery
+    thread) and, when ``display`` is given, rendered preview frames are
+    submitted to it for the main thread to show — this loop never touches
+    cv2 windows or blocking alert I/O itself.
+    """
     stream = VideoStream(cam.source)
     tracker = PersonTracker(app.detector)
     scenarios = build_scenarios(cam, app)
@@ -207,6 +244,7 @@ def _camera_worker(
     every = max(1, app.process_every)
     is_file = stream.is_file
     fps = stream.fps
+    ring_fps = fps / every  # the ring holds only processed frames
     t0 = time.time()
     frame_idx = 0
     banner_text: str | None = None
@@ -252,33 +290,65 @@ def _camera_worker(
                 console.print(
                     f"[bold red]EVENT[/bold red] [{cam.name}] {ev.kind}: {ev.message}"
                 )
-                try:
-                    sink.handle(ev, list(ring))
-                except Exception:
-                    console.print(
-                        f"[red]Camera '{cam.name}': alert delivery error:[/red]\n"
-                        f"{traceback.format_exc()}"
-                    )
+                # Delivery (clip encoding + Telegram uploads) can block for
+                # tens of seconds; hand it to the delivery thread so this
+                # loop keeps reading frames in real time.
+                alert_q.put((ev, list(ring), ring_fps))
                 banner_text = f"{ev.kind.upper()}  track {ev.track_id}"
                 banner_until = time.monotonic() + _BANNER_SEC
 
-            if show:
+            if display is not None:
                 if time.monotonic() >= banner_until:
                     banner_text = None
-                cv2.imshow(window, _draw_overlays(frame, tracks, zones, banner_text))
-                if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                    console.print(
-                        f"[cyan]Camera '{cam.name}': 'q' pressed — stopping.[/cyan]"
-                    )
-                    break
+                display.submit(
+                    window, _draw_overlays(frame, tracks, zones, banner_text)
+                )
     finally:
         stream.release()
-        if show:
-            try:
-                cv2.destroyWindow(window)
-            except cv2.error:
-                pass
         console.print(f"[cyan]Camera '{cam.name}' stopped.[/cyan]")
+
+
+def _delivery_worker(sink: AlertSink, alert_q: queue.Queue) -> None:
+    """Deliver queued alerts off the camera threads.
+
+    Clip encoding and Telegram uploads may block for tens of seconds each;
+    running them here keeps the per-frame camera loops reading in real time.
+    Exits when the ``None`` sentinel is received.
+    """
+    while True:
+        item = alert_q.get()
+        if item is None:
+            return
+        event, frames, fps = item
+        try:
+            sink.handle(event, frames, fps=fps)
+        except Exception:
+            console.print(
+                f"[red]Alert delivery error ({event.camera}/{event.kind}):[/red]\n"
+                f"{traceback.format_exc()}"
+            )
+
+
+def _display_loop(
+    display: _DisplayHub, threads: list[threading.Thread], stop: threading.Event
+) -> None:
+    """Main-thread GUI pump: show worker frames until all cameras stop or 'q'.
+
+    All ``cv2.imshow``/``cv2.waitKey`` calls happen here, on the main
+    thread, because OpenCV HighGUI is not thread-safe.
+    """
+    shown = False
+    while any(t.is_alive() for t in threads):
+        for window, frame in display.drain().items():
+            cv2.imshow(window, frame)
+            shown = True
+        if shown:
+            if (cv2.waitKey(30) & 0xFF) == ord("q"):
+                console.print("[cyan]'q' pressed — stopping.[/cyan]")
+                stop.set()
+                return
+        else:
+            time.sleep(0.03)  # no window yet — waitKey needs one
 
 
 def run(cfg: AppCfg, show: bool = False) -> None:
@@ -286,13 +356,15 @@ def run(cfg: AppCfg, show: bool = False) -> None:
 
     Blocks until every camera finishes (video files reach EOF) or the user
     presses Ctrl+C; then all workers are signalled to stop, joined, and
-    their streams released.
+    their streams released.  Alert delivery runs on a background thread;
+    in ``show`` mode the main thread drives all preview windows.
 
     Args:
         cfg: Loaded application config (see :func:`storeguard.config.load_config`).
         show: Open a cv2 preview window per camera with overlays (boxes +
-            track ids, zone polygons, red banner on event).  Intended only
-            for local testing with video files.
+            track ids, zone polygons, red banner on event); pressing 'q' in
+            any window stops all cameras.  Intended only for local testing
+            with video files.
     """
     if not cfg.cameras:
         console.print("[red]No cameras configured — nothing to do.[/red]")
@@ -304,12 +376,21 @@ def run(cfg: AppCfg, show: bool = False) -> None:
         f"{'on' if cfg.telegram.enabled else 'off'})"
     )
     sink = AlertSink(cfg.telegram, cfg.events_dir)
+    alert_q: queue.Queue = queue.Queue()
+    delivery = threading.Thread(
+        target=_delivery_worker,
+        args=(sink, alert_q),
+        name="alert-delivery",
+        daemon=True,
+    )
+    delivery.start()
+    display = _DisplayHub() if show else None
     stop = threading.Event()
     threads: list[threading.Thread] = []
     for cam in cfg.cameras:
         thread = threading.Thread(
             target=_camera_worker,
-            args=(cam, cfg, sink, stop, show),
+            args=(cam, cfg, alert_q, stop, display),
             name=f"camera-{cam.name}",
             daemon=True,
         )
@@ -317,15 +398,25 @@ def run(cfg: AppCfg, show: bool = False) -> None:
         thread.start()
 
     try:
-        while any(t.is_alive() for t in threads):
-            for t in threads:
-                t.join(timeout=0.25)
+        if display is not None:
+            _display_loop(display, threads, stop)
+        else:
+            while any(t.is_alive() for t in threads):
+                for t in threads:
+                    t.join(timeout=0.25)
     except KeyboardInterrupt:
         console.print("\n[yellow]Ctrl+C — shutting down…[/yellow]")
     finally:
         stop.set()
         for t in threads:
             t.join(timeout=5.0)
+        alert_q.put(None)  # sentinel: flush pending deliveries, then exit
+        delivery.join(timeout=30.0)
+        if delivery.is_alive():
+            console.print(
+                "[yellow]Some alert deliveries were still in flight and were "
+                "abandoned.[/yellow]"
+            )
         if show:
             try:
                 cv2.destroyAllWindows()

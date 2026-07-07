@@ -44,7 +44,7 @@ class AlertSink:
     """
 
     min_gap_sec: ClassVar[float] = 10.0
-    clip_fps: ClassVar[float] = 10.0
+    clip_fps: ClassVar[float] = 10.0  # fallback when the caller passes no fps
 
     def __init__(self, telegram: TelegramCfg, events_dir: str) -> None:
         """Create the sink.
@@ -60,13 +60,19 @@ class AlertSink:
         self._last_sent: dict[tuple[str, str], float] = {}
         self._lock = threading.Lock()
 
-    def handle(self, event: Event, frames: list["np.ndarray"]) -> None:
+    def handle(
+        self, event: Event, frames: list["np.ndarray"], fps: float | None = None
+    ) -> None:
         """Log the event, save an evidence clip and notify Telegram.
 
         Args:
             event: The incident to deliver.
             frames: Recent BGR frames (ring-buffer content) for the evidence
                 clip; may be empty, in which case no clip is written.
+            fps: Real frame rate of ``frames`` (stream fps divided by the
+                runner's ``process_every``), so the saved clip plays at the
+                true speed of the recorded moment.  Falls back to
+                :attr:`clip_fps` when omitted or invalid.
         """
         with self._lock:
             key = (event.camera, event.kind)
@@ -76,7 +82,7 @@ class AlertSink:
             self._last_sent[key] = event.ts
 
         self._append_jsonl(event)
-        clip_path = self._write_clip(event, frames)
+        clip_path = self._write_clip(event, frames, fps)
         if self._telegram.enabled:
             self._send_telegram(event, clip_path)
 
@@ -100,8 +106,10 @@ class AlertSink:
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]AlertSink: failed to write events.jsonl: {exc}[/red]")
 
-    def _write_clip(self, event: Event, frames: list["np.ndarray"]) -> Path | None:
-        """Write the evidence mp4 and return its path (None if not written)."""
+    def _write_clip(
+        self, event: Event, frames: list["np.ndarray"], fps: float | None = None
+    ) -> Path | None:
+        """Write the evidence mp4 (at ``fps``) and return its path (None if not written)."""
         if not frames:
             return None
         try:
@@ -111,10 +119,11 @@ class AlertSink:
                 f"{_safe_name(event.camera)}_{event.kind}_{int(event.ts)}.mp4"
             )
             height, width = frames[0].shape[:2]
+            out_fps = fps if fps is not None and fps > 0 else self.clip_fps
             writer = cv2.VideoWriter(
                 str(path),
                 cv2.VideoWriter_fourcc(*"mp4v"),
-                self.clip_fps,
+                out_fps,
                 (width, height),
             )
             if not writer.isOpened():

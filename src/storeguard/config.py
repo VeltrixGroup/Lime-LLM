@@ -88,6 +88,12 @@ def load_config(path: str | Path) -> AppCfg:
         zones_path = Path(cam.zones_file)
         if not zones_path.is_absolute():
             zones_path = base_dir / zones_path
+        if not zones_path.is_file():
+            raise FileNotFoundError(
+                f"zones file '{zones_path}' for camera '{cam.name}' not found — "
+                f"draw the zones first: storeguard draw-zones "
+                f"--source <rtsp-url-or-video> --out {zones_path}"
+            )
         with zones_path.open("r", encoding="utf-8") as fh:
             zraw = yaml.safe_load(fh) or {}
         file_zones = [ZoneCfg.model_validate(z) for z in zraw.get("zones", [])]

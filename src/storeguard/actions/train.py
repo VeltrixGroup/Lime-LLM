@@ -31,7 +31,9 @@ def train_action(
 ) -> dict:
     """Fine-tune ``r3d_18`` on clips under ``data_dir`` and save the best model.
 
-    Uses a stratified train/val split, CrossEntropyLoss with inverse-frequency
+    Uses a group-aware stratified train/val split (clips cut from the same
+    source video never span train and val — see :func:`_stratified_split`),
+    CrossEntropyLoss with inverse-frequency
     class weights, AdamW and cosine LR annealing. After every epoch a metrics
     row is printed; the checkpoint with the best validation balanced accuracy
     (mean per-class recall) is written to ``out_path`` via
@@ -162,26 +164,60 @@ def train_action(
     return best
 
 
+def _source_stem(path: Path) -> str:
+    """Recover the source-video stem from a ``<stem>_<idx>.mp4`` clip name."""
+    stem = path.stem
+    base, sep, tail = stem.rpartition("_")
+    return base if sep and tail.isdigit() else stem
+
+
 def _stratified_split(
     samples: list[tuple[Path, int]], n_classes: int, val_split: float, seed: int
 ) -> tuple[list[int], list[int]]:
-    """Split sample indices per class; each class with >= 2 clips gets >= 1 val clip."""
-    by_class: dict[int, list[int]] = defaultdict(list)
-    for i, (_, label) in enumerate(samples):
-        by_class[label].append(i)
+    """Split sample indices per class, grouped by source video.
+
+    ``make_dataset`` cuts many near-duplicate clips (same person, clothing,
+    camera, lighting) out of each source recording, so clips from one source
+    video must never land on both sides of the split — otherwise validation
+    metrics are inflated by leakage.  Per class, whole source-video groups
+    are assigned to validation until roughly ``val_split`` of the class's
+    clips are held out (at least one group in val and one in train when the
+    class spans >= 2 source videos).  A class whose clips all come from a
+    single source video falls back to a clip-level split (>= 2 clips gets
+    >= 1 val clip); record more sessions to avoid the residual leakage there.
+    """
+    by_class: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for i, (path, label) in enumerate(samples):
+        by_class[label][_source_stem(path)].append(i)
     rng = random.Random(seed)
     train_idx: list[int] = []
     val_idx: list[int] = []
     for label in sorted(by_class):
-        indices = list(by_class[label])
-        rng.shuffle(indices)
-        if len(indices) >= 2:
-            n_val = int(round(len(indices) * val_split))
-            n_val = max(1, min(n_val, len(indices) - 1))
-        else:
+        groups = [by_class[label][stem] for stem in sorted(by_class[label])]
+        rng.shuffle(groups)
+        total = sum(len(g) for g in groups)
+        if len(groups) >= 2:
+            target = max(1, int(round(total * val_split)))
             n_val = 0
-        val_idx.extend(indices[:n_val])
-        train_idx.extend(indices[n_val:])
+            n_val_groups = 0
+            for group in groups[:-1]:  # always keep >= 1 group for train
+                if n_val >= target:
+                    break
+                val_idx.extend(group)
+                n_val += len(group)
+                n_val_groups += 1
+            for group in groups[n_val_groups:]:
+                train_idx.extend(group)
+        else:
+            indices = list(groups[0])
+            rng.shuffle(indices)
+            if len(indices) >= 2:
+                n_val = int(round(len(indices) * val_split))
+                n_val = max(1, min(n_val, len(indices) - 1))
+            else:
+                n_val = 0
+            val_idx.extend(indices[:n_val])
+            train_idx.extend(indices[n_val:])
     return train_idx, val_idx
 
 

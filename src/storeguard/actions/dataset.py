@@ -1,4 +1,11 @@
-"""Training-data tooling: cut labeled segments into clips and load them for torch."""
+"""Training-data tooling: cut labeled segments into person-crop clips for torch.
+
+The action classifier is served on per-person letterboxed crops (see
+:class:`storeguard.actions.clipbuffer.ClipBuffer`), so the training clips
+written here are the same kind of crops: each labeled segment is run through
+the YOLO person detector/tracker and the dominant person's letterboxed crops
+are saved — never the full scene frame.
+"""
 
 from __future__ import annotations
 
@@ -15,21 +22,32 @@ from rich.console import Console
 from rich.table import Table
 from torch.utils.data import Dataset
 
+from storeguard.actions.clipbuffer import letterbox_person_crop
 from storeguard.actions.model import KINETICS_MEAN, KINETICS_STD
 
 VIDEO_EXTS = (".mp4", ".avi", ".mkv", ".mov")
+
+# Side length of the square person crops written by make_dataset. ClipDataset
+# resizes its input to `size + 16` (= 128 for the default 112) before
+# cropping, so writing at 128 avoids an extra resampling step.
+CROP_SIDE = 128
 
 _REQUIRED_CSV_FIELDS = ("video", "start_sec", "end_sec", "label")
 
 
 def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: float = 0.8) -> None:
-    """Cut labeled segments out of source videos into per-class clip folders.
+    """Cut labeled segments into per-class folders of person-crop clips.
 
     Reads CSV rows ``video,start_sec,end_sec,label`` (as written by the
-    ``storeguard annotate`` tool), cuts each segment from
-    ``videos_dir/<video>`` with OpenCV and writes
-    ``out_dir/<label>/<videostem>_<i>.mp4`` (mp4v codec, source fps capped
-    at 30). Segments shorter than ``min_len_sec`` are skipped. Prints a
+    ``storeguard annotate`` tool), decodes each segment from
+    ``videos_dir/<video>``, runs the YOLO person detector/tracker over it,
+    and writes the letterboxed crops of the dominant tracked person (the one
+    visible on the most frames) to ``out_dir/<label>/<videostem>_<i>.mp4``
+    (mp4v codec, source fps capped at 30).  The crops use the exact letterbox
+    geometry the classifier sees at inference time
+    (:func:`storeguard.actions.clipbuffer.letterbox_person_crop`), so
+    training and serving share one input distribution.  Segments shorter
+    than ``min_len_sec`` or with no tracked person are skipped.  Prints a
     per-class count table at the end.
 
     Args:
@@ -41,6 +59,14 @@ def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: fl
     console = Console()
     src_root = Path(videos_dir)
     out_root = Path(out_dir)
+
+    # Heavy import (ultralytics/torch) kept local: only the dataset-building
+    # path needs the detector. One tracker instance is reused for all
+    # segments; only per-segment track identities matter here.
+    from storeguard.config import DetectorCfg
+    from storeguard.detector import PersonTracker
+
+    tracker = PersonTracker(DetectorCfg())
 
     with open(labels_csv, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -85,9 +111,12 @@ def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: fl
         seg_index[stem] += 1
         out_path = out_root / label / f"{stem}_{idx}.mp4"
 
-        n_frames = _cut_segment(src, out_path, start, end)
+        n_frames = _cut_segment(src, out_path, start, end, tracker)
         if n_frames == 0:
-            console.print(f"[yellow]warning:[/] no frames decoded for {src} [{start:.2f}-{end:.2f}s]")
+            console.print(
+                f"[yellow]warning:[/] no tracked person / no frames decoded for "
+                f"{src} [{start:.2f}-{end:.2f}s]"
+            )
             skipped_bad += 1
             continue
         written[label] += 1
@@ -104,11 +133,18 @@ def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: fl
     )
 
 
-def _cut_segment(src: Path, out_path: Path, start_sec: float, end_sec: float) -> int:
-    """Write frames of ``src`` in ``[start_sec, end_sec)`` to ``out_path``.
+def _cut_segment(
+    src: Path, out_path: Path, start_sec: float, end_sec: float, tracker
+) -> int:
+    """Write letterboxed person crops of ``src`` in ``[start_sec, end_sec)``.
 
-    The output fps is the source fps capped at 30 (frames are subsampled so
-    the clip duration is preserved). Returns the number of frames written.
+    Frames are subsampled so the effective fps is the source fps capped at 30
+    (clip duration is preserved).  Every kept frame is run through the person
+    detector/tracker; the dominant track (seen on the most frames, ties
+    broken by accumulated box area) is taken as the acting person, and its
+    crops — cut with the same letterbox geometry the classifier sees at
+    inference (:func:`letterbox_person_crop`) — are written to ``out_path``.
+    Returns the number of frames written (0 when no person was tracked).
     """
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
@@ -124,26 +160,40 @@ def _cut_segment(src: Path, out_path: Path, start_sec: float, end_sec: float) ->
     end_frame = int(round(end_sec * fps))
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    writer: cv2.VideoWriter | None = None
-    n_written = 0
-    for rel in range(max(0, end_frame - start_frame)):
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            break
-        if rel % step != 0:
-            continue
-        if writer is None:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            h, w = frame.shape[:2]
-            writer = cv2.VideoWriter(
-                str(out_path), cv2.VideoWriter.fourcc(*"mp4v"), out_fps, (w, h)
-            )
-        writer.write(frame)
-        n_written += 1
+    crops: dict[int, list[np.ndarray]] = defaultdict(list)
+    areas: dict[int, float] = defaultdict(float)
+    try:
+        for rel in range(max(0, end_frame - start_frame)):
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            if rel % step != 0:
+                continue
+            for track in tracker.update(frame):
+                crop = letterbox_person_crop(frame, track.box, CROP_SIDE)
+                if crop is None:
+                    continue
+                crops[track.track_id].append(crop)
+                x1, y1, x2, y2 = track.box
+                areas[track.track_id] += (x2 - x1) * (y2 - y1)
+    finally:
+        cap.release()
 
-    if writer is not None:
+    if not crops:
+        return 0
+    actor = max(crops, key=lambda tid: (len(crops[tid]), areas[tid]))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(out_path), cv2.VideoWriter.fourcc(*"mp4v"), out_fps, (CROP_SIDE, CROP_SIDE)
+    )
+    n_written = 0
+    try:
+        for crop in crops[actor]:
+            writer.write(crop)
+            n_written += 1
+    finally:
         writer.release()
-    cap.release()
     if n_written == 0 and out_path.exists():
         out_path.unlink()
     return n_written
@@ -152,11 +202,14 @@ def _cut_segment(src: Path, out_path: Path, start_sec: float, end_sec: float) ->
 class ClipDataset(Dataset):
     """Loads ``root/<class>/*.mp4`` clips as normalized 3D-CNN input tensors.
 
-    Temporal sampling picks ``clip_len`` frame indices spread uniformly across
-    the clip (with random per-segment jitter when ``train=True``). Spatially,
-    frames are resized so the short side is ``size + 16``, then random-cropped
-    to ``size`` and randomly h-flipped for training, or center-cropped for
-    validation. Pixels are normalized with the Kinetics-400 mean/std.
+    Temporal sampling mimics the inference-time :class:`ClipBuffer` cadence:
+    a window of ``clip_len`` frames spaced ``frame_stride`` apart is sampled
+    from the clip (random position when ``train=True``, centered otherwise);
+    clips shorter than that window fall back to indices spread uniformly
+    across the whole clip. Spatially, frames are resized so the short side is
+    ``size + 16``, then random-cropped to ``size`` and randomly h-flipped for
+    training, or center-cropped for validation. Pixels are normalized with
+    the Kinetics-400 mean/std.
     """
 
     def __init__(
@@ -166,6 +219,7 @@ class ClipDataset(Dataset):
         clip_len: int = 16,
         size: int = 112,
         train: bool = True,
+        frame_stride: int = 2,
     ) -> None:
         """Index all clips under ``root``.
 
@@ -175,12 +229,16 @@ class ClipDataset(Dataset):
             clip_len: Number of frames sampled per clip.
             size: Output spatial side length in pixels.
             train: Enable training-time temporal jitter and spatial augmentation.
+            frame_stride: Distance (in clip frames) between sampled frames —
+                should match the effective inference sampling period
+                (``action.stride`` x ``process_every`` processed frames).
         """
         self.root = Path(root)
         self.classes: list[str] = list(classes)
         self.clip_len = clip_len
         self.size = size
         self.train = train
+        self.frame_stride = max(1, int(frame_stride))
         self.class_to_idx: dict[str, int] = {c: i for i, c in enumerate(self.classes)}
         self.samples: list[tuple[Path, int]] = []
         for label_idx, name in enumerate(self.classes):
@@ -231,11 +289,24 @@ class ClipDataset(Dataset):
         return tensor, label
 
     def _frame_indices(self, n_frames: int) -> list[int]:
-        """Pick ``clip_len`` indices across ``[0, n_frames)``.
+        """Pick ``clip_len`` indices matching the inference sampling cadence.
 
-        The range is split into ``clip_len`` equal segments; training samples a
-        random position inside each segment, validation takes segment centers.
+        At inference, :class:`ClipBuffer` collects ``clip_len`` crops at a
+        fixed frame period, so training samples a window of ``clip_len``
+        frames spaced ``frame_stride`` apart: at a random position for
+        training, centered for validation.  Clips shorter than the window
+        fall back to indices spread uniformly across the whole clip
+        (``clip_len`` equal segments; training samples a random position
+        inside each segment, validation takes segment centers).
         """
+        span = (self.clip_len - 1) * self.frame_stride + 1
+        if n_frames >= span:
+            if self.train:
+                start = random.randint(0, n_frames - span)
+            else:
+                start = (n_frames - span) // 2
+            return [start + k * self.frame_stride for k in range(self.clip_len)]
+
         edges = np.linspace(0.0, float(n_frames), self.clip_len + 1)
         indices: list[int] = []
         for k in range(self.clip_len):

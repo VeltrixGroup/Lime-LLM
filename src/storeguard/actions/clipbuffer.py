@@ -13,6 +13,47 @@ import cv2
 import numpy as np
 
 
+def letterbox_person_crop(
+    frame: np.ndarray, box: tuple[float, float, float, float], size: int
+) -> np.ndarray | None:
+    """Cut one square, letterboxed person crop out of a BGR frame.
+
+    The box is expanded by a 10% margin on each side, clamped to the frame,
+    letterbox-padded (black bars) to a centered square and resized to
+    ``size`` x ``size``.  This is the single crop geometry shared by
+    inference (:class:`ClipBuffer`) and dataset building
+    (:func:`storeguard.actions.dataset.make_dataset`), so the action
+    classifier trains and serves on the same input distribution.
+
+    Returns:
+        The square BGR uint8 crop, or ``None`` for degenerate boxes.
+    """
+    x1, y1, x2, y2 = box
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw <= 0 or bh <= 0:
+        return None
+    # Expand by a 10% margin on each side, then clamp to the frame.
+    mx = 0.10 * bw
+    my = 0.10 * bh
+    frame_h, frame_w = frame.shape[:2]
+    xa = max(0, int(math.floor(x1 - mx)))
+    ya = max(0, int(math.floor(y1 - my)))
+    xb = min(frame_w, int(math.ceil(x2 + mx)))
+    yb = min(frame_h, int(math.ceil(y2 + my)))
+    if xb - xa < 1 or yb - ya < 1:
+        return None
+    crop = frame[ya:yb, xa:xb]
+    # Letterbox-pad to a square, centered.
+    ch, cw = crop.shape[:2]
+    side = max(ch, cw)
+    canvas = np.zeros((side, side, 3), dtype=np.uint8)
+    top = (side - ch) // 2
+    left = (side - cw) // 2
+    canvas[top : top + ch, left : left + cw] = crop
+    return cv2.resize(canvas, (size, size), interpolation=cv2.INTER_AREA)
+
+
 class ClipBuffer:
     """Per-track rolling buffer of person crops for the action model.
 
@@ -93,29 +134,8 @@ class ClipBuffer:
         self, frame: np.ndarray, box: tuple[float, float, float, float]
     ) -> np.ndarray | None:
         """Cut, letterbox and resize one person crop; return RGB uint8 or None."""
-        x1, y1, x2, y2 = box
-        bw = x2 - x1
-        bh = y2 - y1
-        if bw <= 0 or bh <= 0:
+        crop = letterbox_person_crop(frame, box, self.size)
+        if crop is None:
             return None
-        # Expand by a 10% margin on each side, then clamp to the frame.
-        mx = 0.10 * bw
-        my = 0.10 * bh
-        frame_h, frame_w = frame.shape[:2]
-        xa = max(0, int(math.floor(x1 - mx)))
-        ya = max(0, int(math.floor(y1 - my)))
-        xb = min(frame_w, int(math.ceil(x2 + mx)))
-        yb = min(frame_h, int(math.ceil(y2 + my)))
-        if xb - xa < 1 or yb - ya < 1:
-            return None
-        crop = frame[ya:yb, xa:xb]
-        # Letterbox-pad to a square, centered.
-        ch, cw = crop.shape[:2]
-        side = max(ch, cw)
-        canvas = np.zeros((side, side, 3), dtype=np.uint8)
-        top = (side - ch) // 2
-        left = (side - cw) // 2
-        canvas[top : top + ch, left : left + cw] = crop
-        resized = cv2.resize(canvas, (self.size, self.size), interpolation=cv2.INTER_AREA)
         # BGR -> RGB.
-        return np.ascontiguousarray(resized[:, :, ::-1])
+        return np.ascontiguousarray(crop[:, :, ::-1])
