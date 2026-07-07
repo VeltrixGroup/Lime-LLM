@@ -1,0 +1,38 @@
+[project]
+name = "storeguard"
+version = "0.1.0"
+description = "Real-time retail video analytics: theft-related action detection on RTSP cameras (person tracking, zone control, concealment action recognition, POS cash control)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "ultralytics>=8.3",
+    "opencv-python>=4.10",
+    "numpy>=1.26",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "requests>=2.32",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+onnx = ["onnx>=1.16", "onnxruntime>=1.18"]
+
+[project.scripts]
+storeguard = "storeguard.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/storeguard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# storeguard artifacts (model weights, event clips, datasets, ultralytics runs)
+models/
+events/
+datasets/
+runs/
+*.pt
+
+# raw camera footage for training (never commit video)
+data/
+*.mp4
+*.avi
+*.mkv
+*.dav
+.claude
+.idea

@@ -1,0 +1,27 @@
+detector:
+  model: yolo11n.pt
+  conf: 0.35
+  imgsz: 640
+  device: auto
+action:
+  weights: models/action.pt
+  clip_len: 16
+  stride: 2
+  size: 112
+  classes: [normal, pocket, take_cash]
+  thresholds: {pocket: 0.75, take_cash: 0.80}
+telegram:
+  enabled: false
+  bot_token: ""
+  chat_id: ""
+events_dir: events
+process_every: 1
+cameras:
+  - name: hall-1
+    source: "rtsp://admin:PASSWORD@192.168.1.64:554/Streaming/Channels/101"
+    scenarios: [pocket, exit_no_pay]
+    zones_file: zones/hall-1.yaml
+  - name: cashier-1
+    source: "rtsp://admin:PASSWORD@192.168.1.65:554/Streaming/Channels/101"
+    scenarios: [cashier]
+    zones_file: zones/cashier-1.yaml
