@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -14,6 +13,7 @@ from storeguard.config import DetectorCfg
 from storeguard.dashboard.payment import PaymentStatusTracker
 from storeguard.detector import PersonTracker
 from storeguard.geometry import Zone
+from storeguard.stream import VideoStream
 from storeguard.types import Track
 
 # BGR colors
@@ -116,17 +116,17 @@ class SessionStats:
 
 
 class DetectionSession:
-    """One uploaded video + its detection worker.
+    """One video file or camera URL + its detection worker.
 
-    The worker thread reads frames, runs :class:`PersonTracker`, updates
-    paid / not-paid status from checkout zones, draws overlays and stores
-    the latest JPEG for the MJPEG stream endpoint.
+    The worker thread reads frames (file or RTSP), runs :class:`PersonTracker`,
+    updates paid / not-paid status from checkout zones, draws overlays and
+    stores the latest JPEG for the MJPEG stream endpoint.
     """
 
     def __init__(
         self,
         session_id: str,
-        video_path: Path,
+        source: str,
         filename: str,
         detector: DetectorCfg,
         process_every: int = 1,
@@ -135,11 +135,13 @@ class DetectionSession:
         checkout_dwell_sec: float = 2.0,
     ) -> None:
         self.id = session_id
-        self.video_path = video_path
+        self.source = source
         self.filename = filename
         self.detector_cfg = detector
         self.process_every = max(1, int(process_every))
-        self.loop = loop
+        self._is_url = source.lower().startswith(("rtsp://", "http://", "https://"))
+        # Live cameras never loop; files may.
+        self.loop = False if self._is_url else loop
         self._zones = list(zones or [])
         self._checkout_dwell_sec = checkout_dwell_sec
 
@@ -233,22 +235,16 @@ class DetectionSession:
                 self._stats.running = False
 
     def _play_once(self) -> bool:
-        """Decode the video once. Returns False if the file cannot be opened."""
-        cap = cv2.VideoCapture(str(self.video_path))
-        if not cap.isOpened():
-            with self._lock:
-                self._stats.error = f"could not open video: {self.video_path}"
-            cap.release()
-            return False
+        """Decode the source once (or until stop for live URLs)."""
+        stream = VideoStream(self.source)
+        is_file = stream.is_file and not self._is_url
+        src_fps = stream.fps
+        frame_delay = 1.0 / src_fps if is_file else 0.0
 
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        if not np.isfinite(src_fps) or src_fps <= 0:
-            src_fps = 25.0
-        frame_delay = 1.0 / src_fps
-
+        # Probe openness: try one read for live; for files VideoStream opens immediately.
+        # If the path is bad, first reads return None forever for files.
         with self._lock:
-            self._stats.total_frames = total
+            self._stats.total_frames = 0
             self._stats.frame = 0
 
         tracks: list[Track] = []
@@ -257,16 +253,27 @@ class DetectionSession:
         t_fps = time.monotonic()
         t0_wall = time.time()
         processed = 0
+        got_any = False
 
         try:
             while not self._stop.is_set():
                 t0 = time.monotonic()
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    break
+                frame = stream.read()
+                if frame is None:
+                    if is_file:
+                        # EOF
+                        break
+                    # Live stream down — wait for reconnect without ending session.
+                    if self._stop.wait(timeout=0.1):
+                        break
+                    continue
+
+                got_any = True
                 frame_idx += 1
-                # Media time so dwell accumulates at real clip speed.
-                ts = t0_wall + (frame_idx - 1) / src_fps
+                if is_file:
+                    ts = t0_wall + (frame_idx - 1) / src_fps
+                else:
+                    ts = time.time()
 
                 every = self.process_every
                 if (frame_idx - 1) % every == 0:
@@ -310,11 +317,16 @@ class DetectionSession:
                         self._stats.not_paid = len(tracks) - n_paid
                         self._frame_ready.notify_all()
 
-                elapsed = time.monotonic() - t0
-                sleep_for = frame_delay - elapsed
-                if sleep_for > 0:
-                    if self._stop.wait(timeout=sleep_for):
+                if is_file and frame_delay > 0:
+                    elapsed = time.monotonic() - t0
+                    sleep_for = frame_delay - elapsed
+                    if sleep_for > 0 and self._stop.wait(timeout=sleep_for):
                         break
         finally:
-            cap.release()
+            stream.release()
+
+        if not got_any:
+            with self._lock:
+                self._stats.error = f"could not open source: {self.source}"
+            return False
         return True
