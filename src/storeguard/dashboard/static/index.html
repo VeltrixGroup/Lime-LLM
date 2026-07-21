@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>storeguard — detection</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="top">
+        <h1 class="brand">storeguard</h1>
+        <p class="tagline">Person detection on your video</p>
+      </header>
+
+      <section class="stage" aria-label="Detection preview">
+        <div class="viewport" id="viewport">
+          <img id="stream" alt="Detection stream" hidden />
+          <div class="placeholder" id="placeholder">
+            <p>Put a clip in <code>data/</code>, pick it below, then Start.</p>
+          </div>
+          <div class="hud" id="hud" hidden>
+            <div class="hud-row">
+              <span id="stat-people">0 people</span>
+              <span id="stat-paid">0 paid</span>
+              <span id="stat-not-paid">0 not paid</span>
+              <span id="stat-fps">0 fps</span>
+              <span id="stat-frame">frame 0</span>
+            </div>
+            <ul class="hud-people" id="stat-people-list"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="controls" aria-label="Playback controls">
+        <label class="picker">
+          <span class="picker-label">From data/</span>
+          <select id="local-video">
+            <option value="">Scanning…</option>
+          </select>
+          <button type="button" id="btn-refresh" class="btn ghost" title="Rescan data/">
+            Refresh
+          </button>
+        </label>
+
+        <label class="file">
+          <input type="file" id="file" accept="video/*,.mp4,.avi,.mkv,.mov,.webm" />
+          <span id="file-label">Or upload</span>
+        </label>
+
+        <label class="every">
+          Every
+          <input type="range" id="every" min="1" max="8" value="1" />
+          <span id="every-val">1</span>
+          frame
+        </label>
+
+        <div class="actions">
+          <button type="button" id="btn-start" class="btn primary" disabled>Start</button>
+          <button type="button" id="btn-stop" class="btn" disabled>Stop</button>
+        </div>
+
+        <p class="status" id="status" role="status"></p>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

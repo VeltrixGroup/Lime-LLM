@@ -279,6 +279,14 @@ telegram:
   enabled: true
   bot_token: "123456789:AAF...your-token..."
   chat_id: "987654321"
+# HTTP webhook — POST JSON when someone exits without paying
+notify:
+  enabled: true
+  url: "https://api.yourstore.com/v1/storeguard/alerts"
+  kinds: [exit_no_pay]
+  headers:
+    Authorization: "Bearer YOUR_TOKEN"
+  timeout_sec: 10
 events_dir: events
 process_every: 2        # process every 2nd frame — good CPU relief
 cameras:
@@ -388,6 +396,39 @@ journalctl -u storeguard -f   # watch the logs
 
 Each alert is a text message plus the saved mp4 clip of the event.
 
+### Notification API (webhook)
+
+When ``exit_no_pay`` fires (shopper left via exit after shelf dwell without
+enough checkout time), storeguard can **POST JSON to your backend**:
+
+```yaml
+notify:
+  enabled: true
+  url: "https://api.yourstore.com/v1/storeguard/alerts"
+  kinds: [exit_no_pay]   # or [] for all event kinds
+  headers:
+    Authorization: "Bearer YOUR_TOKEN"
+```
+
+Example body:
+
+```json
+{
+  "kind": "exit_no_pay",
+  "camera": "hall-1",
+  "message": "[hall-1] Suspected unpaid exit: person #3 …",
+  "ts": 1700000000.0,
+  "iso_time": "2023-11-14T22:13:20+00:00",
+  "track_id": 3,
+  "score": 1.0,
+  "extra": {"shelf_dwell_sec": 4.2, "checkout_dwell_sec": 0.1},
+  "clip_path": "events/clips/hall-1_exit_no_pay_1700000000.mp4"
+}
+```
+
+Your API should accept ``POST`` with ``Content-Type: application/json`` and
+return 2xx. Failures are logged and never stop the camera pipeline.
+
 ## Hardware guidance
 
 - **1–2 cameras**: a modern desktop CPU is enough. Use `yolo11n.pt` and
@@ -413,10 +454,23 @@ management before going live.
 
 ```text
 storeguard run          --config configs/storeguard.yaml [--show]
+storeguard dashboard    [--host 127.0.0.1] [--port 8765] [--device auto] [--config …]
 storeguard draw-zones   --source <rtsp|video|image> --out configs/zones/cam1.yaml
 storeguard annotate     --videos <dir> --out labels.csv [--classes normal,pocket,take_cash]
 storeguard make-dataset --videos <dir> --labels labels.csv --out data/clips
 storeguard train        --data data/clips --out models/action.pt [--epochs 30] [--batch 8] [--lr 1e-4]
+```
+
+### Detection dashboard (local preview)
+
+Upload a video in the browser and watch YOLO person boxes + track ids — or
+drop files into ``data/`` and pick them from the dropdown:
+
+```bash
+mkdir -p data
+# copy your .mp4 into data/
+uv run storeguard dashboard
+# open http://127.0.0.1:8765 — select from data/, press Start
 ```
 
 ---

@@ -22,8 +22,10 @@ def letterbox_person_crop(
     letterbox-padded (black bars) to a centered square and resized to
     ``size`` x ``size``.  This is the single crop geometry shared by
     inference (:class:`ClipBuffer`) and dataset building
-    (:func:`storeguard.actions.dataset.make_dataset`), so the action
-    classifier trains and serves on the same input distribution.
+    (:func:`storeguard.actions.dataset.make_dataset`). Dataset clips are
+    written slightly larger (``size + 16``) so training can random-crop;
+    validation resizes the full letterbox to ``size`` with no inward crop,
+    matching what the classifier sees at serve time.
 
     Returns:
         The square BGR uint8 crop, or ``None`` for degenerate boxes.

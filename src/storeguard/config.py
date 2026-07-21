@@ -48,6 +48,24 @@ class TelegramCfg(BaseModel):
     chat_id: str = ""
 
 
+class NotifyCfg(BaseModel):
+    """HTTP webhook: POST JSON to your API when an event is detected.
+
+    Typical use: notify a store backend when ``exit_no_pay`` fires (shopper
+    left without visiting checkout). Set ``url`` to your endpoint; the body
+    is a JSON object with ``kind``, ``camera``, ``message``, ``ts``,
+    ``iso_time``, ``track_id``, ``score``, ``extra``, and optional
+    ``clip_path``.
+    """
+
+    enabled: bool = False
+    url: str = ""  # e.g. https://api.example.com/v1/storeguard/alerts
+    # Empty list = all event kinds. Default focuses on unpaid-exit alerts.
+    kinds: list[str] = Field(default_factory=lambda: ["exit_no_pay"])
+    headers: dict[str, str] = Field(default_factory=dict)
+    timeout_sec: float = 10.0
+
+
 class CameraCfg(BaseModel):
     """One camera: its stream source, active scenarios and zones."""
 
@@ -65,6 +83,7 @@ class AppCfg(BaseModel):
     detector: DetectorCfg = DetectorCfg()
     action: ActionCfg = ActionCfg()
     telegram: TelegramCfg = TelegramCfg()
+    notify: NotifyCfg = NotifyCfg()
     events_dir: str = "events"
     process_every: int = 1  # process every Nth frame (CPU relief)
 

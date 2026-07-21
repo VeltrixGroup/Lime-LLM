@@ -33,6 +33,20 @@ class PersonTracker:
         self.device = pick_device(cfg.device)
         self.model = YOLO(cfg.model)
 
+    def reset(self) -> None:
+        """Clear ByteTrack state so the next :meth:`update` starts fresh ids.
+
+        Call this between independent video segments (e.g. when building a
+        training dataset) so Kalman/track state from one clip cannot bleed
+        into the next.
+        """
+        predictor = getattr(self.model, "predictor", None)
+        if predictor is None:
+            return
+        for tracker in getattr(predictor, "trackers", []) or []:
+            if hasattr(tracker, "reset"):
+                tracker.reset()
+
     def update(self, frame: np.ndarray) -> list[Track]:
         """Detect and track persons on one BGR frame.
 

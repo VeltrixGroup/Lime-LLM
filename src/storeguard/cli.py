@@ -3,6 +3,7 @@
 Subcommands:
 
 * ``run`` — run the detection pipeline from a YAML config.
+* ``dashboard`` — local web UI to upload a video and watch person detection.
 * ``draw-zones`` — interactively draw polygon zones over a camera frame.
 * ``annotate`` — keyboard labeler producing a labels CSV from raw videos.
 * ``make-dataset`` — cut labeled segments into per-class training clips.
@@ -15,6 +16,7 @@ each subcommand handler so ``storeguard --help`` stays instant.
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from rich.console import Console
 
@@ -35,6 +37,61 @@ def _cmd_run(args: argparse.Namespace) -> None:
     from .runner import run  # heavy: torch + ultralytics
 
     run(cfg, show=args.show)
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard dashboard``."""
+    from .config import DetectorCfg, ZoneCfg, load_config
+    from .geometry import zones_from_cfg
+
+    detector = DetectorCfg(device=args.device)
+    zones = []
+    if args.config:
+        cfg = load_config(args.config)
+        detector = cfg.detector
+        if args.device != "auto":
+            detector = detector.model_copy(update={"device": args.device})
+        # Prefer the first camera that has zones (paid / not-paid needs checkout).
+        for cam in cfg.cameras:
+            if cam.zones:
+                zones = zones_from_cfg(cam.zones)
+                break
+    if args.zones:
+        import yaml
+
+        zpath = Path(args.zones)
+        with zpath.open("r", encoding="utf-8") as fh:
+            zraw = yaml.safe_load(fh) or {}
+        zones = zones_from_cfg(
+            [ZoneCfg.model_validate(z) for z in zraw.get("zones", [])]
+        )
+
+    data_dir = args.data
+    url = f"http://{args.host}:{args.port}"
+    console.print(
+        f"[bold]storeguard dashboard[/bold] — open [cyan]{url}[/cyan] "
+        f"(device={detector.device}, data={data_dir})"
+    )
+    console.print(
+        f"[dim]Drop videos into [bold]{data_dir}/[/bold], then pick one in the UI.[/dim]"
+    )
+    if zones:
+        names = ", ".join(z.name for z in zones)
+        console.print(f"[dim]Paid status zones: {names}[/dim]")
+    else:
+        console.print(
+            "[yellow]No checkout zones loaded — everyone stays "
+            "'not paid'. Pass --config or --zones with a checkout* zone.[/yellow]"
+        )
+    from .dashboard.app import serve
+
+    serve(
+        host=args.host,
+        port=args.port,
+        detector=detector,
+        data_dir=data_dir,
+        zones=zones,
+    )
 
 
 def _cmd_draw_zones(args: argparse.Namespace) -> None:
@@ -69,12 +126,34 @@ def _cmd_annotate(args: argparse.Namespace) -> None:
 def _cmd_make_dataset(args: argparse.Namespace) -> None:
     """Handler for ``storeguard make-dataset``."""
     from .actions.dataset import make_dataset
+    from .config import DetectorCfg, load_config
+
+    detector: DetectorCfg | None = None
+    crop_size = args.crop_size
+    if args.config:
+        cfg = load_config(args.config)
+        detector = cfg.detector
+        if crop_size is None:
+            crop_size = cfg.action.size
+        console.print(
+            f"[cyan]Using detector from '{args.config}' "
+            f"(model={detector.model}, conf={detector.conf}, "
+            f"imgsz={detector.imgsz}); crop_size={crop_size}[/cyan]"
+        )
+    if crop_size is None:
+        crop_size = 112
 
     console.print(
         f"[bold]storeguard make-dataset[/bold] — videos '{args.videos}', "
         f"labels '{args.labels}', output '{args.out}'"
     )
-    make_dataset(args.videos, args.labels, args.out)
+    make_dataset(
+        args.videos,
+        args.labels,
+        args.out,
+        detector=detector,
+        crop_size=crop_size,
+    )
     console.print(f"[green]Dataset written to '{args.out}'.[/green]")
 
 
@@ -136,6 +215,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_run)
 
     p = sub.add_parser(
+        "dashboard",
+        help="open a local web UI to upload a video and watch person detection",
+    )
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
+    p.add_argument(
+        "--device",
+        default="auto",
+        help='detector device: "auto" | "cpu" | "cuda" | "mps" (default: auto)',
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help="optional app YAML; uses its detector settings",
+    )
+    p.add_argument(
+        "--data",
+        default="data",
+        help="folder of local videos to list in the UI (default: data)",
+    )
+    p.add_argument(
+        "--zones",
+        default=None,
+        help="zones YAML (shelf/checkout/exit) for paid / not-paid labels; "
+        "overrides zones from --config",
+    )
+    p.set_defaults(func=_cmd_dashboard)
+
+    p = sub.add_parser(
         "draw-zones",
         help="draw polygon zones over a frame and save them to a YAML file",
     )
@@ -187,6 +295,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--out", required=True, help="output dataset directory, e.g. data/clips"
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help="optional app YAML; uses its detector settings and action.size "
+        "so training crops match the serve-time pipeline",
+    )
+    p.add_argument(
+        "--crop-size",
+        type=int,
+        default=None,
+        help="person-crop side length (default: action.size from --config, "
+        "else 112); should match action.size at serve time",
     )
     p.set_defaults(func=_cmd_make_dataset)
 

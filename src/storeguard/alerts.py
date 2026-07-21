@@ -1,8 +1,8 @@
-"""Alert delivery: JSONL event log, saved mp4 clips and Telegram messages.
+"""Alert delivery: JSONL event log, saved mp4 clips, Telegram and webhooks.
 
-The :class:`AlertSink` is intentionally defensive — a failing disk write or
-Telegram request is logged and swallowed so that alert delivery can never
-crash the video pipeline.
+The :class:`AlertSink` is intentionally defensive — a failing disk write,
+Telegram request or webhook POST is logged and swallowed so that alert
+delivery can never crash the video pipeline.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import cv2
 import requests
 from rich.console import Console
 
-from storeguard.config import TelegramCfg
+from storeguard.config import NotifyCfg, TelegramCfg
 from storeguard.types import Event
 
 if TYPE_CHECKING:
@@ -35,8 +35,25 @@ def _safe_name(name: str) -> str:
     return _UNSAFE_FILENAME_CHARS.sub("-", name).strip("-") or "camera"
 
 
+def event_payload(event: Event, clip_path: Path | None = None) -> dict:
+    """Build the JSON body sent to webhooks (and mirrored in events.jsonl)."""
+    payload = {
+        "kind": event.kind,
+        "camera": event.camera,
+        "message": event.message,
+        "ts": event.ts,
+        "iso_time": datetime.fromtimestamp(event.ts).astimezone().isoformat(),
+        "track_id": event.track_id,
+        "score": event.score,
+        "extra": dict(event.extra) if event.extra else {},
+    }
+    if clip_path is not None:
+        payload["clip_path"] = str(clip_path)
+    return payload
+
+
 class AlertSink:
-    """Persist and deliver events: JSONL log + mp4 clip + Telegram.
+    """Persist and deliver events: JSONL log + mp4 clip + Telegram + webhook.
 
     Applies a per-``(camera, kind)`` minimum gap of :attr:`min_gap_sec`
     seconds on top of the scenarios' own per-track cooldowns. Thread-safe:
@@ -46,7 +63,12 @@ class AlertSink:
     min_gap_sec: ClassVar[float] = 10.0
     clip_fps: ClassVar[float] = 10.0  # fallback when the caller passes no fps
 
-    def __init__(self, telegram: TelegramCfg, events_dir: str) -> None:
+    def __init__(
+        self,
+        telegram: TelegramCfg,
+        events_dir: str,
+        notify: NotifyCfg | None = None,
+    ) -> None:
         """Create the sink.
 
         Args:
@@ -54,8 +76,11 @@ class AlertSink:
                 ``telegram.enabled`` is true.
             events_dir: Directory for ``events.jsonl`` and the ``clips/``
                 subdirectory (created on demand).
+            notify: Optional HTTP webhook settings; when enabled, matching
+                events (e.g. ``exit_no_pay``) are POSTed as JSON to ``url``.
         """
         self._telegram = telegram
+        self._notify = notify or NotifyCfg()
         self._events_dir = Path(events_dir)
         self._last_sent: dict[tuple[str, str], float] = {}
         self._lock = threading.Lock()
@@ -63,7 +88,7 @@ class AlertSink:
     def handle(
         self, event: Event, frames: list["np.ndarray"], fps: float | None = None
     ) -> None:
-        """Log the event, save an evidence clip and notify Telegram.
+        """Log the event, save an evidence clip and notify channels.
 
         Args:
             event: The incident to deliver.
@@ -85,20 +110,21 @@ class AlertSink:
         clip_path = self._write_clip(event, frames, fps)
         if self._telegram.enabled:
             self._send_telegram(event, clip_path)
+        if self._should_notify(event):
+            self._send_webhook(event, clip_path)
+
+    def _should_notify(self, event: Event) -> bool:
+        """True when webhook delivery is enabled for this event kind."""
+        if not self._notify.enabled or not self._notify.url:
+            return False
+        kinds = self._notify.kinds
+        return not kinds or event.kind in kinds
 
     def _append_jsonl(self, event: Event) -> None:
         """Append the event as one JSON line to ``events_dir/events.jsonl``."""
         try:
             self._events_dir.mkdir(parents=True, exist_ok=True)
-            record = {
-                "kind": event.kind,
-                "camera": event.camera,
-                "message": event.message,
-                "ts": event.ts,
-                "iso_time": datetime.fromtimestamp(event.ts).astimezone().isoformat(),
-                "track_id": event.track_id,
-                "score": event.score,
-            }
+            record = event_payload(event)
             line = json.dumps(record, ensure_ascii=False)
             with self._lock:
                 with open(self._events_dir / "events.jsonl", "a", encoding="utf-8") as fh:
@@ -142,6 +168,34 @@ class AlertSink:
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]AlertSink: failed to write event clip: {exc}[/red]")
             return None
+
+    def _send_webhook(self, event: Event, clip_path: Path | None) -> None:
+        """POST the event JSON to the configured notification API."""
+        payload = event_payload(event, clip_path)
+        headers = {
+            "Content-Type": "application/json",
+            **dict(self._notify.headers),
+        }
+        try:
+            resp = requests.post(
+                self._notify.url,
+                json=payload,
+                headers=headers,
+                timeout=self._notify.timeout_sec,
+            )
+            if not resp.ok:
+                _console.log(
+                    f"[red]AlertSink: webhook failed "
+                    f"({resp.status_code}) for {event.kind}: "
+                    f"{resp.text[:200]}[/red]"
+                )
+            else:
+                _console.log(
+                    f"[green]AlertSink: notified {self._notify.url} "
+                    f"({event.kind} / {event.camera})[/green]"
+                )
+        except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
+            _console.log(f"[red]AlertSink: webhook error: {exc}[/red]")
 
     def _send_telegram(self, event: Event, clip_path: Path | None) -> None:
         """Send the event message and, if available, the saved clip."""
