@@ -410,9 +410,10 @@ def run(cfg: AppCfg, show: bool = False) -> None:
     console.print(
         f"[bold]storeguard[/bold]: starting {len(cfg.cameras)} camera worker(s) "
         f"(events → '{cfg.events_dir}', telegram "
-        f"{'on' if cfg.telegram.enabled else 'off'})"
+        f"{'on' if cfg.telegram.enabled else 'off'}, notify "
+        f"{'on' if cfg.notify.enabled else 'off'})"
     )
-    sink = AlertSink(cfg.telegram, cfg.events_dir)
+    sink = AlertSink(cfg.telegram, cfg.events_dir, notify=cfg.notify)
     alert_q: queue.Queue = queue.Queue(maxsize=_ALERT_QUEUE_MAX)
     delivery = threading.Thread(
         target=_delivery_worker,

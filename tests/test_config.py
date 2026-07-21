@@ -95,6 +95,10 @@ def test_load_config_defaults(tmp_path: Path) -> None:
     assert cfg.telegram.bot_token == ""
     assert cfg.telegram.chat_id == ""
 
+    assert cfg.notify.enabled is False
+    assert cfg.notify.url == ""
+    assert cfg.notify.kinds == ["exit_no_pay"]
+
     assert cfg.events_dir == "events"
     assert cfg.process_every == 1
 
@@ -120,6 +124,12 @@ def test_load_config_overrides(tmp_path: Path) -> None:
           enabled: true
           bot_token: "123:abc"
           chat_id: "42"
+        notify:
+          enabled: true
+          url: "https://hooks.example/alert"
+          kinds: [exit_no_pay, pocket]
+          headers: {Authorization: "Bearer x"}
+          timeout_sec: 5
         events_dir: out_events
         process_every: 3
         cameras:
@@ -146,6 +156,12 @@ def test_load_config_overrides(tmp_path: Path) -> None:
     assert cfg.telegram.enabled is True
     assert cfg.telegram.bot_token == "123:abc"
     assert cfg.telegram.chat_id == "42"
+
+    assert cfg.notify.enabled is True
+    assert cfg.notify.url == "https://hooks.example/alert"
+    assert cfg.notify.kinds == ["exit_no_pay", "pocket"]
+    assert cfg.notify.headers == {"Authorization": "Bearer x"}
+    assert cfg.notify.timeout_sec == 5.0
 
     assert cfg.events_dir == "out_events"
     assert cfg.process_every == 3
