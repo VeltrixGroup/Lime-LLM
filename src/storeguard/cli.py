@@ -69,12 +69,34 @@ def _cmd_annotate(args: argparse.Namespace) -> None:
 def _cmd_make_dataset(args: argparse.Namespace) -> None:
     """Handler for ``storeguard make-dataset``."""
     from .actions.dataset import make_dataset
+    from .config import DetectorCfg, load_config
+
+    detector: DetectorCfg | None = None
+    crop_size = args.crop_size
+    if args.config:
+        cfg = load_config(args.config)
+        detector = cfg.detector
+        if crop_size is None:
+            crop_size = cfg.action.size
+        console.print(
+            f"[cyan]Using detector from '{args.config}' "
+            f"(model={detector.model}, conf={detector.conf}, "
+            f"imgsz={detector.imgsz}); crop_size={crop_size}[/cyan]"
+        )
+    if crop_size is None:
+        crop_size = 112
 
     console.print(
         f"[bold]storeguard make-dataset[/bold] — videos '{args.videos}', "
         f"labels '{args.labels}', output '{args.out}'"
     )
-    make_dataset(args.videos, args.labels, args.out)
+    make_dataset(
+        args.videos,
+        args.labels,
+        args.out,
+        detector=detector,
+        crop_size=crop_size,
+    )
     console.print(f"[green]Dataset written to '{args.out}'.[/green]")
 
 
@@ -187,6 +209,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--out", required=True, help="output dataset directory, e.g. data/clips"
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        help="optional app YAML; uses its detector settings and action.size "
+        "so training crops match the serve-time pipeline",
+    )
+    p.add_argument(
+        "--crop-size",
+        type=int,
+        default=None,
+        help="person-crop side length (default: action.size from --config, "
+        "else 112); should match action.size at serve time",
     )
     p.set_defaults(func=_cmd_make_dataset)
 

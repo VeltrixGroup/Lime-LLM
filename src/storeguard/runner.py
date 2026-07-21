@@ -40,6 +40,10 @@ console = Console()
 
 _RING_LEN = 100  # per-camera ring buffer of processed frames (event clips)
 _BANNER_SEC = 3.0  # how long the red event banner stays on screen (show mode)
+# Cap in-flight alerts: each item holds up to _RING_LEN frames. Under a
+# bursty event storm with slow Telegram I/O the unbound queue would retain
+# unbounded frame memory; drop the oldest pending delivery when full.
+_ALERT_QUEUE_MAX = 32
 
 
 class _SharedActionModel:
@@ -292,8 +296,27 @@ def _camera_worker(
                 )
                 # Delivery (clip encoding + Telegram uploads) can block for
                 # tens of seconds; hand it to the delivery thread so this
-                # loop keeps reading frames in real time.
-                alert_q.put((ev, list(ring), ring_fps))
+                # loop keeps reading frames in real time. Drop the oldest
+                # pending item if the queue is full so memory stays bounded.
+                item = (ev, list(ring), ring_fps)
+                try:
+                    alert_q.put_nowait(item)
+                except queue.Full:
+                    try:
+                        alert_q.get_nowait()
+                        console.print(
+                            f"[yellow]Alert queue full — dropped oldest pending "
+                            f"delivery to make room for [{cam.name}] {ev.kind}.[/yellow]"
+                        )
+                    except queue.Empty:
+                        pass
+                    try:
+                        alert_q.put_nowait(item)
+                    except queue.Full:
+                        console.print(
+                            f"[yellow]Alert queue full — dropped [{cam.name}] "
+                            f"{ev.kind}.[/yellow]"
+                        )
                 banner_text = f"{ev.kind.upper()}  track {ev.track_id}"
                 banner_until = time.monotonic() + _BANNER_SEC
 
@@ -337,12 +360,26 @@ def _display_loop(
     All ``cv2.imshow``/``cv2.waitKey`` calls happen here, on the main
     thread, because OpenCV HighGUI is not thread-safe.
     """
-    shown = False
+    open_windows: set[str] = set()
     while any(t.is_alive() for t in threads):
-        for window, frame in display.drain().items():
+        pending = display.drain()
+        for window, frame in pending.items():
             cv2.imshow(window, frame)
-            shown = True
-        if shown:
+            open_windows.add(window)
+        # Close windows whose camera thread has already exited and that
+        # produced no new frame this tick (avoids lingering blank windows).
+        alive_names = {t.name for t in threads if t.is_alive()}
+        for window in list(open_windows):
+            # window title is "storeguard: {cam.name}"; thread is "camera-{name}"
+            cam_name = window.split(": ", 1)[-1]
+            thread_name = f"camera-{cam_name}"
+            if thread_name not in alive_names and window not in pending:
+                try:
+                    cv2.destroyWindow(window)
+                except cv2.error:
+                    pass
+                open_windows.discard(window)
+        if open_windows:
             if (cv2.waitKey(30) & 0xFF) == ord("q"):
                 console.print("[cyan]'q' pressed — stopping.[/cyan]")
                 stop.set()
@@ -376,7 +413,7 @@ def run(cfg: AppCfg, show: bool = False) -> None:
         f"{'on' if cfg.telegram.enabled else 'off'})"
     )
     sink = AlertSink(cfg.telegram, cfg.events_dir)
-    alert_q: queue.Queue = queue.Queue()
+    alert_q: queue.Queue = queue.Queue(maxsize=_ALERT_QUEUE_MAX)
     delivery = threading.Thread(
         target=_delivery_worker,
         args=(sink, alert_q),
@@ -410,12 +447,21 @@ def run(cfg: AppCfg, show: bool = False) -> None:
         stop.set()
         for t in threads:
             t.join(timeout=5.0)
-        alert_q.put(None)  # sentinel: flush pending deliveries, then exit
+        # Make room for the sentinel even if the queue is saturated.
+        while True:
+            try:
+                alert_q.put_nowait(None)
+                break
+            except queue.Full:
+                try:
+                    alert_q.get_nowait()
+                except queue.Empty:
+                    time.sleep(0.01)
         delivery.join(timeout=30.0)
         if delivery.is_alive():
             console.print(
                 "[yellow]Some alert deliveries were still in flight and were "
-                "abandoned.[/yellow]"
+                "abandoned (JSONL + clip for those events may be missing).[/yellow]"
             )
         if show:
             try:

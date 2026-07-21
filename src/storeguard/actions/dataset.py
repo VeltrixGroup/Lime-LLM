@@ -24,18 +24,26 @@ from torch.utils.data import Dataset
 
 from storeguard.actions.clipbuffer import letterbox_person_crop
 from storeguard.actions.model import KINETICS_MEAN, KINETICS_STD
+from storeguard.config import DetectorCfg
 
 VIDEO_EXTS = (".mp4", ".avi", ".mkv", ".mov")
 
-# Side length of the square person crops written by make_dataset. ClipDataset
-# resizes its input to `size + 16` (= 128 for the default 112) before
-# cropping, so writing at 128 avoids an extra resampling step.
-CROP_SIDE = 128
+# Margin (pixels) above ``crop_size`` written by make_dataset so ClipDataset
+# can random-crop during training. Validation resizes the full square down to
+# ``size`` (no inward crop), matching the letterboxed framing used at inference.
+_TRAIN_CROP_MARGIN = 16
 
 _REQUIRED_CSV_FIELDS = ("video", "start_sec", "end_sec", "label")
 
 
-def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: float = 0.8) -> None:
+def make_dataset(
+    videos_dir: str,
+    labels_csv: str,
+    out_dir: str,
+    min_len_sec: float = 0.8,
+    detector: DetectorCfg | None = None,
+    crop_size: int = 112,
+) -> None:
     """Cut labeled segments into per-class folders of person-crop clips.
 
     Reads CSV rows ``video,start_sec,end_sec,label`` (as written by the
@@ -55,18 +63,27 @@ def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: fl
         labels_csv: Path to the labels CSV file.
         out_dir: Output root; one subdirectory per class label is created.
         min_len_sec: Minimum segment duration in seconds; shorter ones are skipped.
+        detector: Detector settings; defaults match :class:`DetectorCfg` and
+            should be the same config used at serve time for train/serve parity.
+        crop_size: Side length of the square person crops (should match
+            ``action.size`` at serve time). Clips are written at
+            ``crop_size + 16`` so training can random-crop; validation keeps
+            the full letterbox.
     """
     console = Console()
     src_root = Path(videos_dir)
     out_root = Path(out_dir)
+    if crop_size < 1:
+        raise ValueError(f"crop_size must be >= 1, got {crop_size}")
+    write_side = crop_size + _TRAIN_CROP_MARGIN
 
     # Heavy import (ultralytics/torch) kept local: only the dataset-building
     # path needs the detector. One tracker instance is reused for all
-    # segments; only per-segment track identities matter here.
-    from storeguard.config import DetectorCfg
+    # segments; tracker.reset() is called at each segment boundary so
+    # Kalman/track state cannot bleed across clips.
     from storeguard.detector import PersonTracker
 
-    tracker = PersonTracker(DetectorCfg())
+    tracker = PersonTracker(detector or DetectorCfg())
 
     with open(labels_csv, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -106,12 +123,14 @@ def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: fl
                 skipped_bad += 1
                 continue
 
-        stem = src.stem
-        idx = seg_index[stem]
-        seg_index[stem] += 1
-        out_path = out_root / label / f"{stem}_{idx}.mp4"
+        # Include extension so a.mp4 and a.mkv neither share a segment
+        # counter nor overwrite each other's output clips.
+        safe = f"{src.stem}_{src.suffix.lstrip('.').lower()}"
+        idx = seg_index[safe]
+        seg_index[safe] += 1
+        out_path = out_root / label / f"{safe}_{idx}.mp4"
 
-        n_frames = _cut_segment(src, out_path, start, end, tracker)
+        n_frames = _cut_segment(src, out_path, start, end, tracker, write_side)
         if n_frames == 0:
             console.print(
                 f"[yellow]warning:[/] no tracked person / no frames decoded for "
@@ -134,7 +153,12 @@ def make_dataset(videos_dir: str, labels_csv: str, out_dir: str, min_len_sec: fl
 
 
 def _cut_segment(
-    src: Path, out_path: Path, start_sec: float, end_sec: float, tracker
+    src: Path,
+    out_path: Path,
+    start_sec: float,
+    end_sec: float,
+    tracker,
+    write_side: int,
 ) -> int:
     """Write letterboxed person crops of ``src`` in ``[start_sec, end_sec)``.
 
@@ -146,6 +170,8 @@ def _cut_segment(
     inference (:func:`letterbox_person_crop`) — are written to ``out_path``.
     Returns the number of frames written (0 when no person was tracked).
     """
+    tracker.reset()  # fresh track ids for this segment
+
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
         cap.release()
@@ -170,7 +196,7 @@ def _cut_segment(
             if rel % step != 0:
                 continue
             for track in tracker.update(frame):
-                crop = letterbox_person_crop(frame, track.box, CROP_SIDE)
+                crop = letterbox_person_crop(frame, track.box, write_side)
                 if crop is None:
                     continue
                 crops[track.track_id].append(crop)
@@ -185,7 +211,10 @@ def _cut_segment(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
-        str(out_path), cv2.VideoWriter.fourcc(*"mp4v"), out_fps, (CROP_SIDE, CROP_SIDE)
+        str(out_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        out_fps,
+        (write_side, write_side),
     )
     n_written = 0
     try:
@@ -206,10 +235,13 @@ class ClipDataset(Dataset):
     a window of ``clip_len`` frames spaced ``frame_stride`` apart is sampled
     from the clip (random position when ``train=True``, centered otherwise);
     clips shorter than that window fall back to indices spread uniformly
-    across the whole clip. Spatially, frames are resized so the short side is
-    ``size + 16``, then random-cropped to ``size`` and randomly h-flipped for
-    training, or center-cropped for validation. Pixels are normalized with
-    the Kinetics-400 mean/std.
+    across the whole clip.
+
+    Spatially, clips are already letterboxed person squares (see
+    :func:`make_dataset`). Training resizes to ``size + 16`` and random-crops
+    to ``size`` (plus random h-flip). Validation resizes the *full* square to
+    ``size`` with no inward crop, matching the letterboxed framing used at
+    inference. Pixels are normalized with the Kinetics-400 mean/std.
     """
 
     def __init__(
@@ -259,26 +291,38 @@ class ClipDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
         """Return ``(tensor of shape (3, clip_len, size, size), label_idx)``."""
         path, label = self.samples[index]
-        frames = self._read_resized_frames(path)
+        frames = self._read_frames(path)
         if not frames:
             raise RuntimeError(f"could not decode any frames from {path}")
         indices = self._frame_indices(len(frames))
         clip = [frames[i] for i in indices]
 
-        h, w = clip[0].shape[:2]
         if self.train:
-            top = random.randint(0, h - self.size)
-            left = random.randint(0, w - self.size)
+            short_side = self.size + _TRAIN_CROP_MARGIN
+            resized = [
+                cv2.resize(c, (short_side, short_side), interpolation=cv2.INTER_AREA)
+                if c.shape[0] != short_side or c.shape[1] != short_side
+                else c
+                for c in clip
+            ]
+            top = random.randint(0, short_side - self.size)
+            left = random.randint(0, short_side - self.size)
+            stacked = np.stack(
+                [c[top : top + self.size, left : left + self.size] for c in resized]
+            )
+            if random.random() < 0.5:
+                stacked = stacked[:, :, ::-1]
         else:
-            top = (h - self.size) // 2
-            left = (w - self.size) // 2
-        flip = self.train and random.random() < 0.5
+            # Full letterbox → size (no inward crop): matches inference framing.
+            stacked = np.stack(
+                [
+                    cv2.resize(c, (self.size, self.size), interpolation=cv2.INTER_AREA)
+                    if c.shape[0] != self.size or c.shape[1] != self.size
+                    else c
+                    for c in clip
+                ]
+            )
 
-        stacked = np.stack(
-            [c[top : top + self.size, left : left + self.size] for c in clip]
-        )  # (T, size, size, 3) BGR
-        if flip:
-            stacked = stacked[:, :, ::-1]
         stacked = stacked[..., ::-1]  # BGR -> RGB
 
         x = stacked.astype(np.float32) / 255.0
@@ -318,9 +362,8 @@ class ClipDataset(Dataset):
             indices.append(min(int(pos), n_frames - 1))
         return indices
 
-    def _read_resized_frames(self, path: Path) -> list[np.ndarray]:
-        """Decode all frames, resizing each so the short side is ``size + 16``."""
-        short_side = self.size + 16
+    def _read_frames(self, path: Path) -> list[np.ndarray]:
+        """Decode all frames from ``path`` (BGR uint8, already letterboxed)."""
         cap = cv2.VideoCapture(str(path))
         frames: list[np.ndarray] = []
         try:
@@ -328,16 +371,7 @@ class ClipDataset(Dataset):
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break
-                h, w = frame.shape[:2]
-                if h <= w:
-                    new_h = short_side
-                    new_w = max(short_side, int(round(w * short_side / h)))
-                else:
-                    new_w = short_side
-                    new_h = max(short_side, int(round(h * short_side / w)))
-                frames.append(
-                    cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                )
+                frames.append(frame)
         finally:
             cap.release()
         return frames

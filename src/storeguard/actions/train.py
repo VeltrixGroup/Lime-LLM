@@ -165,7 +165,11 @@ def train_action(
 
 
 def _source_stem(path: Path) -> str:
-    """Recover the source-video stem from a ``<stem>_<idx>.mp4`` clip name."""
+    """Recover the source-video key from a ``<stem>_<ext>_<idx>.mp4`` clip name.
+
+    ``make_dataset`` writes ``{videostem}_{ext}_{i}.mp4`` (e.g. ``cam1_mp4_0.mp4``)
+    so same-stem / different-extension sources stay distinct leakage groups.
+    """
     stem = path.stem
     base, sep, tail = stem.rpartition("_")
     return base if sep and tail.isdigit() else stem
@@ -180,11 +184,12 @@ def _stratified_split(
     camera, lighting) out of each source recording, so clips from one source
     video must never land on both sides of the split — otherwise validation
     metrics are inflated by leakage.  Per class, whole source-video groups
-    are assigned to validation until roughly ``val_split`` of the class's
-    clips are held out (at least one group in val and one in train when the
-    class spans >= 2 source videos).  A class whose clips all come from a
-    single source video falls back to a clip-level split (>= 2 clips gets
-    >= 1 val clip); record more sessions to avoid the residual leakage there.
+    (recovered from ``{stem}_{ext}_{i}.mp4`` names) are assigned to validation
+    until roughly ``val_split`` of the class's clips are held out (at least
+    one group in val and one in train when the class spans >= 2 source
+    videos).  A class whose clips all come from a single source video falls
+    back to a clip-level split (>= 2 clips gets >= 1 val clip); record more
+    sessions to avoid the residual leakage there.
     """
     by_class: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
     for i, (path, label) in enumerate(samples):
