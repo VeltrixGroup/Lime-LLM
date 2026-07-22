@@ -192,6 +192,29 @@ body {
   animation: rise 0.7s 0.14s ease-out both;
 }
 
+.camera {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1 1 100%;
+}
+
+.camera input[type="text"] {
+  flex: 1 1 280px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--ink);
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  padding: 0.6rem 0.75rem;
+}
+
+.camera input[type="text"]:focus {
+  outline: 1px solid var(--lime-dim);
+}
+
 .picker {
   display: inline-flex;
   align-items: center;

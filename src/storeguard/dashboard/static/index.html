@@ -24,7 +24,7 @@
         <div class="viewport" id="viewport">
           <img id="stream" alt="Detection stream" hidden />
           <div class="placeholder" id="placeholder">
-            <p>Put a clip in <code>data/</code>, pick it below, then Start.</p>
+            <p>Paste an RTSP camera URL, or pick a clip from <code>data/</code>.</p>
           </div>
           <div class="hud" id="hud" hidden>
             <div class="hud-row">
@@ -40,6 +40,17 @@
       </section>
 
       <section class="controls" aria-label="Playback controls">
+        <label class="camera">
+          <span class="picker-label">Camera URL</span>
+          <input
+            type="text"
+            id="camera-url"
+            placeholder="rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+
         <label class="picker">
           <span class="picker-label">From data/</span>
           <select id="local-video">

@@ -1,4 +1,5 @@
 (() => {
+  const cameraUrl = document.getElementById("camera-url");
   const localSelect = document.getElementById("local-video");
   const btnRefresh = document.getElementById("btn-refresh");
   const fileInput = document.getElementById("file");
@@ -23,13 +24,17 @@
   let selectedFile = null;
   let selectedLocal = "";
 
+  function cameraValue() {
+    return (cameraUrl.value || "").trim();
+  }
+
   function setStatus(msg, isError = false) {
     statusEl.textContent = msg || "";
     statusEl.classList.toggle("error", Boolean(isError));
   }
 
   function canStart() {
-    return Boolean(selectedLocal || selectedFile);
+    return Boolean(cameraValue() || selectedLocal || selectedFile);
   }
 
   function setRunning(running) {
@@ -38,6 +43,7 @@
     fileInput.disabled = running;
     localSelect.disabled = running;
     btnRefresh.disabled = running;
+    cameraUrl.disabled = running;
   }
 
   function updateStartEnabled() {
@@ -46,6 +52,18 @@
 
   everyInput.addEventListener("input", () => {
     everyVal.textContent = everyInput.value;
+  });
+
+  cameraUrl.addEventListener("input", () => {
+    if (cameraValue()) {
+      selectedLocal = "";
+      localSelect.value = "";
+      selectedFile = null;
+      fileInput.value = "";
+      fileLabel.textContent = "Or upload";
+      setStatus(`Ready: camera URL`);
+    }
+    updateStartEnabled();
   });
 
   async function loadVideos() {
@@ -61,7 +79,9 @@
         opt.textContent = "No videos in data/ — drop an .mp4 there";
         localSelect.appendChild(opt);
         selectedLocal = "";
-        setStatus(`Looking in ${data.data_dir || "data/"}`);
+        if (!cameraValue()) {
+          setStatus(`Looking in ${data.data_dir || "data/"} — or paste an RTSP URL`);
+        }
       } else {
         const blank = document.createElement("option");
         blank.value = "";
@@ -78,7 +98,9 @@
         } else {
           selectedLocal = "";
         }
-        setStatus(`${videos.length} video(s) in data/`);
+        if (!cameraValue()) {
+          setStatus(`${videos.length} video(s) in data/`);
+        }
       }
     } catch (err) {
       const opt = document.createElement("option");
@@ -96,6 +118,7 @@
       selectedFile = null;
       fileInput.value = "";
       fileLabel.textContent = "Or upload";
+      cameraUrl.value = "";
       setStatus(`Ready: data/${selectedLocal}`);
     }
     updateStartEnabled();
@@ -111,12 +134,30 @@
     selectedFile = file;
     selectedLocal = "";
     localSelect.value = "";
+    cameraUrl.value = "";
     fileLabel.textContent = file.name;
     btnStart.disabled = false;
     setStatus(`Ready (upload): ${file.name}`);
   });
 
   async function createSession() {
+    const url = cameraValue();
+    if (url) {
+      setStatus("Connecting to camera…");
+      const res = await fetch("/api/session/camera", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url,
+          process_every: Number(everyInput.value),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Camera open failed (${res.status})`);
+      }
+      return res.json();
+    }
     if (selectedLocal) {
       setStatus(`Opening data/${selectedLocal}…`);
       const res = await fetch("/api/session/local", {
@@ -135,7 +176,7 @@
       return res.json();
     }
     if (!selectedFile) {
-      throw new Error("Pick a video from data/ or upload one");
+      throw new Error("Paste an RTSP URL, pick data/, or upload a video");
     }
     const body = new FormData();
     body.append("file", selectedFile);

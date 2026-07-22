@@ -70,6 +70,16 @@ class LocalSessionRequest(BaseModel):
     loop: bool = True
 
 
+class CameraSessionRequest(BaseModel):
+    """Open a live camera / RTSP (or HTTP) stream URL."""
+
+    url: str = Field(
+        ...,
+        description="Camera URL, e.g. rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101",
+    )
+    process_every: int = 1
+
+
 def create_app(
     detector: DetectorCfg | None = None,
     upload_dir: Path | None = None,
@@ -125,14 +135,14 @@ def create_app(
 
     def _make_session(
         session_id: str,
-        video_path: Path,
+        source: str,
         filename: str,
         process_every: int,
         loop: bool,
     ) -> DetectionSession:
         return DetectionSession(
             session_id=session_id,
-            video_path=video_path,
+            source=source,
             filename=filename,
             detector=app.state.detector,
             process_every=process_every,
@@ -172,7 +182,7 @@ def create_app(
         session_id = uuid.uuid4().hex[:12]
         session = _make_session(
             session_id=session_id,
-            video_path=video_path,
+            source=str(video_path),
             filename=body.path,
             process_every=body.process_every,
             loop=body.loop,
@@ -185,6 +195,38 @@ def create_app(
                 "process_every": session.process_every,
                 "loop": body.loop,
                 "source": "local",
+            }
+        )
+
+    @app.post("/api/session/camera")
+    def create_camera_session(body: CameraSessionRequest) -> JSONResponse:
+        """Open a live RTSP/HTTP camera URL for detection."""
+        url = body.url.strip()
+        if not url.lower().startswith(("rtsp://", "http://", "https://")):
+            raise HTTPException(
+                status_code=400,
+                detail="url must start with rtsp://, http:// or https://",
+            )
+        session_id = uuid.uuid4().hex[:12]
+        # Short label for the HUD (hide credentials).
+        label = url.split("@")[-1] if "@" in url else url
+        if len(label) > 64:
+            label = label[:61] + "..."
+        session = _make_session(
+            session_id=session_id,
+            source=url,
+            filename=label,
+            process_every=body.process_every,
+            loop=False,
+        )
+        _activate(session)
+        return JSONResponse(
+            {
+                "id": session_id,
+                "filename": label,
+                "process_every": session.process_every,
+                "loop": False,
+                "source": "camera",
             }
         )
 
@@ -221,7 +263,7 @@ def create_app(
 
         session = _make_session(
             session_id=session_id,
-            video_path=dest,
+            source=str(dest),
             filename=name,
             process_every=process_every,
             loop=loop,
