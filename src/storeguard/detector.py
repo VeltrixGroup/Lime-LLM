@@ -87,3 +87,29 @@ class PersonTracker:
                 )
             )
         return tracks
+
+    def detect_phones(self, frame: np.ndarray) -> list[tuple[float, float, float, float]]:
+        """Detect cell phones (COCO class 67) in one frame; return pixel boxes.
+
+        Reuses the same YOLO model as person detection (no extra weights or
+        training data), so the 'on phone' scenario is a pure add-on. It is a
+        second forward pass, so only call it when that scenario is enabled.
+        """
+        results = self.model.predict(
+            frame,
+            classes=[67],  # COCO 'cell phone'
+            conf=self.cfg.conf,
+            imgsz=self.cfg.imgsz,
+            device=self.device,
+            verbose=False,
+        )
+        boxes: list[tuple[float, float, float, float]] = []
+        if not results:
+            return boxes
+        dets = results[0].boxes
+        if dets is None:
+            return boxes
+        for box in dets:
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0].tolist())
+            boxes.append((x1, y1, x2, y2))
+        return boxes

@@ -17,22 +17,25 @@
     <main class="shell">
       <header class="top">
         <h1 class="brand">storeguard</h1>
-        <p class="tagline">Person detection on your video</p>
+        <p class="tagline">Person detection on your cameras</p>
       </header>
 
       <section class="stage" aria-label="Detection preview">
         <div class="viewport" id="viewport">
-          <img id="stream" alt="Detection stream" hidden />
+          <div class="grid" id="grid" hidden></div>
           <div class="placeholder" id="placeholder">
-            <p>Paste an RTSP camera URL, or pick a clip from <code>data/</code>.</p>
+            <p>
+              Add up to 16 camera URLs, pick a clip from <code>data/</code>, or
+              upload a video.
+            </p>
           </div>
           <div class="hud" id="hud" hidden>
             <div class="hud-row">
+              <span id="stat-cameras">0 cameras</span>
               <span id="stat-people">0 people</span>
               <span id="stat-paid">0 paid</span>
               <span id="stat-not-paid">0 not paid</span>
               <span id="stat-fps">0 fps</span>
-              <span id="stat-frame">frame 0</span>
             </div>
             <ul class="hud-people" id="stat-people-list"></ul>
           </div>
@@ -40,16 +43,16 @@
       </section>
 
       <section class="controls" aria-label="Playback controls">
-        <label class="camera">
-          <span class="picker-label">Camera URL</span>
-          <input
-            type="text"
-            id="camera-url"
-            placeholder="rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101"
-            autocomplete="off"
-            spellcheck="false"
-          />
-        </label>
+        <div class="cameras" id="cameras">
+          <div class="cameras-head">
+            <span class="picker-label">Camera URLs</span>
+            <span class="cameras-count" id="camera-count">1 / 16</span>
+            <button type="button" id="btn-add-camera" class="btn ghost">
+              + Add camera
+            </button>
+          </div>
+          <div class="camera-rows" id="camera-rows"></div>
+        </div>
 
         <label class="picker">
           <span class="picker-label">From data/</span>

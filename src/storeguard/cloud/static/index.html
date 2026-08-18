@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>storeguard cloud</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="grain"></div>
+    <main class="shell">
+      <header class="top">
+        <h1 class="brand">storeguard</h1>
+        <p class="tagline">cloud control plane</p>
+      </header>
+
+      <section id="loading" class="card center">Loading…</section>
+
+      <!-- ============ logged out ============ -->
+      <section id="auth-view" hidden>
+        <div class="tabs">
+          <button id="tab-login" class="tab active" type="button">Log in</button>
+          <button id="tab-signup" class="tab" type="button">
+            Create organization
+          </button>
+        </div>
+
+        <form id="login-form" class="card form">
+          <label>
+            Email
+            <input type="email" name="email" autocomplete="username" required />
+          </label>
+          <label>
+            Password
+            <input
+              type="password"
+              name="password"
+              autocomplete="current-password"
+              required
+            />
+          </label>
+          <button class="btn primary" type="submit">Log in</button>
+        </form>
+
+        <form id="signup-form" class="card form" hidden>
+          <label>
+            Organization name
+            <input type="text" name="org_name" maxlength="200" required />
+          </label>
+          <label>
+            Your name
+            <input type="text" name="full_name" maxlength="200" />
+          </label>
+          <label>
+            Email
+            <input type="email" name="email" autocomplete="username" required />
+          </label>
+          <label>
+            Password (min 8 characters)
+            <input
+              type="password"
+              name="password"
+              autocomplete="new-password"
+              minlength="8"
+              maxlength="72"
+              required
+            />
+          </label>
+          <button class="btn primary" type="submit">Create organization</button>
+        </form>
+      </section>
+
+      <!-- ============ logged in ============ -->
+      <section id="app-view" hidden>
+        <div class="card orgbar">
+          <div>
+            <div class="org-name" id="org-name"></div>
+            <div class="who">
+              <span id="who-email"></span> ·
+              <span id="who-role" class="role"></span>
+            </div>
+          </div>
+          <div class="orgbar-actions">
+            <button id="btn-change-pw" class="btn ghost" type="button">
+              Change password
+            </button>
+            <button id="btn-logout" class="btn ghost" type="button">Log out</button>
+          </div>
+        </div>
+
+        <form id="changepw-form" class="card form" hidden>
+          <label>
+            Current password
+            <input type="password" name="current_password" required />
+          </label>
+          <label>
+            New password (min 8 characters)
+            <input
+              type="password"
+              name="new_password"
+              minlength="8"
+              maxlength="72"
+              required
+            />
+          </label>
+          <button class="btn primary" type="submit">Update password</button>
+        </form>
+
+        <section class="card">
+          <div class="section-head">
+            <h2>Team</h2>
+            <span id="member-count" class="muted"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="members">
+              <thead>
+                <tr>
+                  <th>Email</th>
+                  <th>Name</th>
+                  <th>Role</th>
+                  <th id="th-actions"></th>
+                </tr>
+              </thead>
+              <tbody id="members-body"></tbody>
+            </table>
+          </div>
+
+          <form id="add-member-form" class="add-form" hidden>
+            <h3>Add member</h3>
+            <div class="row">
+              <input type="email" name="email" placeholder="email" required />
+              <input type="text" name="full_name" placeholder="name (optional)" />
+              <input
+                type="password"
+                name="password"
+                placeholder="initial password"
+                minlength="8"
+                maxlength="72"
+                required
+              />
+              <select name="role">
+                <option value="staff">staff</option>
+                <option value="owner">owner</option>
+              </select>
+              <button class="btn primary" type="submit">Add</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card" id="cameras-card">
+          <div class="section-head">
+            <h2>Cameras</h2>
+            <span id="camera-count" class="muted"></span>
+          </div>
+          <div id="cameras-list"></div>
+
+          <form id="add-camera-form" class="add-form" hidden>
+            <h3>Add camera</h3>
+            <div class="row">
+              <input type="text" name="name" placeholder="name (e.g. Entrance)" required />
+              <input
+                type="text"
+                name="source"
+                placeholder="rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101"
+                required
+              />
+              <input
+                type="number"
+                name="process_every"
+                min="1"
+                max="100"
+                value="1"
+                title="process every Nth frame"
+              />
+              <label class="chk">
+                <input type="checkbox" name="enabled" checked /> enabled
+              </label>
+              <button class="btn primary" type="submit">Add</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card" id="devices-card">
+          <div class="section-head">
+            <h2>Edge devices</h2>
+            <span id="key-count" class="muted"></span>
+          </div>
+          <div id="keys-list"></div>
+          <div id="new-key-box" class="new-key" hidden>
+            <div class="muted">Copy this token now — it won't be shown again:</div>
+            <code id="new-key-token" class="token"></code>
+          </div>
+          <form id="add-key-form" class="add-form">
+            <h3>Create device token</h3>
+            <div class="row">
+              <input type="text" name="name" placeholder="device name (e.g. Store PC)" />
+              <button class="btn primary" type="submit">Create token</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card" id="telegram-card">
+          <div class="section-head">
+            <h2>Telegram alerts</h2>
+            <span id="telegram-state" class="muted"></span>
+          </div>
+          <form id="telegram-form" class="form">
+            <label class="chk">
+              <input type="checkbox" name="enabled" /> Enable Telegram alerts
+            </label>
+            <label>
+              Bot token
+              <input
+                type="password"
+                name="bot_token"
+                placeholder="leave blank to keep the saved token"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              Chat ID
+              <input type="text" name="chat_id" placeholder="e.g. -1001234567890" />
+            </label>
+            <div class="row">
+              <button class="btn primary" type="submit">Save</button>
+              <button id="btn-test-telegram" class="btn ghost" type="button">
+                Send test
+              </button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card" id="events-card">
+          <div class="section-head">
+            <h2>Events</h2>
+            <span id="event-count" class="muted"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="members">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Camera</th>
+                  <th>Person</th>
+                  <th>Kind</th>
+                  <th>Message</th>
+                  <th>Clip</th>
+                </tr>
+              </thead>
+              <tbody id="events-body"></tbody>
+            </table>
+          </div>
+          <button id="btn-refresh-events" class="btn ghost sm" type="button">
+            Refresh
+          </button>
+        </section>
+      </section>
+
+      <p id="status" class="status" role="status"></p>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -52,6 +52,42 @@ def event_payload(event: Event, clip_path: Path | None = None) -> dict:
     return payload
 
 
+def write_mp4_clip(
+    path: Path,
+    frames: list["np.ndarray"],
+    fps: float | None = None,
+    fallback_fps: float = 10.0,
+) -> bool:
+    """Write ``frames`` to an mp4 at ``path`` (at ``fps``). Returns success.
+
+    Shared by the local :class:`AlertSink` and the cloud edge sink. Never
+    raises — a failure is logged and reported as ``False`` so clip writing can
+    never crash the video pipeline.
+    """
+    if not frames:
+        return False
+    try:
+        height, width = frames[0].shape[:2]
+        out_fps = fps if fps is not None and fps > 0 else fallback_fps
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height)
+        )
+        if not writer.isOpened():
+            _console.log(f"[red]write_mp4_clip: could not open VideoWriter for {path}[/red]")
+            return False
+        try:
+            for frame in frames:
+                if frame.shape[:2] != (height, width):
+                    frame = cv2.resize(frame, (width, height))
+                writer.write(frame)
+        finally:
+            writer.release()
+        return True
+    except Exception as exc:  # noqa: BLE001 - clip writing must never crash the pipeline
+        _console.log(f"[red]write_mp4_clip: failed: {exc}[/red]")
+        return False
+
+
 class AlertSink:
     """Persist and deliver events: JSONL log + mp4 clip + Telegram + webhook.
 
@@ -141,33 +177,15 @@ class AlertSink:
         try:
             clips_dir = self._events_dir / "clips"
             clips_dir.mkdir(parents=True, exist_ok=True)
-            path = clips_dir / (
-                f"{_safe_name(event.camera)}_{event.kind}_{int(event.ts)}.mp4"
-            )
-            height, width = frames[0].shape[:2]
-            out_fps = fps if fps is not None and fps > 0 else self.clip_fps
-            writer = cv2.VideoWriter(
-                str(path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                out_fps,
-                (width, height),
-            )
-            if not writer.isOpened():
-                _console.log(
-                    f"[red]AlertSink: could not open VideoWriter for {path}[/red]"
-                )
-                return None
-            try:
-                for frame in frames:
-                    if frame.shape[:2] != (height, width):
-                        frame = cv2.resize(frame, (width, height))
-                    writer.write(frame)
-            finally:
-                writer.release()
-            return path
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
-            _console.log(f"[red]AlertSink: failed to write event clip: {exc}[/red]")
+            _console.log(f"[red]AlertSink: failed to create clips dir: {exc}[/red]")
             return None
+        path = clips_dir / (
+            f"{_safe_name(event.camera)}_{event.kind}_{int(event.ts)}.mp4"
+        )
+        if write_mp4_clip(path, frames, fps, fallback_fps=self.clip_fps):
+            return path
+        return None
 
     def _send_webhook(self, event: Event, clip_path: Path | None) -> None:
         """POST the event JSON to the configured notification API."""
