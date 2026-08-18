@@ -24,3 +24,10 @@ data/
 *.dav
 .claude
 .idea
+
+# macOS
+.DS_Store
+
+# cloud control-plane local dev artifacts (sqlite db + agent event clips)
+*.db
+storeguard_events/

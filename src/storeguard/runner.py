@@ -122,22 +122,43 @@ def _get_action_model(app: AppCfg) -> _SharedActionModel | None:
         return shared
 
 
-def build_scenarios(cam: CameraCfg, app: AppCfg) -> list:
+def build_scenarios(
+    cam: CameraCfg, app: AppCfg, tracker: PersonTracker | None = None
+) -> list:
     """Instantiate the scenario objects one camera asks for in its config.
 
-    ``exit_no_pay`` is pure zone logic and always available.  ``pocket`` and
-    ``cashier`` need the trained action classifier: it is loaded lazily once
-    and shared across all cameras; if the weights file is missing, a warning
-    is printed and those scenarios are skipped (``exit_no_pay`` still runs).
+    ``exit_no_pay`` and ``idle`` are pure geometry and always available.
+    ``on_phone`` needs the ``tracker`` (it reuses YOLO's cell-phone class).
+    ``pocket`` and ``cashier`` need the trained action classifier: it is loaded
+    lazily once and shared across all cameras; if the weights file is missing, a
+    warning is printed and those scenarios are skipped.
     """
     from .actions.clipbuffer import ClipBuffer
-    from .scenarios import CashierScenario, ExitNoPayScenario, PocketScenario
+    from .scenarios import (
+        CashierScenario,
+        ExitNoPayScenario,
+        IdleScenario,
+        PhoneScenario,
+        PocketScenario,
+    )
 
     zones = zones_from_cfg(cam.zones)
     scenarios: list = []
     for name in cam.scenarios:
         if name == "exit_no_pay":
             scenarios.append(ExitNoPayScenario(cam.name, zones))
+            continue
+        if name == "idle":
+            scenarios.append(IdleScenario(cam.name))
+            continue
+        if name == "on_phone":
+            if tracker is None:
+                console.print(
+                    f"[yellow]Camera '{cam.name}': 'on_phone' needs the tracker "
+                    "— skipped.[/yellow]"
+                )
+                continue
+            scenarios.append(PhoneScenario(cam.name, tracker.detect_phones))
             continue
         if name not in ("pocket", "cashier"):
             console.print(
@@ -241,7 +262,7 @@ def _camera_worker(
     """
     stream = VideoStream(cam.source)
     tracker = PersonTracker(app.detector)
-    scenarios = build_scenarios(cam, app)
+    scenarios = build_scenarios(cam, app, tracker=tracker)
     zones = zones_from_cfg(cam.zones)
     ring: deque[np.ndarray] = deque(maxlen=_RING_LEN)
     window = f"storeguard: {cam.name}"
@@ -388,7 +409,7 @@ def _display_loop(
             time.sleep(0.03)  # no window yet — waitKey needs one
 
 
-def run(cfg: AppCfg, show: bool = False) -> None:
+def run(cfg: AppCfg, show: bool = False, sink: AlertSink | None = None) -> None:
     """Run the full pipeline: one worker thread per configured camera.
 
     Blocks until every camera finishes (video files reach EOF) or the user
@@ -402,6 +423,10 @@ def run(cfg: AppCfg, show: bool = False) -> None:
             track ids, zone polygons, red banner on event); pressing 'q' in
             any window stops all cameras.  Intended only for local testing
             with video files.
+        sink: Alert delivery target (anything with a
+            ``handle(event, frames, fps)`` method). Defaults to the local
+            :class:`~storeguard.alerts.AlertSink`; the edge agent passes a
+            cloud-pushing sink instead.
     """
     if not cfg.cameras:
         console.print("[red]No cameras configured — nothing to do.[/red]")
@@ -413,7 +438,8 @@ def run(cfg: AppCfg, show: bool = False) -> None:
         f"{'on' if cfg.telegram.enabled else 'off'}, notify "
         f"{'on' if cfg.notify.enabled else 'off'})"
     )
-    sink = AlertSink(cfg.telegram, cfg.events_dir, notify=cfg.notify)
+    if sink is None:
+        sink = AlertSink(cfg.telegram, cfg.events_dir, notify=cfg.notify)
     alert_q: queue.Queue = queue.Queue(maxsize=_ALERT_QUEUE_MAX)
     delivery = threading.Thread(
         target=_delivery_worker,

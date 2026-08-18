@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import threading
@@ -9,17 +10,27 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketDisconnect
 
 from storeguard.config import DetectorCfg
-from storeguard.dashboard.pipeline import DetectionSession
+from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v"}
+
+#: Maximum simultaneously connected cameras (sessions) per dashboard.
+MAX_CAMERAS = 16
+
+#: Session ids come from ``uuid4().hex[:12]`` — always 12 ASCII chars.  The
+#: WebSocket frame protocol relies on this: every binary message is the
+#: 12-byte session id followed by the JPEG bytes.
+_SESSION_ID_LEN = 12
 
 
 def _list_videos(data_dir: Path) -> list[dict[str, str | int]]:
@@ -62,6 +73,27 @@ def _resolve_data_video(data_dir: Path, rel: str) -> Path:
     return candidate
 
 
+def _clean_camera_url(raw: str) -> str:
+    """Strip and validate one camera URL; raise 400 on a bad scheme."""
+    url = raw.strip()
+    if not url:
+        return ""
+    if not url.lower().startswith(("rtsp://", "http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"camera url must start with rtsp://, http:// or https://: {url!r}",
+        )
+    return url
+
+
+def _camera_label(url: str) -> str:
+    """Short label for the HUD (hide credentials)."""
+    label = url.split("@")[-1] if "@" in url else url
+    if len(label) > 64:
+        label = label[:61] + "..."
+    return label
+
+
 class LocalSessionRequest(BaseModel):
     """Open a video that already lives under the dashboard data directory."""
 
@@ -78,6 +110,40 @@ class CameraSessionRequest(BaseModel):
         description="Camera URL, e.g. rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101",
     )
     process_every: int = 1
+
+
+class CamerasSessionRequest(BaseModel):
+    """Connect a batch of camera URLs (replaces all current sessions)."""
+
+    urls: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_CAMERAS,
+        description=f"1..{MAX_CAMERAS} camera URLs (rtsp:// or http(s)://)",
+    )
+    process_every: int = 1
+
+
+def _stats_payload(session: DetectionSession) -> dict:
+    """One session's stats as the JSON shape shared by all stats endpoints."""
+    s: SessionStats = session.stats
+    return {
+        "id": session.id,
+        "kind": getattr(session, "kind", "") or "",
+        "filename": s.filename,
+        "people": s.people,
+        "fps": s.fps,
+        "frame": s.frame,
+        "total_frames": s.total_frames,
+        "tracks": s.tracks,
+        "people_status": [
+            {"track_id": p.track_id, "status": p.status} for p in s.people_status
+        ],
+        "paid": s.paid,
+        "not_paid": s.not_paid,
+        "running": s.running,
+        "error": s.error,
+    }
 
 
 def create_app(
@@ -111,10 +177,9 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
-        with app.state.session_lock:
-            if app.state.session is not None:
-                app.state.session.stop()
-                app.state.session = None
+        # Stopping sessions joins worker threads (up to 5s each); do it off the
+        # event loop so shutdown doesn't block the loop.
+        await run_in_threadpool(_replace_sessions, [])
         if app.state.own_upload_dir and app.state.upload_root.exists():
             shutil.rmtree(app.state.upload_root, ignore_errors=True)
 
@@ -130,7 +195,8 @@ def create_app(
     app.state.data_dir = videos_root
     app.state.zones = zone_list
     app.state.checkout_dwell_sec = checkout_dwell_sec
-    app.state.session: DetectionSession | None = None
+    # All live sessions keyed by id, in creation order (up to MAX_CAMERAS).
+    app.state.sessions: dict[str, DetectionSession] = {}
     app.state.session_lock = threading.Lock()
 
     def _make_session(
@@ -139,6 +205,7 @@ def create_app(
         filename: str,
         process_every: int,
         loop: bool,
+        kind: str,
     ) -> DetectionSession:
         return DetectionSession(
             session_id=session_id,
@@ -149,13 +216,32 @@ def create_app(
             loop=loop,
             zones=app.state.zones,
             checkout_dwell_sec=app.state.checkout_dwell_sec,
+            kind=kind,
         )
 
-    def _activate(session: DetectionSession) -> None:
+    def _stop_sessions(sessions: list[DetectionSession]) -> None:
+        """Stop many sessions in parallel: signal all, then join each."""
+        for session in sessions:
+            session.signal_stop()
+        for session in sessions:
+            session.stop()
+
+    def _replace_sessions(
+        new: list[DetectionSession], start: bool = False
+    ) -> None:
+        """Swap the session registry; stop the old ones outside the lock.
+
+        With ``start=True`` the new sessions are started while the registry lock
+        is held, so a concurrent replace/stop can't land between registering a
+        session and starting it (which would orphan an unstoppable worker).
+        """
         with app.state.session_lock:
-            if app.state.session is not None:
-                app.state.session.stop()
-            app.state.session = session
+            old = list(app.state.sessions.values())
+            app.state.sessions = {s.id: s for s in new}
+            if start:
+                for session in new:
+                    session.start()
+        _stop_sessions(old)
 
     @app.get("/")
     def index() -> FileResponse:
@@ -175,19 +261,38 @@ def create_app(
             }
         )
 
+    @app.get("/api/sessions")
+    def list_sessions() -> JSONResponse:
+        """All live sessions with their stats — the UI polls this endpoint."""
+        with app.state.session_lock:
+            sessions = list(app.state.sessions.values())
+        return JSONResponse(
+            {
+                "max_cameras": MAX_CAMERAS,
+                "sessions": [_stats_payload(s) for s in sessions],
+            }
+        )
+
+    @app.post("/api/sessions/stop")
+    def stop_all_sessions() -> JSONResponse:
+        """Stop and remove every session."""
+        _replace_sessions([])
+        return JSONResponse({"stopped": True})
+
     @app.post("/api/session/local")
     def create_local_session(body: LocalSessionRequest) -> JSONResponse:
         """Open a video from ``data/`` without re-uploading through the browser."""
         video_path = _resolve_data_video(app.state.data_dir, body.path)
-        session_id = uuid.uuid4().hex[:12]
+        session_id = uuid.uuid4().hex[:_SESSION_ID_LEN]
         session = _make_session(
             session_id=session_id,
             source=str(video_path),
             filename=body.path,
             process_every=body.process_every,
             loop=body.loop,
+            kind="local",
         )
-        _activate(session)
+        _replace_sessions([session])
         return JSONResponse(
             {
                 "id": session_id,
@@ -198,28 +303,65 @@ def create_app(
             }
         )
 
-    @app.post("/api/session/camera")
-    def create_camera_session(body: CameraSessionRequest) -> JSONResponse:
-        """Open a live RTSP/HTTP camera URL for detection."""
-        url = body.url.strip()
-        if not url.lower().startswith(("rtsp://", "http://", "https://")):
+    @app.post("/api/session/cameras")
+    def create_camera_sessions(body: CamerasSessionRequest) -> JSONResponse:
+        """Connect up to ``MAX_CAMERAS`` camera URLs at once.
+
+        Replaces all current sessions and starts detection on every camera
+        immediately (unlike the single-source endpoints, which wait for an
+        explicit ``/start``).  Duplicate and blank URLs are dropped.
+        """
+        urls: list[str] = []
+        for raw in body.urls:
+            url = _clean_camera_url(raw)
+            if url and url not in urls:
+                urls.append(url)
+        if not urls:
+            raise HTTPException(status_code=400, detail="no camera urls given")
+        if len(urls) > MAX_CAMERAS:
             raise HTTPException(
                 status_code=400,
-                detail="url must start with rtsp://, http:// or https://",
+                detail=f"at most {MAX_CAMERAS} cameras are supported",
             )
-        session_id = uuid.uuid4().hex[:12]
-        # Short label for the HUD (hide credentials).
-        label = url.split("@")[-1] if "@" in url else url
-        if len(label) > 64:
-            label = label[:61] + "..."
+        sessions = [
+            _make_session(
+                session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
+                source=url,
+                filename=_camera_label(url),
+                process_every=body.process_every,
+                loop=False,
+                kind="camera",
+            )
+            for url in urls
+        ]
+        _replace_sessions(sessions, start=True)
+        return JSONResponse(
+            {
+                "count": len(sessions),
+                "sessions": [
+                    {"id": s.id, "filename": s.filename, "source": "camera"}
+                    for s in sessions
+                ],
+            }
+        )
+
+    @app.post("/api/session/camera")
+    def create_camera_session(body: CameraSessionRequest) -> JSONResponse:
+        """Open a single live RTSP/HTTP camera URL for detection."""
+        url = _clean_camera_url(body.url)
+        if not url:
+            raise HTTPException(status_code=400, detail="no camera url given")
+        session_id = uuid.uuid4().hex[:_SESSION_ID_LEN]
+        label = _camera_label(url)
         session = _make_session(
             session_id=session_id,
             source=url,
             filename=label,
             process_every=body.process_every,
             loop=False,
+            kind="camera",
         )
-        _activate(session)
+        _replace_sessions([session])
         return JSONResponse(
             {
                 "id": session_id,
@@ -246,7 +388,7 @@ def create_app(
                     f"expected one of {sorted(_VIDEO_EXTS)}"
                 ),
             )
-        session_id = uuid.uuid4().hex[:12]
+        session_id = uuid.uuid4().hex[:_SESSION_ID_LEN]
         dest = app.state.upload_root / f"{session_id}{suffix}"
         try:
             with dest.open("wb") as out:
@@ -267,8 +409,10 @@ def create_app(
             filename=name,
             process_every=process_every,
             loop=loop,
+            kind="upload",
         )
-        _activate(session)
+        # create_session is async: run the (thread-joining) swap off the loop.
+        await run_in_threadpool(_replace_sessions, [session])
 
         return JSONResponse(
             {
@@ -282,8 +426,8 @@ def create_app(
 
     def _require_session(session_id: str) -> DetectionSession:
         with app.state.session_lock:
-            session = app.state.session
-        if session is None or session.id != session_id:
+            session = app.state.sessions.get(session_id)
+        if session is None:
             raise HTTPException(status_code=404, detail="session not found")
         return session
 
@@ -301,29 +445,20 @@ def create_app(
         session.stop()
         return JSONResponse({"id": session_id, "running": False})
 
+    @app.delete("/api/session/{session_id}")
+    def delete_session(session_id: str) -> JSONResponse:
+        """Stop one session and drop it from the registry."""
+        with app.state.session_lock:
+            session = app.state.sessions.pop(session_id, None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        session.stop()
+        return JSONResponse({"id": session_id, "removed": True})
+
     @app.get("/api/session/{session_id}/stats")
     def session_stats(session_id: str) -> JSONResponse:
         session = _require_session(session_id)
-        s = session.stats
-        return JSONResponse(
-            {
-                "id": session_id,
-                "filename": s.filename,
-                "people": s.people,
-                "fps": s.fps,
-                "frame": s.frame,
-                "total_frames": s.total_frames,
-                "tracks": s.tracks,
-                "people_status": [
-                    {"track_id": p.track_id, "status": p.status}
-                    for p in s.people_status
-                ],
-                "paid": s.paid,
-                "not_paid": s.not_paid,
-                "running": s.running,
-                "error": s.error,
-            }
-        )
+        return JSONResponse(_stats_payload(session))
 
     @app.get("/api/session/{session_id}/stream")
     def session_stream(session_id: str) -> StreamingResponse:
@@ -358,6 +493,52 @@ def create_app(
             generate(),
             media_type=f"multipart/x-mixed-replace; boundary={boundary}",
         )
+
+    @app.websocket("/api/ws/frames")
+    async def ws_frames(ws: WebSocket) -> None:
+        """Multiplex the latest JPEG of every session over one socket.
+
+        Browsers cap HTTP/1.1 connections per host (~6), so a grid of 16
+        MJPEG ``<img>`` tags would stall.  Instead the UI opens this single
+        WebSocket; each binary message is ``12-byte session id + JPEG``.
+        """
+        await ws.accept()
+        last_sent: dict[str, int] = {}
+
+        async def _watch_disconnect() -> None:
+            # Reading is the only way to observe a client close while no frames
+            # are flowing (an idle/down grid). Ignore any payload; just wait.
+            try:
+                while True:
+                    await ws.receive()
+            except Exception:  # noqa: BLE001
+                return
+
+        recv_task = asyncio.create_task(_watch_disconnect())
+        try:
+            while not recv_task.done():
+                with app.state.session_lock:
+                    sessions = list(app.state.sessions.values())
+                live_ids = {s.id for s in sessions}
+                for known in list(last_sent):
+                    if known not in live_ids:
+                        del last_sent[known]
+                sent_any = False
+                for session in sessions:
+                    result = session.peek_jpeg(last_sent.get(session.id, 0))
+                    if result is None:
+                        continue
+                    jpeg, seq = result
+                    last_sent[session.id] = seq
+                    await ws.send_bytes(session.id.encode("ascii") + jpeg)
+                    sent_any = True
+                await asyncio.sleep(0.02 if sent_any else 0.05)
+        except WebSocketDisconnect:
+            return
+        except Exception:  # noqa: BLE001 — client gone mid-send; nothing to do
+            return
+        finally:
+            recv_task.cancel()
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

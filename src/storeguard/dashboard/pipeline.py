@@ -22,6 +22,14 @@ _COLOR_PAID = (80, 220, 60)  # green
 _COLOR_NOT_PAID = (60, 60, 255)  # red
 _COLOR_ZONE = (0, 200, 255)
 
+#: Serializes YOLO model construction across sessions so starting many cameras
+#: at once doesn't spike memory or race to download the same weights file.
+_MODEL_INIT_LOCK = threading.Lock()
+
+#: Seconds to wait for the first frame of a live source before surfacing a
+#: "no video" error to the UI (the worker keeps retrying in the background).
+_CONNECT_TIMEOUT_SEC = 10.0
+
 
 def draw_person_overlays(
     frame: np.ndarray,
@@ -133,10 +141,12 @@ class DetectionSession:
         loop: bool = True,
         zones: list[Zone] | None = None,
         checkout_dwell_sec: float = 2.0,
+        kind: str = "",
     ) -> None:
         self.id = session_id
         self.source = source
         self.filename = filename
+        self.kind = kind
         self.detector_cfg = detector
         self.process_every = max(1, int(process_every))
         self._is_url = source.lower().startswith(("rtsp://", "http://", "https://"))
@@ -186,12 +196,25 @@ class DetectionSession:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def signal_stop(self) -> None:
+        """Ask the worker to stop without waiting for it.
+
+        Used to wind down many sessions in parallel: signal them all first,
+        then :meth:`stop` each one — total wait is the slowest session, not
+        the sum.
+        """
         self._stop.set()
         with self._frame_ready:
             self._frame_ready.notify_all()
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
+
+    def stop(self) -> None:
+        self.signal_stop()
+        # Copy to a local: two threads may call stop() concurrently (DELETE
+        # racing stop-all), and re-reading self._thread across the check and
+        # the join would risk a None dereference.
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5.0)
             self._thread = None
         with self._lock:
             self._stats.running = False
@@ -206,12 +229,34 @@ class DetectionSession:
                 return self._jpeg, self._jpeg_seq
             return None
 
+    def peek_jpeg(self, after_seq: int) -> tuple[bytes, int] | None:
+        """Return the latest JPEG if newer than ``after_seq``, without blocking.
+
+        Safe to call from the asyncio event loop (the lock is only held for a
+        reference swap): the multi-camera WebSocket endpoint polls this for
+        every active session.
+        """
+        with self._lock:
+            if self._jpeg is not None and self._jpeg_seq > after_seq:
+                return self._jpeg, self._jpeg_seq
+            return None
+
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def _sanitize(self, text: str) -> str:
+        """Strip the raw source (which may embed credentials) from a message."""
+        if self.source and self.source != self.filename:
+            return text.replace(self.source, self.filename)
+        return text
+
     def _run(self) -> None:
         try:
-            self._tracker = PersonTracker(self.detector_cfg)
+            # Serialize model construction: N cameras starting together must not
+            # all load/allocate at once (memory spike) or race to download the
+            # same weights file.
+            with _MODEL_INIT_LOCK:
+                self._tracker = PersonTracker(self.detector_cfg)
             self._tracker.reset()
             self._payment.reset()
             with self._lock:
@@ -228,7 +273,7 @@ class DetectionSession:
 
         except Exception as exc:  # noqa: BLE001 — surface to UI, keep server up
             with self._lock:
-                self._stats.error = str(exc)
+                self._stats.error = self._sanitize(str(exc))
                 self._stats.running = False
         finally:
             with self._lock:
@@ -252,8 +297,10 @@ class DetectionSession:
         frame_idx = 0
         t_fps = time.monotonic()
         t0_wall = time.time()
+        play_start = time.monotonic()
         processed = 0
         got_any = False
+        connect_error_set = False
 
         try:
             while not self._stop.is_set():
@@ -263,11 +310,26 @@ class DetectionSession:
                     if is_file:
                         # EOF
                         break
-                    # Live stream down — wait for reconnect without ending session.
+                    # Live stream down — wait for reconnect without ending the
+                    # session. If it never connected, surface an error so a dead
+                    # camera doesn't look like a healthy one watching an empty aisle.
+                    if (
+                        not got_any
+                        and not connect_error_set
+                        and time.monotonic() - play_start > _CONNECT_TIMEOUT_SEC
+                    ):
+                        with self._lock:
+                            self._stats.error = f"no video from {self.filename}"
+                        connect_error_set = True
                     if self._stop.wait(timeout=0.1):
                         break
                     continue
 
+                if not got_any and connect_error_set:
+                    # Recovered — clear the earlier "no video" error.
+                    with self._lock:
+                        self._stats.error = None
+                    connect_error_set = False
                 got_any = True
                 frame_idx += 1
                 if is_file:
@@ -327,6 +389,6 @@ class DetectionSession:
 
         if not got_any:
             with self._lock:
-                self._stats.error = f"could not open source: {self.source}"
+                self._stats.error = f"could not open source: {self.filename}"
             return False
         return True

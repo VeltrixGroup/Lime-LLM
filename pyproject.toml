@@ -22,6 +22,13 @@ dependencies = [
 
 [project.optional-dependencies]
 onnx = ["onnx>=1.16", "onnxruntime>=1.18"]
+cloud = [
+    "alembic>=1.13",
+    "bcrypt>=4.1",
+    "itsdangerous>=2.1",
+    "pydantic-settings>=2.4",
+    "sqlalchemy>=2.0",
+]
 
 [project.scripts]
 storeguard = "storeguard.cli:main"
@@ -29,6 +36,7 @@ storeguard = "storeguard.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "httpx>=0.27",
 ]
 
 [build-system]
@@ -40,6 +48,8 @@ packages = ["src/storeguard"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/storeguard/dashboard/static" = "storeguard/dashboard/static"
+"src/storeguard/cloud/static" = "storeguard/cloud/static"
+"src/storeguard/cloud/migrations" = "storeguard/cloud/migrations"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

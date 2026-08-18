@@ -186,6 +186,65 @@ def _cmd_train(args: argparse.Namespace) -> None:
         console.print("Final metrics: " + ", ".join(parts))
 
 
+def _cmd_cloud(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard cloud`` (the multi-tenant control plane)."""
+    from .cloud.app import serve_cloud
+
+    if args.dev:
+        console.print(
+            "[yellow]--dev: creating tables directly (skip Alembic). "
+            "Do NOT use this in production.[/yellow]"
+        )
+    else:
+        console.print(
+            "[dim]Expecting an up-to-date schema — run "
+            "[bold]alembic upgrade head[/bold] first (or pass --dev).[/dim]"
+        )
+    serve_cloud(host=args.host, port=args.port, create_tables=args.dev)
+
+
+def _cmd_agent(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard agent`` — enroll with the cloud and pull config."""
+    import os
+
+    from .cloud.agent_client import CloudClient
+
+    token = args.key or os.environ.get("STOREGUARD_AGENT_KEY", "")
+    if not token:
+        raise SystemExit("provide --key or set STOREGUARD_AGENT_KEY")
+
+    if args.run:
+        # Full detection agent (heavy: torch + cv2 imported lazily here so the
+        # plain enroll/config check stays instant).
+        from .edge_agent import run_edge_agent
+
+        run_edge_agent(
+            args.server, token, device=args.device, process_every=args.process_every
+        )
+        return
+
+    client = CloudClient(args.server, token)
+    hb = client.heartbeat()
+    console.print(f"[green]Enrolled[/green] — tenant {hb.get('tenant_id')}")
+    cfg = client.get_config()
+    cams = cfg.get("cameras", [])
+    console.print(
+        f"[bold]{cfg.get('tenant_name')}[/bold] — {len(cams)} camera(s):"
+    )
+    for c in cams:
+        console.print(
+            f"  • {c['name']}  [{c['label']}]  "
+            f"every={c['process_every']} enabled={c['enabled']} "
+            f"zones={len(c['zones'])}"
+        )
+    if args.test_event:
+        ev = client.send_event(kind="test", message="hello from storeguard agent")
+        console.print(f"[cyan]Sent test event[/cyan] id={ev['id']}")
+        if args.clip:
+            up = client.upload_clip(ev["id"], args.clip)
+            console.print(f"[cyan]Uploaded clip[/cyan] has_clip={up['has_clip']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the top-level ``storeguard`` argument parser."""
     parser = argparse.ArgumentParser(
@@ -329,6 +388,55 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", type=int, default=8, help="batch size (default: 8)")
     p.add_argument("--lr", type=float, default=1e-4, help="learning rate (default: 1e-4)")
     p.set_defaults(func=_cmd_train)
+
+    p = sub.add_parser(
+        "cloud",
+        help="run the multi-tenant cloud control plane (accounts, tenants, API)",
+    )
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8000, help="HTTP port (default: 8000)")
+    p.add_argument(
+        "--dev",
+        action="store_true",
+        help="create tables directly instead of via Alembic (local dev only)",
+    )
+    p.set_defaults(func=_cmd_cloud)
+
+    p = sub.add_parser(
+        "agent",
+        help="edge agent: enroll with the cloud, pull camera config, push events",
+    )
+    p.add_argument(
+        "--server", required=True, help="cloud base URL, e.g. https://cloud.example.com"
+    )
+    p.add_argument(
+        "--key", default=None, help="agent token (or set STOREGUARD_AGENT_KEY)"
+    )
+    p.add_argument(
+        "--test-event",
+        action="store_true",
+        help="send a test event to verify the push path",
+    )
+    p.add_argument(
+        "--clip", default=None, help="path to a clip to attach to the test event"
+    )
+    p.add_argument(
+        "--run",
+        action="store_true",
+        help="run detection: pull camera config and push events + clips to the cloud",
+    )
+    p.add_argument(
+        "--device",
+        default="auto",
+        help='detector device for --run: "auto" | "cpu" | "cuda" | "mps"',
+    )
+    p.add_argument(
+        "--process-every",
+        type=int,
+        default=None,
+        help="for --run: process every Nth frame (default: from cloud config)",
+    )
+    p.set_defaults(func=_cmd_agent)
 
     return parser
 
