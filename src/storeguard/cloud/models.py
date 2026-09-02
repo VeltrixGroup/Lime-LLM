@@ -116,7 +116,7 @@ class Camera(Base):
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    #: RTSP/HTTP stream URL (may embed credentials — treat as sensitive).
+    #: RTSP stream URL (may embed credentials — treat as sensitive).
     source: Mapped[str] = mapped_column(String(1024), nullable=False)
     process_every: Mapped[int] = mapped_column(default=1, nullable=False)
     enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
@@ -215,6 +215,29 @@ class Event(Base):
     clip_content_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     tenant: Mapped["Tenant"] = relationship(back_populates="events")
+
+
+class CameraDefaults(Base):
+    """Per-tenant default camera credentials (one row per tenant).
+
+    Lets an owner add a camera by IP alone: :func:`storeguard.cloud.schemas.
+    build_camera_source` combines the IP with these defaults into a full RTSP
+    URL instead of requiring one typed out per camera.
+    """
+
+    __tablename__ = "camera_defaults"
+
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    username: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    #: Bot-token-style secret: write-only over the API, stored plaintext here.
+    password: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    port: Mapped[int] = mapped_column(default=554, nullable=False)
+    #: Path appended after host:port, e.g. "/Streaming/Channels/101".
+    stream_path: Mapped[str] = mapped_column(
+        String(200), default="/Streaming/Channels/101", nullable=False
+    )
 
 
 class TelegramConfig(Base):

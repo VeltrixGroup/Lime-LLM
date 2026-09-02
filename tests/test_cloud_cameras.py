@@ -86,6 +86,18 @@ def test_create_camera_bad_source_rejected(owner: TestClient) -> None:
     assert _create_camera(owner, source="ftp://nope/1").status_code == 422
 
 
+def test_create_camera_http_source_rejected(owner: TestClient) -> None:
+    # Cameras are RTSP-only — http(s):// was accepted historically but no
+    # longer is, since nothing in this system actually speaks it.
+    assert _create_camera(owner, source="http://10.0.0.9/stream").status_code == 422
+
+
+def test_create_camera_blank_name_defaults_to_source_label(owner: TestClient) -> None:
+    res = _create_camera(owner, name="")
+    assert res.status_code == 201, res.text
+    assert res.json()["name"] == "10.0.0.9:554/Streaming/Channels/101"
+
+
 def test_zone_points_must_be_normalized(owner: TestClient) -> None:
     bad = [{"name": "z", "points": [[0.1, 0.1], [1.5, 0.1], [0.5, 0.9]]}]
     assert _create_camera(owner, zones=bad).status_code == 422

@@ -41,6 +41,7 @@ from storeguard.cloud.models import (
     ROLE_OWNER,
     AgentKey,
     Camera,
+    CameraDefaults,
     CameraZone,
     Event,
     Membership,
@@ -55,6 +56,8 @@ from storeguard.cloud.schemas import (
     AgentKeyCreateRequest,
     AgentKeyOut,
     AgentKeysOut,
+    CameraDefaultsIn,
+    CameraDefaultsOut,
     CameraIn,
     CameraOut,
     CamerasOut,
@@ -75,6 +78,7 @@ from storeguard.cloud.schemas import (
     UserOut,
     ZoneOut,
     ZonesIn,
+    build_camera_source,
     camera_label,
     normalize_email,
 )
@@ -440,7 +444,14 @@ def create_cloud_app(
         db: Session = Depends(get_db),
         owner: Membership = Depends(require_owner),
     ) -> CameraOut:
-        name = body.name.strip()
+        if body.source:
+            source = body.source
+        else:
+            # IP-only add: build the RTSP URL from the tenant's saved defaults
+            # (username/password/port/stream path) instead of a typed-out URL.
+            defaults = db.get(CameraDefaults, owner.tenant_id)
+            source = build_camera_source(body.ip, defaults)
+        name = body.name.strip() or (body.ip or camera_label(source))[:120]
         if (
             db.scalar(
                 select(Camera.id).where(
@@ -455,7 +466,7 @@ def create_cloud_app(
         cam = Camera(
             tenant_id=owner.tenant_id,
             name=name,
-            source=body.source,
+            source=source,
             process_every=body.process_every,
             enabled=body.enabled,
         )
@@ -533,6 +544,52 @@ def create_cloud_app(
             )
         db.commit()
         return _camera_out(cam)
+
+    # ---- camera defaults (cabinet side, owner-only) ----
+    #
+    # Saved once per tenant so "add camera" only needs an IP address — the
+    # username/password/port/stream path are filled in from here, the same
+    # way an NVR client applies one saved credential set to every channel it
+    # discovers instead of asking for a full URL each time.
+
+    def _camera_defaults_out(cfg: CameraDefaults | None) -> CameraDefaultsOut:
+        if cfg is None:
+            return CameraDefaultsOut(
+                username="", port=554, stream_path="/Streaming/Channels/101",
+                password_set=False,
+            )
+        return CameraDefaultsOut(
+            username=cfg.username,
+            port=cfg.port,
+            stream_path=cfg.stream_path,
+            password_set=bool(cfg.password),
+        )
+
+    @app.get("/api/settings/camera-defaults", response_model=CameraDefaultsOut)
+    def get_camera_defaults(
+        db: Session = Depends(get_db),
+        owner: Membership = Depends(require_owner),
+    ) -> CameraDefaultsOut:
+        return _camera_defaults_out(db.get(CameraDefaults, owner.tenant_id))
+
+    @app.put("/api/settings/camera-defaults", response_model=CameraDefaultsOut)
+    def set_camera_defaults(
+        body: CameraDefaultsIn,
+        db: Session = Depends(get_db),
+        owner: Membership = Depends(require_owner),
+    ) -> CameraDefaultsOut:
+        cfg = db.get(CameraDefaults, owner.tenant_id)
+        if cfg is None:
+            cfg = CameraDefaults(tenant_id=owner.tenant_id)
+            db.add(cfg)
+        cfg.username = body.username.strip()
+        cfg.port = body.port
+        cfg.stream_path = body.stream_path.strip() or "/Streaming/Channels/101"
+        password = body.password.strip()
+        if password:  # an empty password in the request keeps the stored one
+            cfg.password = password
+        db.commit()
+        return _camera_defaults_out(cfg)
 
     # ---- agent keys (cabinet side) ----
 
