@@ -153,6 +153,41 @@
           </form>
         </section>
 
+        <section class="card" id="camera-defaults-card">
+          <div class="section-head">
+            <h2>Camera settings</h2>
+            <span id="camera-defaults-state" class="muted"></span>
+          </div>
+          <p class="muted">
+            Saved once and reused for every camera you add below — so adding a
+            camera only needs its IP address, not a full URL.
+          </p>
+          <form id="camera-defaults-form" class="form">
+            <label>
+              Username
+              <input type="text" name="username" placeholder="admin" autocomplete="off" />
+            </label>
+            <label>
+              Password
+              <input
+                type="password"
+                name="password"
+                placeholder="leave blank to keep the saved password"
+                autocomplete="off"
+              />
+            </label>
+            <label>
+              Port
+              <input type="number" name="port" min="1" max="65535" value="554" />
+            </label>
+            <label>
+              Stream path
+              <input type="text" name="stream_path" placeholder="/Streaming/Channels/101" />
+            </label>
+            <button class="btn primary" type="submit">Save</button>
+          </form>
+        </section>
+
         <section class="card" id="cameras-card">
           <div class="section-head">
             <h2>Cameras</h2>
@@ -163,13 +198,8 @@
           <form id="add-camera-form" class="add-form" hidden>
             <h3>Add camera</h3>
             <div class="row">
-              <input type="text" name="name" placeholder="name (e.g. Entrance)" required />
-              <input
-                type="text"
-                name="source"
-                placeholder="rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101"
-                required
-              />
+              <input type="text" name="name" placeholder="name (optional, e.g. Entrance)" />
+              <input type="text" name="ip" placeholder="192.168.1.64" required />
               <input
                 type="number"
                 name="process_every"
@@ -183,6 +213,11 @@
               </label>
               <button class="btn primary" type="submit">Add</button>
             </div>
+            <p class="muted">
+              Uses the username/password/port from Camera settings above. Need
+              a non-default URL for one camera? Add it here, then use
+              <em>Edit</em> to paste a full URL.
+            </p>
           </form>
         </section>
 

@@ -18,6 +18,11 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "python-multipart>=0.0.12",
+    "sqlalchemy>=2.0.52",
+    "itsdangerous>=2.2.0",
+    "bcrypt>=5.0.0",
+    "pydantic-settings>=2.15.0",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]

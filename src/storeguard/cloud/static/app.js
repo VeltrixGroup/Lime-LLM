@@ -455,8 +455,8 @@
       await api("/api/cameras", {
         method: "POST",
         body: {
-          name: fd.name,
-          source: fd.source,
+          name: fd.name || "",
+          ip: fd.ip,
           process_every: Number(fd.process_every) || 1,
           enabled: addCameraForm.elements.enabled.checked,
         },
@@ -465,6 +465,47 @@
       addCameraForm.elements.enabled.checked = true;
       setStatus("Camera added");
       await loadCameras();
+    } catch (err) {
+      setStatus(err.message, true);
+    }
+  });
+
+  // ---------- camera settings (defaults used to add a camera by IP) ----------
+
+  const cameraDefaultsCard = $("camera-defaults-card");
+  const cameraDefaultsForm = $("camera-defaults-form");
+  const cameraDefaultsState = $("camera-defaults-state");
+
+  async function loadCameraDefaults() {
+    try {
+      const cfg = await api("/api/settings/camera-defaults");
+      cameraDefaultsForm.elements.username.value = cfg.username || "";
+      cameraDefaultsForm.elements.password.value = "";
+      cameraDefaultsForm.elements.port.value = cfg.port;
+      cameraDefaultsForm.elements.stream_path.value = cfg.stream_path || "";
+      cameraDefaultsState.textContent = cfg.password_set
+        ? "password set"
+        : "no password set";
+    } catch (err) {
+      setStatus(err.message, true);
+    }
+  }
+
+  cameraDefaultsForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const fd = formData(cameraDefaultsForm);
+    try {
+      await api("/api/settings/camera-defaults", {
+        method: "PUT",
+        body: {
+          username: fd.username || "",
+          password: fd.password || "",
+          port: Number(fd.port) || 554,
+          stream_path: fd.stream_path || "",
+        },
+      });
+      setStatus("Camera settings saved");
+      await loadCameraDefaults();
     } catch (err) {
       setStatus(err.message, true);
     }
@@ -701,6 +742,7 @@
     whoRole.textContent = me.tenant.role;
     addForm.hidden = !isOwner();
     addCameraForm.hidden = !isOwner();
+    cameraDefaultsCard.hidden = !isOwner();
     devicesCard.hidden = !isOwner();
     telegramCard.hidden = !isOwner();
     changePwForm.hidden = true;
@@ -708,6 +750,7 @@
     await loadMembers();
     await loadCameras();
     if (isOwner()) {
+      await loadCameraDefaults();
       await loadAgentKeys();
       await loadTelegram();
     }

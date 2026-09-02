@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import ipaddress
 from datetime import datetime
+from urllib.parse import quote
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from storeguard.cloud.models import ROLE_STAFF, ROLES
+from storeguard.cloud.models import ROLE_STAFF, ROLES, CameraDefaults
 
 
 def _validate_role(value: str) -> str:
@@ -15,13 +17,13 @@ def _validate_role(value: str) -> str:
     return value
 
 
-_CAMERA_SCHEMES = ("rtsp://", "http://", "https://")
+_CAMERA_SCHEMES = ("rtsp://",)
 
 
 def _validate_source(value: str) -> str:
     value = value.strip()
     if not value.lower().startswith(_CAMERA_SCHEMES):
-        raise ValueError("source must start with rtsp://, http:// or https://")
+        raise ValueError("source must start with rtsp://")
     return value
 
 
@@ -29,6 +31,33 @@ def camera_label(source: str) -> str:
     """Human label for a camera source with credentials stripped."""
     label = source.split("@")[-1] if "@" in source else source
     return label[:61] + "..." if len(label) > 64 else label
+
+
+def _validate_ip(value: str) -> str:
+    value = value.strip()
+    try:
+        ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("ip must be a valid IPv4 or IPv6 address") from exc
+    return value
+
+
+def build_camera_source(ip: str, defaults: CameraDefaults | None) -> str:
+    """Build an RTSP URL for a bare ``ip`` using a tenant's saved camera defaults.
+
+    Lets "add camera" take just an IP address: the username, password, port,
+    and stream path are filled in from the tenant's :class:`CameraDefaults`
+    (or from Hikvision's own out-of-the-box values, if the tenant never set
+    any) instead of being retyped into a full URL every time.
+    """
+    port = defaults.port if defaults else 554
+    path = (defaults.stream_path.strip() if defaults else "") or "/Streaming/Channels/101"
+    if not path.startswith("/"):
+        path = "/" + path
+    username = defaults.username.strip() if defaults else ""
+    password = defaults.password.strip() if defaults else ""
+    auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
+    return f"rtsp://{auth}{ip}:{port}{path}"
 
 
 def _validate_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -148,15 +177,37 @@ class ZoneOut(BaseModel):
 
 
 class CameraIn(BaseModel):
-    """Create a camera (optionally with inline zones)."""
+    """Create a camera (optionally with inline zones).
 
-    name: str = Field(min_length=1, max_length=120)
-    source: str = Field(max_length=1024)
+    Either ``source`` (a full rtsp://... URL) or ``ip`` may be
+    given. ``ip`` is combined with the tenant's saved :class:`CameraDefaults`
+    (see :func:`build_camera_source`) so adding a camera doesn't require
+    typing a full URL — only the device's IP. ``name`` defaults to the IP (or
+    the source's host) when left blank.
+    """
+
+    name: str = Field(default="", max_length=120)
+    source: str | None = Field(default=None, max_length=1024)
+    ip: str | None = Field(default=None, max_length=64)
     process_every: int = Field(default=1, ge=1, le=100)
     enabled: bool = True
     zones: list[ZoneIn] = Field(default_factory=list)
 
-    _src = field_validator("source")(_validate_source)
+    @field_validator("source")
+    @classmethod
+    def _src(cls, value: str | None) -> str | None:
+        return _validate_source(value) if value else value
+
+    @field_validator("ip")
+    @classmethod
+    def _ip(cls, value: str | None) -> str | None:
+        return _validate_ip(value) if value else value
+
+    @model_validator(mode="after")
+    def _require_source_or_ip(self) -> "CameraIn":
+        if not self.source and not self.ip:
+            raise ValueError("either source or ip is required")
+        return self
 
 
 class CameraUpdate(BaseModel):
@@ -191,6 +242,24 @@ class CameraOut(BaseModel):
 
 class CamerasOut(BaseModel):
     cameras: list[CameraOut]
+
+
+class CameraDefaultsIn(BaseModel):
+    """Tenant-wide camera connection defaults. An empty password keeps the stored one."""
+
+    username: str = Field(default="", max_length=120)
+    password: str = Field(default="", max_length=200)
+    port: int = Field(default=554, ge=1, le=65535)
+    stream_path: str = Field(default="/Streaming/Channels/101", max_length=200)
+
+
+class CameraDefaultsOut(BaseModel):
+    """Camera defaults for display — the password is never returned."""
+
+    username: str
+    port: int
+    stream_path: str
+    password_set: bool
 
 
 # ---------------------------------------------------------------------------
