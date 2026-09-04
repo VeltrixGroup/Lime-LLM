@@ -92,6 +92,53 @@ from storeguard.cloud.settings import get_settings
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _CLIP_EXTS = {".mp4", ".webm", ".mov", ".m4v", ".jpg", ".jpeg", ".png", ".gif"}
+_CAMERA_TEST_TIMEOUT_SEC = 10.0
+
+
+def _probe_camera(source: str, timeout_sec: float = _CAMERA_TEST_TIMEOUT_SEC) -> bool:
+    """Try to grab one frame from ``source`` within ``timeout_sec``.
+
+    cv2 is imported lazily (it's a heavy import) so plain cabinet routes that
+    never touch a camera stream stay fast to import. Runs from wherever this
+    cloud process is hosted — only meaningful when it can reach the camera's
+    network (true for a local/on-prem cloud instance; not for one hosted away
+    from the store, where only the edge agent can reach the LAN).
+
+    The actual attempt runs on a background thread so a slow/unreachable host
+    can't block the request past ``timeout_sec`` — ``cv2.VideoCapture()``'s
+    own constructor blocks on connect and ignores our deadline until it
+    returns, which for a dead host can take 30s+ (FFmpeg's own internal
+    timeout). A timed-out probe leaves that thread to finish/die on its own;
+    it's a rare, manually-triggered action, not worth the complexity of a
+    hard cancel.
+    """
+    import os
+    import threading
+    import time
+
+    import cv2
+
+    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
+    result: dict[str, bool] = {}
+
+    def _attempt() -> None:
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+        try:
+            deadline = time.monotonic() + timeout_sec
+            while time.monotonic() < deadline:
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    result["ok"] = True
+                    return
+                time.sleep(0.2)
+            result["ok"] = False
+        finally:
+            cap.release()
+
+    thread = threading.Thread(target=_attempt, daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    return result.get("ok", False)
 
 
 def _slugify(name: str) -> str:
@@ -544,6 +591,16 @@ def create_cloud_app(
             )
         db.commit()
         return _camera_out(cam)
+
+    @app.post("/api/cameras/{camera_id}/test")
+    def test_camera(
+        camera_id: str,
+        db: Session = Depends(get_db),
+        owner: Membership = Depends(require_owner),
+    ) -> dict:
+        """Try to open the camera's stream and grab one frame (owner only)."""
+        cam = _get_camera(db, owner.tenant_id, camera_id)
+        return {"ok": _probe_camera(cam.source)}
 
     # ---- camera defaults (cabinet side, owner-only) ----
     #

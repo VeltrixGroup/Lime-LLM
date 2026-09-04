@@ -127,6 +127,7 @@ body {
   min-height: 0;
   overflow: hidden;
   background: #000;
+  cursor: zoom-in;
 }
 
 .viewport.multi .tile {
@@ -212,6 +213,24 @@ body {
 .tile-close:hover {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+/* Tap a tile (Hik-Connect style) to focus just that camera full-size. */
+.grid.expanded {
+  grid-template-columns: 1fr !important;
+}
+
+.grid.expanded .tile {
+  display: none;
+}
+
+.grid.expanded .tile.is-expanded {
+  display: block;
+  cursor: zoom-out;
+}
+
+.grid.expanded .tile.is-expanded .tile-hud {
+  display: flex;
 }
 
 .placeholder {
@@ -376,6 +395,36 @@ body {
 .camera-remove:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.cloud-connect {
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--line);
+}
+
+.cloud-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.cloud-row input {
+  flex: 1 1 200px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--ink);
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  padding: 0.6rem 0.75rem;
+}
+
+.cloud-row input:focus {
+  outline: 1px solid var(--lime-dim);
+}
+
+.cloud-row input:disabled {
+  opacity: 0.5;
 }
 
 .picker {

@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
+from storeguard.cloud.agent_client import CloudClient
 from storeguard.config import DetectorCfg
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
@@ -121,6 +122,14 @@ class CamerasSessionRequest(BaseModel):
         max_length=MAX_CAMERAS,
         description=f"1..{MAX_CAMERAS} camera URLs (rtsp:// or http(s)://)",
     )
+    process_every: int = 1
+
+
+class CloudSessionRequest(BaseModel):
+    """Pull this tenant's enabled cameras from the cloud and connect all of them."""
+
+    server: str = Field(..., min_length=1, description="Cloud base URL, e.g. http://127.0.0.1:8000")
+    token: str = Field(..., min_length=1, description="Agent token from the cabinet's Edge devices")
     process_every: int = 1
 
 
@@ -338,6 +347,54 @@ def create_app(
         return JSONResponse(
             {
                 "count": len(sessions),
+                "sessions": [
+                    {"id": s.id, "filename": s.filename, "source": "camera"}
+                    for s in sessions
+                ],
+            }
+        )
+
+    @app.post("/api/session/cloud")
+    def create_cloud_sessions(body: CloudSessionRequest) -> JSONResponse:
+        """Pull this tenant's enabled cameras from the cloud and connect all of them.
+
+        Same replace-all-and-start behavior as ``/api/session/cameras``, but
+        the camera list (with credentials already filled in) and each
+        camera's name come straight from the cabinet instead of being
+        retyped as raw URLs.
+        """
+        try:
+            client = CloudClient(body.server.strip(), body.token.strip())
+            cfg = client.get_config()
+        except Exception as exc:  # noqa: BLE001 — surface any failure as a clean 400
+            raise HTTPException(
+                status_code=400, detail=f"could not reach the cloud: {exc}"
+            ) from exc
+
+        cams = [c for c in cfg.get("cameras", []) if c.get("enabled", True)]
+        if not cams:
+            raise HTTPException(
+                status_code=400, detail="no enabled cameras in the cloud config"
+            )
+        total = len(cams)
+        cams = cams[:MAX_CAMERAS]
+        sessions = [
+            _make_session(
+                session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
+                source=c["source"],
+                filename=c.get("name") or _camera_label(c["source"]),
+                process_every=body.process_every,
+                loop=False,
+                kind="camera",
+            )
+            for c in cams
+        ]
+        _replace_sessions(sessions, start=True)
+        return JSONResponse(
+            {
+                "count": len(sessions),
+                "total_enabled": total,
+                "tenant_name": cfg.get("tenant_name", ""),
                 "sessions": [
                     {"id": s.id, "filename": s.filename, "source": "camera"}
                     for s in sessions

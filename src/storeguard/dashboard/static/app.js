@@ -5,6 +5,9 @@
   const cameraRows = document.getElementById("camera-rows");
   const cameraCount = document.getElementById("camera-count");
   const btnAddCamera = document.getElementById("btn-add-camera");
+  const cloudServerInput = document.getElementById("cloud-server");
+  const cloudTokenInput = document.getElementById("cloud-token");
+  const btnCloudConnect = document.getElementById("btn-cloud-connect");
   const localSelect = document.getElementById("local-video");
   const btnRefresh = document.getElementById("btn-refresh");
   const fileInput = document.getElementById("file");
@@ -34,6 +37,9 @@
   let wsRetryTimer = null;
   let selectedFile = null;
   let selectedLocal = "";
+  // Session id of the tile currently tapped open full-size (Hik-Connect
+  // style), or null when showing the grid.
+  let expandedId = null;
   const blobUrls = new Map(); // session id -> last object URL (revoked on replace)
 
   // ---------- camera url rows ----------
@@ -144,6 +150,9 @@
     localSelect.disabled = running;
     btnRefresh.disabled = running;
     for (const input of rowInputs()) input.disabled = running;
+    cloudServerInput.disabled = running;
+    cloudTokenInput.disabled = running;
+    btnCloudConnect.disabled = running;
     updateCameraHead();
   }
 
@@ -258,22 +267,39 @@
     close.className = "tile-close";
     close.title = "Disconnect this camera";
     close.textContent = "×";
-    close.addEventListener("click", () => removeTile(s.id));
+    close.addEventListener("click", (e) => {
+      e.stopPropagation(); // don't also toggle expand
+      removeTile(s.id);
+    });
     tile.appendChild(close);
+
+    // Tap a tile to focus just that camera full-size; tap again for the grid.
+    tile.addEventListener("click", () => {
+      expandedId = expandedId === s.id ? null : s.id;
+      syncStage();
+    });
     return tile;
   }
 
   function syncStage() {
-    const count = grid.querySelectorAll(".tile").length;
-    grid.style.setProperty("--cols", gridColumns(count));
-    viewport.classList.toggle("multi", count > 1);
+    const tiles = Array.from(grid.querySelectorAll(".tile"));
+    const count = tiles.length;
+    const hasExpanded =
+      Boolean(expandedId) && tiles.some((t) => t.dataset.id === expandedId);
+    grid.classList.toggle("expanded", hasExpanded);
+    for (const t of tiles) {
+      t.classList.toggle("is-expanded", hasExpanded && t.dataset.id === expandedId);
+    }
+    if (!hasExpanded) grid.style.setProperty("--cols", gridColumns(count));
+    viewport.classList.toggle("multi", count > 1 && !hasExpanded);
     grid.hidden = count === 0;
     placeholder.hidden = count > 0;
-    hud.hidden = count === 0;
+    hud.hidden = count === 0 || hasExpanded;
   }
 
   function buildTiles(sessions) {
     grid.innerHTML = "";
+    expandedId = null;
     for (const s of sessions) grid.appendChild(buildTile(s));
     syncStage();
   }
@@ -290,6 +316,7 @@
           URL.revokeObjectURL(url);
           blobUrls.delete(tile.dataset.id);
         }
+        if (expandedId === tile.dataset.id) expandedId = null;
         tile.remove();
       }
     }
@@ -315,18 +342,19 @@
       URL.revokeObjectURL(url);
       blobUrls.delete(id);
     }
-    const left = grid.querySelectorAll(".tile").length;
-    grid.style.setProperty("--cols", gridColumns(left));
-    viewport.classList.toggle("multi", left > 1);
-    if (!left) stopAll(false);
+    if (expandedId === id) expandedId = null;
+    syncStage();
+    if (!grid.querySelectorAll(".tile").length) stopAll(false);
   }
 
   function clearTiles() {
     grid.innerHTML = "";
     grid.hidden = true;
+    grid.classList.remove("expanded");
     viewport.classList.remove("multi");
     placeholder.hidden = false;
     hud.hidden = true;
+    expandedId = null;
     for (const url of blobUrls.values()) URL.revokeObjectURL(url);
     blobUrls.clear();
   }
@@ -535,6 +563,38 @@
     return [data];
   }
 
+  async function startCloud(server, token) {
+    setStatus("Connecting to cloud…");
+    const res = await fetch("/api/session/cloud", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        server,
+        token,
+        process_every: Number(everyInput.value),
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `Cloud connect failed (${res.status})`);
+    }
+    return res.json();
+  }
+
+  // Shared tail for every "start" path: show the grid, join the frame feed,
+  // start polling stats, and report what's now running.
+  function onSessionsStarted(sessions, label) {
+    buildTiles(sessions);
+    openWs();
+    startStatsPoll();
+    setStatus(
+      label ||
+        (sessions.length === 1
+          ? `Detecting — ${sessions[0].filename}`
+          : `Detecting on ${sessions.length} cameras`)
+    );
+  }
+
   btnStart.addEventListener("click", async () => {
     const urls = cameraUrls();
     try {
@@ -549,13 +609,38 @@
       } else {
         throw new Error("Add a camera URL, pick data/, or upload a video");
       }
-      buildTiles(sessions);
-      openWs();
-      startStatsPoll();
-      setStatus(
-        sessions.length === 1
-          ? `Detecting — ${sessions[0].filename}`
-          : `Detecting on ${sessions.length} cameras`
+      onSessionsStarted(sessions);
+    } catch (err) {
+      setRunning(false);
+      clearTiles();
+      setStatus(err.message || String(err), true);
+    }
+  });
+
+  btnCloudConnect.addEventListener("click", async () => {
+    const server = cloudServerInput.value.trim();
+    const token = cloudTokenInput.value.trim();
+    if (!server || !token) {
+      setStatus("Enter both the cloud server URL and an agent token", true);
+      return;
+    }
+    try {
+      localStorage.setItem("storeguard_cloud_server", server);
+      localStorage.setItem("storeguard_cloud_token", token);
+    } catch {
+      /* localStorage unavailable (private mode etc.) — not fatal */
+    }
+    try {
+      setRunning(true);
+      const data = await startCloud(server, token);
+      const sessions = data.sessions || [];
+      if (!sessions.length) throw new Error("No cameras connected");
+      const dropped = (data.total_enabled || sessions.length) - sessions.length;
+      onSessionsStarted(
+        sessions,
+        `Connected ${sessions.length} camera${sessions.length === 1 ? "" : "s"}` +
+          (data.tenant_name ? ` from ${data.tenant_name}` : "") +
+          (dropped > 0 ? ` (${dropped} more skipped — 16 max)` : "")
       );
     } catch (err) {
       setRunning(false);
@@ -595,21 +680,26 @@
       // (the poll's latch keeps the view up until they actually run).
       const sessions = data.sessions || [];
       if (!sessions.length) return;
-      buildTiles(sessions);
       setRunning(true);
-      openWs();
-      startStatsPoll();
-      setStatus(
-        sessions.length === 1
-          ? `Detecting — ${sessions[0].filename}`
-          : `Detecting on ${sessions.length} cameras`
-      );
+      onSessionsStarted(sessions);
     } catch {
       /* server unreachable — leave the idle UI */
     }
   }
 
+  // Remember the cloud server/token locally (this machine only) so they
+  // don't need retyping every time the dashboard is opened.
+  function restoreCloudFields() {
+    try {
+      cloudServerInput.value = localStorage.getItem("storeguard_cloud_server") || "";
+      cloudTokenInput.value = localStorage.getItem("storeguard_cloud_token") || "";
+    } catch {
+      /* localStorage unavailable (private mode etc.) — leave fields blank */
+    }
+  }
+
   addCameraRow();
   loadVideos();
+  restoreCloudFields();
   reattachRunningSessions();
 })();

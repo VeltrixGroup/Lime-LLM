@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+import storeguard.cloud.app as cloud_app
 from storeguard.cloud.app import create_cloud_app
 
 _RTSP = "rtsp://admin:s3cret@10.0.0.9:554/Streaming/Channels/101"
@@ -170,6 +171,38 @@ def test_staff_can_read_but_not_write(app, owner: TestClient) -> None:
         staff.put(f"/api/cameras/{cam_id}/zones", json={"zones": _ZONES}).status_code
         == 403
     )
+
+
+def test_test_camera_connection_ok(owner: TestClient, monkeypatch) -> None:
+    cam_id = _create_camera(owner).json()["id"]
+    monkeypatch.setattr(cloud_app, "_probe_camera", lambda source: True)
+    res = owner.post(f"/api/cameras/{cam_id}/test")
+    assert res.status_code == 200
+    assert res.json() == {"ok": True}
+
+
+def test_test_camera_connection_fails(owner: TestClient, monkeypatch) -> None:
+    cam_id = _create_camera(owner).json()["id"]
+    monkeypatch.setattr(cloud_app, "_probe_camera", lambda source: False)
+    res = owner.post(f"/api/cameras/{cam_id}/test")
+    assert res.status_code == 200
+    assert res.json() == {"ok": False}
+
+
+def test_test_camera_requires_owner(owner: TestClient, app, monkeypatch) -> None:
+    cam_id = _create_camera(owner).json()["id"]
+    monkeypatch.setattr(cloud_app, "_probe_camera", lambda source: True)
+    owner.post(
+        "/api/org/members",
+        json={"email": "staff@a.com", "password": "staffpass1", "role": "staff"},
+    )
+    staff = TestClient(app)
+    staff.post("/api/auth/login", json={"email": "staff@a.com", "password": "staffpass1"})
+    assert staff.post(f"/api/cameras/{cam_id}/test").status_code == 403
+
+
+def test_test_camera_not_found(owner: TestClient) -> None:
+    assert owner.post("/api/cameras/does-not-exist/test").status_code == 404
 
 
 def test_camera_isolation_between_tenants(app, owner: TestClient) -> None:

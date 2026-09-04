@@ -163,6 +163,98 @@ def test_stop_all_clears_registry(client: TestClient) -> None:
     assert _session_ids(client) == []
 
 
+class _FakeCloudClient:
+    """Stand-in for CloudClient: returns a canned config, no real HTTP call."""
+
+    config: dict = {}
+    last_init: tuple[str, str] | None = None
+
+    def __init__(self, server: str, token: str) -> None:
+        type(self).last_init = (server, token)
+
+    def get_config(self) -> dict:
+        return type(self).config
+
+
+def test_cloud_session_connects_enabled_cameras_by_name(
+    client: TestClient, monkeypatch
+) -> None:
+    _FakeCloudClient.config = {
+        "tenant_name": "Store A",
+        "cameras": [
+            {"id": "c1", "name": "Entrance", "source": "rtsp://a/1", "enabled": True},
+            {"id": "c2", "name": "Stockroom", "source": "rtsp://b/1", "enabled": False},
+        ],
+    }
+    monkeypatch.setattr(dashboard_app, "CloudClient", _FakeCloudClient)
+    res = client.post(
+        "/api/session/cloud",
+        json={"server": "http://cloud.local", "token": "tok"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["count"] == 1
+    assert body["tenant_name"] == "Store A"
+    assert body["sessions"][0]["filename"] == "Entrance"
+    assert _FakeCloudClient.last_init == ("http://cloud.local", "tok")
+
+    listing = client.get("/api/sessions").json()
+    assert len(listing["sessions"]) == 1
+
+
+def test_cloud_session_no_enabled_cameras_rejected(
+    client: TestClient, monkeypatch
+) -> None:
+    _FakeCloudClient.config = {"tenant_name": "Store A", "cameras": []}
+    monkeypatch.setattr(dashboard_app, "CloudClient", _FakeCloudClient)
+    res = client.post(
+        "/api/session/cloud", json={"server": "http://cloud.local", "token": "tok"}
+    )
+    assert res.status_code == 400
+    assert _session_ids(client) == []
+
+
+def test_cloud_session_connection_failure_returns_400(
+    client: TestClient, monkeypatch
+) -> None:
+    class _BrokenCloudClient:
+        def __init__(self, server, token):
+            pass
+
+        def get_config(self):
+            raise ConnectionError("refused")
+
+    monkeypatch.setattr(dashboard_app, "CloudClient", _BrokenCloudClient)
+    res = client.post(
+        "/api/session/cloud", json={"server": "http://cloud.local", "token": "tok"}
+    )
+    assert res.status_code == 400
+    assert "refused" in res.json()["detail"]
+
+
+def test_cloud_session_caps_at_max_cameras(client: TestClient, monkeypatch) -> None:
+    _FakeCloudClient.config = {
+        "tenant_name": "Big Store",
+        "cameras": [
+            {
+                "id": f"c{i}",
+                "name": f"Cam {i}",
+                "source": f"rtsp://cam{i}.local/1",
+                "enabled": True,
+            }
+            for i in range(MAX_CAMERAS + 3)
+        ],
+    }
+    monkeypatch.setattr(dashboard_app, "CloudClient", _FakeCloudClient)
+    res = client.post(
+        "/api/session/cloud", json={"server": "http://cloud.local", "token": "tok"}
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["count"] == MAX_CAMERAS
+    assert body["total_enabled"] == MAX_CAMERAS + 3
+
+
 def test_ws_frames_prefixes_session_id(client: TestClient) -> None:
     body = client.post(
         "/api/session/cameras", json={"urls": ["rtsp://a.local/1"]}

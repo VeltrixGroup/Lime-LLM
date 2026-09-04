@@ -7,9 +7,21 @@
 
   let me = null; // { user:{id,email,full_name}, tenant:{id,name,slug,role} }
 
+  let statusTimer = null;
+
   function setStatus(msg, isError = false) {
     statusEl.textContent = msg || "";
     statusEl.classList.toggle("error", Boolean(isError));
+    clearTimeout(statusTimer);
+    if (!msg) {
+      statusEl.classList.remove("show");
+      return;
+    }
+    statusEl.classList.add("show");
+    // Errors stay until the next action; confirmations fade on their own.
+    if (!isError) {
+      statusTimer = setTimeout(() => statusEl.classList.remove("show"), 4000);
+    }
   }
 
   async function api(path, { method = "GET", body } = {}) {
@@ -240,6 +252,23 @@
     return b;
   }
 
+  function emptyState(text) {
+    const div = document.createElement("div");
+    div.className = "empty";
+    div.textContent = text;
+    return div;
+  }
+
+  function emptyRow(colspan, text) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = colspan;
+    td.className = "empty";
+    td.textContent = text;
+    tr.appendChild(td);
+    return tr;
+  }
+
   function labeledInput(labelText, input) {
     const l = document.createElement("label");
     l.textContent = labelText;
@@ -405,9 +434,29 @@
     actions.className = "cam-actions";
     const editBtn = mkBtn("Edit", "ghost sm");
     const zonesBtn = mkBtn("Zones", "ghost sm");
+    const testBtn = mkBtn("Test", "ghost sm");
     const delBtn = mkBtn("Delete", "danger sm");
-    actions.append(editBtn, zonesBtn, delBtn);
+    actions.append(editBtn, zonesBtn, testBtn, delBtn);
     head.appendChild(actions);
+
+    testBtn.addEventListener("click", async () => {
+      testBtn.disabled = true;
+      testBtn.textContent = "Testing…";
+      try {
+        const res = await api(`/api/cameras/${cam.id}/test`, { method: "POST" });
+        setStatus(
+          res.ok
+            ? `${cam.name}: stream connected`
+            : `${cam.name}: could not connect — check credentials/port/path`,
+          !res.ok
+        );
+      } catch (err) {
+        setStatus(err.message, true);
+      } finally {
+        testBtn.disabled = false;
+        testBtn.textContent = "Test";
+      }
+    });
 
     const editForm = buildEditForm(cam);
     const zonesForm = buildZonesForm(cam);
@@ -439,6 +488,11 @@
       const data = await api("/api/cameras");
       const cams = data.cameras || [];
       camerasList.innerHTML = "";
+      if (cams.length === 0) {
+        camerasList.appendChild(
+          emptyState("No cameras yet — add one below with its IP address.")
+        );
+      }
       for (const c of cams) camerasList.appendChild(renderCamera(c));
       cameraCount.textContent = `${cams.length} camera${
         cams.length === 1 ? "" : "s"
@@ -580,6 +634,11 @@
       const data = await api("/api/agent-keys");
       const keys = data.keys || [];
       keysList.innerHTML = "";
+      if (keys.length === 0) {
+        keysList.appendChild(
+          emptyState("No device tokens yet — create one below for the store PC.")
+        );
+      }
       for (const k of keys) keysList.appendChild(renderKeyRow(k));
       keyCount.textContent = `${keys.length} token${keys.length === 1 ? "" : "s"}`;
     } catch (err) {
@@ -655,6 +714,9 @@
       const data = await api(path);
       const evs = data.events || [];
       eventsBody.innerHTML = "";
+      if (evs.length === 0) {
+        eventsBody.appendChild(emptyRow(6, "No events yet."));
+      }
       for (const ev of evs) eventsBody.appendChild(renderEventRow(ev));
       const base = `${evs.length} event${evs.length === 1 ? "" : "s"}`;
       eventCount.textContent = personId
