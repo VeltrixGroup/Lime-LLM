@@ -54,6 +54,30 @@
           <div class="camera-rows" id="camera-rows"></div>
         </div>
 
+        <div class="cameras cloud-connect" id="cloud-connect">
+          <div class="cameras-head">
+            <span class="picker-label">Or connect from cloud</span>
+          </div>
+          <div class="cloud-row">
+            <input
+              type="text"
+              id="cloud-server"
+              placeholder="http://127.0.0.1:8000"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <input
+              type="password"
+              id="cloud-token"
+              placeholder="agent token (Edge devices in the cabinet)"
+              autocomplete="off"
+            />
+            <button type="button" id="btn-cloud-connect" class="btn ghost">
+              Connect
+            </button>
+          </div>
+        </div>
+
         <label class="picker">
           <span class="picker-label">From data/</span>
           <select id="local-video">
