@@ -303,6 +303,12 @@ input[type="number"] {
   font-size: 0.8rem;
 }
 
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
 /* ---------- org bar ---------- */
 
 .orgbar {

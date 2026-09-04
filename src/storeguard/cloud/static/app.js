@@ -434,9 +434,29 @@
     actions.className = "cam-actions";
     const editBtn = mkBtn("Edit", "ghost sm");
     const zonesBtn = mkBtn("Zones", "ghost sm");
+    const testBtn = mkBtn("Test", "ghost sm");
     const delBtn = mkBtn("Delete", "danger sm");
-    actions.append(editBtn, zonesBtn, delBtn);
+    actions.append(editBtn, zonesBtn, testBtn, delBtn);
     head.appendChild(actions);
+
+    testBtn.addEventListener("click", async () => {
+      testBtn.disabled = true;
+      testBtn.textContent = "Testing…";
+      try {
+        const res = await api(`/api/cameras/${cam.id}/test`, { method: "POST" });
+        setStatus(
+          res.ok
+            ? `${cam.name}: stream connected`
+            : `${cam.name}: could not connect — check credentials/port/path`,
+          !res.ok
+        );
+      } catch (err) {
+        setStatus(err.message, true);
+      } finally {
+        testBtn.disabled = false;
+        testBtn.textContent = "Test";
+      }
+    });
 
     const editForm = buildEditForm(cam);
     const zonesForm = buildZonesForm(cam);
