@@ -151,11 +151,17 @@ def build_live_proxy_router(upstream_base: str) -> APIRouter:
                     asyncio.create_task(client_to_upstream()),
                     asyncio.create_task(upstream_to_client()),
                 ]
-                _done, pending = await asyncio.wait(
+                done, pending = await asyncio.wait(
                     tasks, return_when=asyncio.FIRST_COMPLETED
                 )
                 for task in pending:
                     task.cancel()
+                for task in done:
+                    # asyncio.wait() never raises on task failure — retrieve
+                    # each result so a dropped upstream connection surfaces
+                    # into the except below instead of being logged as
+                    # "Task exception was never retrieved" once GC'd.
+                    task.result()
         except (OSError, websockets.exceptions.WebSocketException):
             pass
         finally:

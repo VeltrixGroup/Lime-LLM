@@ -19,6 +19,13 @@ function apiPath(path) {
   return `${API_BASE}${path}`;
 }
 
+// Proxied under "/live/" means this page shares its origin (and session
+// cookie) with the cloud cabinet — so instead of asking for camera URLs by
+// hand, it can just ask the cabinet's own (unproxied, sibling) /api/cameras
+// for this tenant's cameras. Standalone at "/" has no cabinet to ask, so it
+// keeps the manual entry.
+const isProxied = API_BASE !== "";
+
 // ---------- state ----------
 
 const running = ref(false);
@@ -32,13 +39,6 @@ const blobUrls = new Map(); // session id -> last object URL (revoked on replace
 const expandedId = ref(null);
 
 const cameraUrlRows = ref([""]);
-const cloudServer = ref("");
-const cloudToken = ref("");
-
-const videos = ref([]);
-const dataDir = ref("");
-const selectedLocal = ref("");
-const selectedFile = ref(null);
 
 const everyN = ref(1);
 const statusMsg = ref("");
@@ -59,9 +59,7 @@ const cameraUrls = computed(() => {
   return urls;
 });
 
-const canStart = computed(
-  () => Boolean(cameraUrls.value.length || selectedLocal.value || selectedFile.value)
-);
+const canStart = computed(() => Boolean(cameraUrls.value.length));
 
 const gridCols = computed(() => {
   const count = sessions.value.length;
@@ -116,67 +114,6 @@ function addCameraRow() {
 function removeCameraRow(index) {
   if (cameraUrlRows.value.length <= 1) return;
   cameraUrlRows.value.splice(index, 1);
-}
-
-function onCameraRowInput() {
-  if (cameraUrls.value.length) {
-    selectedLocal.value = "";
-    selectedFile.value = null;
-  }
-}
-
-function startHint() {
-  if (running.value) return;
-  if (cameraUrls.value.length) {
-    setStatus(
-      cameraUrls.value.length === 1
-        ? "Start connects 1 camera"
-        : `Start connects ${cameraUrls.value.length} cameras`
-    );
-  } else if (selectedLocal.value) {
-    setStatus(`Start plays data/${selectedLocal.value}`);
-  } else if (selectedFile.value) {
-    setStatus(`Start uploads ${selectedFile.value.name}`);
-  }
-}
-
-// ---------- data/ picker + upload ----------
-
-async function loadVideos() {
-  try {
-    const res = await fetch(apiPath("/api/videos"));
-    if (!res.ok) throw new Error(`list failed (${res.status})`);
-    const data = await res.json();
-    videos.value = data.videos || [];
-    dataDir.value = data.data_dir || "data/";
-    if (selectedLocal.value && !videos.value.some((v) => v.path === selectedLocal.value)) {
-      selectedLocal.value = "";
-    }
-    if (!cameraUrls.value.length) {
-      setStatus(
-        videos.value.length
-          ? `${videos.value.length} video(s) in data/`
-          : `Looking in ${dataDir.value} — or add camera URLs`
-      );
-    }
-  } catch (err) {
-    setStatus(err.message || String(err), true);
-  }
-}
-
-function onLocalChange() {
-  if (selectedLocal.value) {
-    selectedFile.value = null;
-  }
-  startHint();
-}
-
-function onFileChange(e) {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  selectedFile.value = file;
-  selectedLocal.value = "";
-  startHint();
 }
 
 // ---------- tiles ----------
@@ -314,64 +251,6 @@ async function startCamerasReq(urls) {
   return (await res.json()).sessions || [];
 }
 
-async function startLocalReq(path) {
-  setStatus(`Opening data/${path}…`);
-  const res = await fetch(apiPath("/api/session/local"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, process_every: Number(everyN.value), loop: true }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Open failed (${res.status})`);
-  }
-  const data = await res.json();
-  const startRes = await fetch(apiPath(`/api/session/${data.id}/start?process_every=${everyN.value}`), {
-    method: "POST",
-  });
-  if (!startRes.ok) {
-    const err = await startRes.json().catch(() => ({}));
-    throw new Error(err.detail || "Failed to start");
-  }
-  return [data];
-}
-
-async function startUploadReq(file) {
-  const body = new FormData();
-  body.append("file", file);
-  body.append("process_every", everyN.value);
-  body.append("loop", "true");
-  setStatus("Uploading…");
-  const res = await fetch(apiPath("/api/session"), { method: "POST", body });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Upload failed (${res.status})`);
-  }
-  const data = await res.json();
-  const startRes = await fetch(apiPath(`/api/session/${data.id}/start?process_every=${everyN.value}`), {
-    method: "POST",
-  });
-  if (!startRes.ok) {
-    const err = await startRes.json().catch(() => ({}));
-    throw new Error(err.detail || "Failed to start");
-  }
-  return [data];
-}
-
-async function startCloudReq(server, token) {
-  setStatus("Connecting to cloud…");
-  const res = await fetch(apiPath("/api/session/cloud"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ server, token, process_every: Number(everyN.value) }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Cloud connect failed (${res.status})`);
-  }
-  return res.json();
-}
-
 function onSessionsStarted(newSessions, label) {
   sessions.value = newSessions;
   expandedId.value = null;
@@ -388,16 +267,8 @@ function onSessionsStarted(newSessions, label) {
 async function onStart() {
   try {
     running.value = true;
-    let started;
-    if (cameraUrls.value.length) {
-      started = await startCamerasReq(cameraUrls.value);
-    } else if (selectedLocal.value) {
-      started = await startLocalReq(selectedLocal.value);
-    } else if (selectedFile.value) {
-      started = await startUploadReq(selectedFile.value);
-    } else {
-      throw new Error("Add a camera URL, pick data/, or upload a video");
-    }
+    if (!cameraUrls.value.length) throw new Error("Add a camera URL");
+    const started = await startCamerasReq(cameraUrls.value);
     onSessionsStarted(started);
   } catch (err) {
     running.value = false;
@@ -406,30 +277,19 @@ async function onStart() {
   }
 }
 
-async function onCloudConnect() {
-  const server = cloudServer.value.trim();
-  const token = cloudToken.value.trim();
-  if (!server || !token) {
-    setStatus("Enter both the cloud server URL and an agent token", true);
-    return;
-  }
-  try {
-    localStorage.setItem("storeguard_cloud_server", server);
-    localStorage.setItem("storeguard_cloud_token", token);
-  } catch {
-    /* localStorage unavailable — not fatal */
-  }
+async function startFromCabinet() {
   try {
     running.value = true;
-    const data = await startCloudReq(server, token);
-    const started = data.sessions || [];
-    if (!started.length) throw new Error("No cameras connected");
-    const dropped = (data.total_enabled || started.length) - started.length;
+    setStatus("Loading cameras from the cabinet…");
+    const res = await fetch("/api/cameras"); // cabinet's own origin, not apiPath()
+    if (!res.ok) throw new Error(`Could not reach the cabinet (${res.status})`);
+    const data = await res.json();
+    const urls = (data.cameras || []).filter((c) => c.enabled).map((c) => c.source);
+    if (!urls.length) throw new Error("No enabled cameras in the cabinet yet");
+    const started = await startCamerasReq(urls);
     onSessionsStarted(
       started,
-      `Connected ${started.length} camera${started.length === 1 ? "" : "s"}` +
-        (data.tenant_name ? ` from ${data.tenant_name}` : "") +
-        (dropped > 0 ? ` (${dropped} more skipped — 16 max)` : "")
+      `Connected ${started.length} camera${started.length === 1 ? "" : "s"} from the cabinet`
     );
   } catch (err) {
     running.value = false;
@@ -471,19 +331,11 @@ async function reattachRunningSessions() {
   }
 }
 
-function restoreCloudFields() {
-  try {
-    cloudServer.value = localStorage.getItem("storeguard_cloud_server") || "";
-    cloudToken.value = localStorage.getItem("storeguard_cloud_token") || "";
-  } catch {
-    /* localStorage unavailable — leave fields blank */
+onMounted(async () => {
+  await reattachRunningSessions();
+  if (isProxied && !running.value) {
+    startFromCabinet();
   }
-}
-
-onMounted(() => {
-  loadVideos();
-  restoreCloudFields();
-  reattachRunningSessions();
 });
 
 onUnmounted(() => {
@@ -519,10 +371,8 @@ onUnmounted(() => {
           />
         </div>
         <div class="placeholder" :hidden="sessions.length > 0">
-          <p>
-            Add up to {{ MAX_CAMERAS }} camera URLs, pick a clip from
-            <code>data/</code>, or upload a video.
-          </p>
+          <p v-if="isProxied">Loading cameras from the cabinet…</p>
+          <p v-else>Add up to {{ MAX_CAMERAS }} camera URLs to start.</p>
         </div>
         <div class="hud" :hidden="sessions.length === 0 || isExpanded">
           <div class="hud-row">
@@ -542,7 +392,7 @@ onUnmounted(() => {
     </section>
 
     <section class="controls" aria-label="Playback controls">
-      <div class="cameras">
+      <div class="cameras" v-if="!isProxied">
         <div class="cameras-head">
           <span class="picker-label">Camera URLs</span>
           <span class="cameras-count">{{ cameraUrlRows.length }} / {{ MAX_CAMERAS }}</span>
@@ -564,7 +414,6 @@ onUnmounted(() => {
               autocomplete="off"
               spellcheck="false"
               :disabled="running"
-              @input="onCameraRowInput"
             />
             <button
               type="button"
@@ -579,54 +428,14 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <div class="cameras cloud-connect">
+      <div class="cameras" v-else>
         <div class="cameras-head">
-          <span class="picker-label">Or connect from cloud</span>
-        </div>
-        <div class="cloud-row">
-          <input
-            type="text"
-            v-model="cloudServer"
-            placeholder="http://127.0.0.1:8000"
-            autocomplete="off"
-            spellcheck="false"
-            :disabled="running"
-          />
-          <input
-            type="password"
-            v-model="cloudToken"
-            placeholder="agent token (Edge devices in the cabinet)"
-            autocomplete="off"
-            :disabled="running"
-          />
-          <button type="button" class="btn ghost" :disabled="running" @click="onCloudConnect">
-            Connect
+          <span class="picker-label">Cameras from the cabinet</span>
+          <button type="button" class="btn ghost" :disabled="running" @click="startFromCabinet">
+            Reconnect
           </button>
         </div>
       </div>
-
-      <label class="picker">
-        <span class="picker-label">From data/</span>
-        <select v-model="selectedLocal" :disabled="running" @change="onLocalChange">
-          <option value="">
-            {{ videos.length ? `Select from data/ (${videos.length})` : "No videos in data/ — drop an .mp4 there" }}
-          </option>
-          <option v-for="v in videos" :key="v.path" :value="v.path">{{ v.name }}</option>
-        </select>
-        <button type="button" class="btn ghost" :disabled="running" title="Rescan data/" @click="loadVideos">
-          Refresh
-        </button>
-      </label>
-
-      <label class="file">
-        <input
-          type="file"
-          accept="video/*,.mp4,.avi,.mkv,.mov,.webm"
-          :disabled="running"
-          @change="onFileChange"
-        />
-        <span>{{ selectedFile ? selectedFile.name : "Or upload" }}</span>
-      </label>
 
       <label class="every">
         Every
@@ -636,7 +445,13 @@ onUnmounted(() => {
       </label>
 
       <div class="actions">
-        <button type="button" class="btn primary" :disabled="running || !canStart" @click="onStart">
+        <button
+          v-if="!isProxied"
+          type="button"
+          class="btn primary"
+          :disabled="running || !canStart"
+          @click="onStart"
+        >
           Start
         </button>
         <button type="button" class="btn" :disabled="!running" @click="stopAll(true)">Stop</button>
