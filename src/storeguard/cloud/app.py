@@ -9,7 +9,7 @@ later phases; nothing here touches the GPU pipeline.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import (
@@ -27,7 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
-from storeguard.cloud import telegram
+from storeguard.cloud import lime_crm, mailer, telegram
 from storeguard.cloud.live_proxy import build_live_proxy_router
 from storeguard.cloud.auth import (
     current_agent,
@@ -45,7 +45,9 @@ from storeguard.cloud.models import (
     CameraDefaults,
     CameraZone,
     Event,
+    LimeCrmConfig,
     Membership,
+    PasswordResetToken,
     TelegramConfig,
     Tenant,
     User,
@@ -67,10 +69,14 @@ from storeguard.cloud.schemas import (
     EventIn,
     EventOut,
     EventsOut,
+    ForgotPasswordRequest,
+    LimeCrmConfigIn,
+    LimeCrmConfigOut,
     LoginRequest,
     MeOut,
     MembersOut,
     MemberOut,
+    ResetPasswordRequest,
     SignupRequest,
     TelegramConfigIn,
     TelegramConfigOut,
@@ -85,6 +91,7 @@ from storeguard.cloud.schemas import (
 )
 from storeguard.cloud.security import (
     generate_agent_token,
+    generate_reset_token,
     hash_password,
     hash_token,
     verify_password,
@@ -468,6 +475,67 @@ def create_cloud_app(
         db.commit()
         return {"ok": True}
 
+    @app.post("/api/auth/forgot-password", status_code=202)
+    def forgot_password(
+        body: ForgotPasswordRequest, background: BackgroundTasks, db: Session = Depends(get_db)
+    ) -> dict:
+        """Email a reset link if the address has an account.
+
+        Always responds the same way whether or not the email exists —
+        otherwise the endpoint would let anyone probe which emails are
+        registered. The actual send happens off the request so a slow SMTP
+        server can't hold the connection open.
+        """
+        user = db.scalar(select(User).where(User.email == normalize_email(body.email)))
+        if user is not None:
+            raw_token = generate_reset_token()
+            db.add(
+                PasswordResetToken(
+                    user_id=user.id,
+                    token_hash=hash_token(raw_token),
+                    expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                )
+            )
+            db.commit()
+            reset_url = f"{settings.public_base_url.rstrip('/')}/reset-password?token={raw_token}"
+            background.add_task(
+                mailer.send_password_reset_email,
+                settings.smtp_host,
+                settings.smtp_port,
+                settings.smtp_username,
+                settings.smtp_password,
+                settings.smtp_use_tls,
+                settings.smtp_from_email,
+                user.email,
+                reset_url,
+            )
+        return {"sent": True}
+
+    @app.post("/api/auth/reset-password")
+    def reset_password(body: ResetPasswordRequest, db: Session = Depends(get_db)) -> dict:
+        """Set a new password from a reset-email token (single use, 1 hour)."""
+        row = db.scalar(
+            select(PasswordResetToken).where(
+                PasswordResetToken.token_hash == hash_token(body.token)
+            )
+        )
+        now = datetime.now(timezone.utc)
+        # SQLite round-trips DateTime(timezone=True) as naive even though it
+        # was written as aware UTC — normalize before comparing so this
+        # doesn't blow up with "can't compare offset-naive and aware".
+        expires_at = row.expires_at if row is not None else None
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if row is None or row.used_at is not None or expires_at < now:
+            raise HTTPException(status_code=400, detail="invalid or expired reset link")
+        user = db.get(User, row.user_id)
+        if user is None:
+            raise HTTPException(status_code=400, detail="invalid or expired reset link")
+        user.password_hash = hash_password(body.new_password)
+        row.used_at = now
+        db.commit()
+        return {"ok": True}
+
     # ---- cameras + zones (tenant-scoped) ----
 
     @app.get("/api/cameras", response_model=CamerasOut)
@@ -793,6 +861,66 @@ def create_cloud_app(
         ok = telegram.send_message(cfg.bot_token, cfg.chat_id, "storeguard: test alert ✅")
         return {"sent": ok}
 
+    # ---- lime crm / generic webhook settings (cabinet side, owner-only) ----
+
+    def _lime_crm_out(cfg: LimeCrmConfig | None) -> LimeCrmConfigOut:
+        if cfg is None:
+            return LimeCrmConfigOut(
+                enabled=False, webhook_url="", auth_header="", token_set=False
+            )
+        return LimeCrmConfigOut(
+            enabled=cfg.enabled,
+            webhook_url=cfg.webhook_url,
+            auth_header=cfg.auth_header,
+            token_set=bool(cfg.auth_token),
+        )
+
+    @app.get("/api/settings/lime-crm", response_model=LimeCrmConfigOut)
+    def get_lime_crm_settings(
+        db: Session = Depends(get_db),
+        owner: Membership = Depends(require_owner),
+    ) -> LimeCrmConfigOut:
+        return _lime_crm_out(db.get(LimeCrmConfig, owner.tenant_id))
+
+    @app.put("/api/settings/lime-crm", response_model=LimeCrmConfigOut)
+    def set_lime_crm_settings(
+        body: LimeCrmConfigIn,
+        db: Session = Depends(get_db),
+        owner: Membership = Depends(require_owner),
+    ) -> LimeCrmConfigOut:
+        cfg = db.get(LimeCrmConfig, owner.tenant_id)
+        if cfg is None:
+            cfg = LimeCrmConfig(tenant_id=owner.tenant_id)
+            db.add(cfg)
+        cfg.enabled = body.enabled
+        cfg.webhook_url = body.webhook_url.strip()
+        cfg.auth_header = body.auth_header.strip()
+        token = body.auth_token.strip()
+        if token:  # an empty token in the request keeps the stored one
+            cfg.auth_token = token
+        db.commit()
+        return _lime_crm_out(cfg)
+
+    @app.post("/api/settings/lime-crm/test")
+    def test_lime_crm_settings(
+        db: Session = Depends(get_db),
+        owner: Membership = Depends(require_owner),
+    ) -> dict:
+        cfg = db.get(LimeCrmConfig, owner.tenant_id)
+        if cfg is None or not cfg.webhook_url:
+            raise HTTPException(status_code=400, detail="set a webhook URL first")
+        ok = lime_crm.send_notification(
+            cfg.webhook_url,
+            cfg.auth_header,
+            cfg.auth_token,
+            {
+                "kind": "test",
+                "message": "storeguard: test notification",
+                "tenant_id": owner.tenant_id,
+            },
+        )
+        return {"sent": ok}
+
     # ---- agent-facing API (edge agent authenticates with its token) ----
 
     @app.get("/api/agent/config", response_model=AgentConfigOut)
@@ -825,6 +953,7 @@ def create_cloud_app(
     @app.post("/api/agent/events", response_model=EventOut, status_code=201)
     def agent_push_event(
         body: EventIn,
+        background: BackgroundTasks,
         db: Session = Depends(get_db),
         agent: AgentKey = Depends(current_agent),
     ) -> EventOut:
@@ -856,6 +985,29 @@ def create_cloud_app(
         )
         db.add(ev)
         db.commit()
+
+        # Every detection, not just ones that end up with a clip — off the
+        # request path so a slow/down receiver can't delay the agent's push.
+        crm = db.get(LimeCrmConfig, agent.tenant_id)
+        if crm and crm.enabled and crm.webhook_url:
+            background.add_task(
+                lime_crm.send_notification,
+                crm.webhook_url,
+                crm.auth_header,
+                crm.auth_token,
+                {
+                    "id": ev.id,
+                    "tenant_id": ev.tenant_id,
+                    "kind": ev.kind,
+                    "message": ev.message,
+                    "camera_id": ev.camera_id,
+                    "camera_name": ev.camera_name,
+                    "person_id": ev.person_id,
+                    "track_id": ev.track_id,
+                    "score": ev.score,
+                    "ts": ev.ts.isoformat(),
+                },
+            )
         return _event_out(ev)
 
     @app.post("/api/agent/events/{event_id}/clip", response_model=EventOut)
@@ -934,6 +1086,25 @@ def create_cloud_app(
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str) -> FileResponse:
+        """Serve the SPA shell for client-side routes (history-mode routing).
+
+        Vue Router now uses real paths (e.g. "/cameras", not "#/cameras"), so
+        a hard refresh or a bookmarked link is a real request to this server
+        and must resolve to the same index.html the app boots from. Routes
+        registered above (api/*, live*, static/*) always match first and
+        never reach here; anything else under those prefixes is a genuine
+        miss, not a client route, so it 404s instead of getting masked as
+        the SPA shell.
+        """
+        if full_path == "api" or full_path.startswith("api/") or full_path == "live" or full_path.startswith("live/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        index_path = _STATIC_DIR / "index.html"
+        if not index_path.is_file():
+            raise HTTPException(status_code=500, detail="cloud UI missing")
+        return FileResponse(index_path)
 
     return app
 

@@ -32,6 +32,10 @@ data/
 *.db
 storeguard_events/
 
+# local secrets (SMTP credentials, secret keys, etc.) — never commit
+.env
+.env.*
+
 .vscode
 
 # cloud + dashboard Vue frontends (built output is committed to each

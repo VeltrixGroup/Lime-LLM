@@ -618,6 +618,23 @@ input[type="number"] {
   border-color: var(--accent-dim);
 }
 
+.link-btn {
+  align-self: center;
+  padding: 0.2rem;
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  color: var(--muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link-btn:hover {
+  color: var(--accent);
+}
+
 /* ---------- modals ---------- */
 
 .modal-backdrop {

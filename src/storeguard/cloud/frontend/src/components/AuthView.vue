@@ -7,6 +7,8 @@ const activeTab = ref("login");
 
 const loginForm = reactive({ email: "", password: "" });
 const signupForm = reactive({ org_name: "", full_name: "", email: "", password: "" });
+const forgotEmail = ref("");
+const forgotSent = ref(false);
 
 async function submitLogin() {
   try {
@@ -19,6 +21,24 @@ async function submitLogin() {
 async function submitSignup() {
   try {
     me.value = await api("/api/auth/signup", { method: "POST", body: { ...signupForm } });
+  } catch (err) {
+    setStatus(err.message, true);
+  }
+}
+
+function openForgot() {
+  forgotEmail.value = loginForm.email;
+  forgotSent.value = false;
+  activeTab.value = "forgot";
+}
+
+async function submitForgot() {
+  try {
+    await api("/api/auth/forgot-password", {
+      method: "POST",
+      body: { email: forgotEmail.value },
+    });
+    forgotSent.value = true;
   } catch (err) {
     setStatus(err.message, true);
   }
@@ -66,7 +86,27 @@ async function submitSignup() {
         />
       </label>
       <button class="btn primary" type="submit">Log in</button>
+      <button type="button" class="link-btn" @click="openForgot">Forgot password?</button>
     </form>
+
+    <div v-else-if="activeTab === 'forgot'" class="card form">
+      <template v-if="!forgotSent">
+        <p class="hint">Enter your account email and we'll send a link to reset your password.</p>
+        <form @submit.prevent="submitForgot">
+          <label>
+            Email
+            <input type="email" v-model="forgotEmail" autocomplete="username" required />
+          </label>
+          <button class="btn primary" type="submit">Send reset link</button>
+        </form>
+      </template>
+      <template v-else>
+        <p class="hint">
+          If an account exists for {{ forgotEmail }}, a reset link is on its way — check your inbox.
+        </p>
+      </template>
+      <button type="button" class="link-btn" @click="activeTab = 'login'">Back to log in</button>
+    </div>
 
     <form v-else class="card form" @submit.prevent="submitSignup">
       <label>

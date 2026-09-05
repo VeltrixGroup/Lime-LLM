@@ -42,6 +42,11 @@ def generate_agent_token() -> str:
     return AGENT_TOKEN_PREFIX + secrets.token_urlsafe(32)
 
 
+def generate_reset_token() -> str:
+    """A fresh, high-entropy password-reset token (emailed once, then hashed for storage)."""
+    return secrets.token_urlsafe(32)
+
+
 def hash_token(token: str) -> str:
     """SHA-256 of an agent token for storage/lookup.
 

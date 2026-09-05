@@ -158,6 +158,21 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=72)
 
 
+class ForgotPasswordRequest(BaseModel):
+    """Request a password-reset email."""
+
+    email: str
+
+    _norm_email = field_validator("email")(_validate_email)
+
+
+class ResetPasswordRequest(BaseModel):
+    """Set a new password using a token from a reset email."""
+
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=72)
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: cameras + zones
 # ---------------------------------------------------------------------------
@@ -345,4 +360,36 @@ class TelegramConfigOut(BaseModel):
 
     enabled: bool
     chat_id: str
+    token_set: bool
+
+
+def _validate_webhook_url(value: str) -> str:
+    value = value.strip()
+    if value and not value.lower().startswith(("http://", "https://")):
+        raise ValueError("webhook_url must start with http:// or https://")
+    return value
+
+
+class LimeCrmConfigIn(BaseModel):
+    """Set the tenant's outbound webhook. An empty auth_token keeps the stored one.
+
+    Generic by design — any URL that accepts a JSON POST works, not just
+    Lime CRM's; ``auth_header``/``auth_token`` cover the common "one header"
+    auth schemes (``Authorization: Bearer ...``, ``X-Api-Key: ...``).
+    """
+
+    enabled: bool = False
+    webhook_url: str = Field(default="", max_length=1024)
+    auth_header: str = Field(default="", max_length=120)
+    auth_token: str = Field(default="", max_length=500)
+
+    _url = field_validator("webhook_url")(_validate_webhook_url)
+
+
+class LimeCrmConfigOut(BaseModel):
+    """Webhook config for display — the auth token is never returned."""
+
+    enabled: bool
+    webhook_url: str
+    auth_header: str
     token_set: bool

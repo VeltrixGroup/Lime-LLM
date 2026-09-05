@@ -50,6 +50,20 @@ class CloudSettings(BaseSettings):
     #: store's dashboard.
     dashboard_upstream_url: str = "http://127.0.0.1:8765"
 
+    #: SMTP server for outbound email (password-reset links). An empty host
+    #: means email sending is off; forgot-password requests will log a
+    #: failure server-side instead of silently pretending to send.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    smtp_from_email: str = "storeguard@localhost"
+
+    #: This instance's public URL (no trailing slash), used to build the
+    #: link inside password-reset emails, e.g. "https://cabinet.example.com".
+    public_base_url: str = "http://127.0.0.1:8000"
+
     @property
     def is_dev_secret(self) -> bool:
         """True while the insecure default secret is still in use."""

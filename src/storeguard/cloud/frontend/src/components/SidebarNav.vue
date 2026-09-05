@@ -33,6 +33,10 @@ import { isOwner } from "../store";
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 3 3.5 10.3c-.9.4-.9 1.7.1 2l4.9 1.6 1.7 5.2c.3.9 1.5 1.1 2.1.3l2.4-3 4.6 3.4c.8.6 1.9.1 2-.9L21 3Z"/><path d="M8.5 13.9 18 6.5"/></svg>
         Telegram
       </router-link>
+      <router-link v-if="isOwner()" class="nav-link" active-class="active" to="/lime-crm">
+        <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a4 4 0 0 0 5.7.4l2-2a4 4 0 0 0-5.6-5.7L10.6 8.2"/><path d="M14 10a4 4 0 0 0-5.7-.4l-2 2a4 4 0 0 0 5.6 5.7l1.5-1.5"/></svg>
+        Lime CRM
+      </router-link>
       <router-link class="nav-link" active-class="active" to="/events">
         <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h3.5l2-6 4 12 2-8 1.5 2H21"/></svg>
         Events
