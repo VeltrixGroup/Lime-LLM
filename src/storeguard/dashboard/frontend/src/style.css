@@ -18,18 +18,19 @@
 }
 
 html,
-body {
+body,
+#app {
   margin: 0;
   min-height: 100%;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--font-mono);
-  font-size: 14px;
 }
 
 body {
   position: relative;
   overflow-x: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 14px;
 }
 
 .grain {
@@ -84,8 +85,7 @@ body {
   position: relative;
   width: 100%;
   height: min(62vh, 640px);
-  background:
-    linear-gradient(160deg, #121614 0%, #0a0c0b 55%, #141a12 100%);
+  background: linear-gradient(160deg, #121614 0%, #0a0c0b 55%, #141a12 100%);
   border: 1px solid var(--line);
   overflow: hidden;
 }
@@ -256,6 +256,12 @@ body {
   line-height: 1.35;
   color: var(--ink);
   opacity: 0.7;
+}
+
+.placeholder code {
+  font-family: var(--font-mono);
+  color: var(--lime);
+  font-size: 0.95em;
 }
 
 .hud {
@@ -456,17 +462,6 @@ body {
   outline: 1px solid var(--lime-dim);
 }
 
-.btn.ghost {
-  padding: 0.55rem 0.75rem;
-  font-size: 0.72rem;
-}
-
-.placeholder code {
-  font-family: var(--font-mono);
-  color: var(--lime);
-  font-size: 0.95em;
-}
-
 .file {
   position: relative;
   display: inline-flex;
@@ -506,7 +501,7 @@ body {
   accent-color: var(--lime);
 }
 
-#every-val {
+.every-val {
   color: var(--lime);
   min-width: 0.8rem;
   text-align: center;
@@ -530,6 +525,11 @@ body {
   cursor: pointer;
   transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease,
     transform 0.15s ease;
+}
+
+.btn.ghost {
+  padding: 0.55rem 0.75rem;
+  font-size: 0.72rem;
 }
 
 .btn:hover:not(:disabled) {
@@ -595,4 +595,8 @@ body {
   .btn {
     flex: 1;
   }
+}
+
+[hidden] {
+  display: none !important;
 }

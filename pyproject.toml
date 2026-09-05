@@ -23,6 +23,8 @@ dependencies = [
     "bcrypt>=5.0.0",
     "pydantic-settings>=2.15.0",
     "alembic>=1.13",
+    "httpx>=0.27",
+    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +43,6 @@ storeguard = "storeguard.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
-    "httpx>=0.27",
 ]
 
 [build-system]
@@ -50,11 +51,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/storeguard"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/storeguard/dashboard/static" = "storeguard/dashboard/static"
-"src/storeguard/cloud/static" = "storeguard/cloud/static"
-"src/storeguard/cloud/migrations" = "storeguard/cloud/migrations"
+# Vue source for the cloud cabinet and the dashboard; only their build output
+# (checked into cloud/static/ and dashboard/static/) is needed at runtime.
+# Not force-include: hatchling's default packages discovery already picks up
+# static/ and migrations/ on its own — an explicit force-include of a path it
+# already covers raises a "file already in archive" error instead of being a
+# harmless no-op.
+exclude = [
+    "src/storeguard/cloud/frontend",
+    "src/storeguard/dashboard/frontend",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

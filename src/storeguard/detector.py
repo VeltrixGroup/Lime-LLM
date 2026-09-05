@@ -8,10 +8,14 @@ must only be imported by code that actually runs detection — never from
 from __future__ import annotations
 
 import numpy as np
+from rich.console import Console
 from ultralytics import YOLO
 
 from .config import DetectorCfg, pick_device
 from .types import Track
+
+_console = Console()
+_logged_devices: set[str] = set()
 
 
 class PersonTracker:
@@ -31,7 +35,40 @@ class PersonTracker:
         """
         self.cfg = cfg
         self.device = pick_device(cfg.device)
+        # Half-precision only helps (and is only supported) on CUDA — leave
+        # CPU/MPS at full precision.
+        self.half = self.device.startswith("cuda")
+        self._log_device_once()
         self.model = YOLO(cfg.model)
+
+    def _log_device_once(self) -> None:
+        """Print the resolved inference device once per process.
+
+        A silent "auto" fallback to CPU is the single easiest way to end up
+        with a fast GPU sitting idle (e.g. a non-CUDA torch wheel installed
+        by mistake) — print it so that's visible instead of discovered by
+        watching the FPS counter.
+        """
+        if self.device in _logged_devices:
+            return
+        _logged_devices.add(self.device)
+        if self.device == "cuda":
+            try:
+                import torch
+
+                name = torch.cuda.get_device_name(0)
+            except Exception:
+                name = "unknown GPU"
+            _console.print(f"[green]Detector device: cuda ({name}), half precision on[/green]")
+        elif self.device == "cpu":
+            _console.print(
+                "[yellow]Detector device: cpu — detection will be much slower than "
+                "on a GPU. If this machine has an NVIDIA GPU, check that torch was "
+                "installed with CUDA support (`python -c \"import torch; "
+                'print(torch.cuda.is_available())"` should print True).[/yellow]'
+            )
+        else:
+            _console.print(f"[green]Detector device: {self.device}[/green]")
 
     def reset(self) -> None:
         """Clear ByteTrack state so the next :meth:`update` starts fresh ids.
@@ -67,6 +104,7 @@ class PersonTracker:
             imgsz=self.cfg.imgsz,
             tracker="bytetrack.yaml",
             device=self.device,
+            half=self.half,
             verbose=False,
         )
         tracks: list[Track] = []
@@ -101,6 +139,7 @@ class PersonTracker:
             conf=self.cfg.conf,
             imgsz=self.cfg.imgsz,
             device=self.device,
+            half=self.half,
             verbose=False,
         )
         boxes: list[tuple[float, float, float, float]] = []

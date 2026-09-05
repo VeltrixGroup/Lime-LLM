@@ -1969,6 +1969,7 @@ dependencies = [
     { name = "alembic" },
     { name = "bcrypt" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "itsdangerous" },
     { name = "lap" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1985,6 +1986,7 @@ dependencies = [
     { name = "torchvision" },
     { name = "ultralytics" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.optional-dependencies]
@@ -2002,7 +2004,6 @@ onnx = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
 ]
 
@@ -2013,6 +2014,7 @@ requires-dist = [
     { name = "bcrypt", specifier = ">=5.0.0" },
     { name = "bcrypt", marker = "extra == 'cloud'", specifier = ">=4.1" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
     { name = "itsdangerous", marker = "extra == 'cloud'", specifier = ">=2.1" },
     { name = "lap", specifier = ">=0.5.12" },
@@ -2033,14 +2035,12 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.19" },
     { name = "ultralytics", specifier = ">=8.3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+    { name = "websockets", specifier = ">=13.0" },
 ]
 provides-extras = ["onnx", "cloud"]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "pytest", specifier = ">=8.0" },
-]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
 
 [[package]]
 name = "sympy"

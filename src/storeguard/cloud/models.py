@@ -252,3 +252,48 @@ class TelegramConfig(Base):
     #: Bot token and target chat; the token is write-only over the API.
     bot_token: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     chat_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+
+
+class PasswordResetToken(Base):
+    """A one-time, short-lived token emailed to reset a forgotten password.
+
+    Only the SHA-256 hash is stored (same reasoning as ``AgentKey.token_hash``):
+    if the database leaks, a token already emailed out must not be usable from
+    the stored row alone.
+    """
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class LimeCrmConfig(Base):
+    """Per-tenant outbound webhook for detection notifications (one row per tenant).
+
+    Named for the first integration this shipped for (the user's own Lime
+    CRM), but the receiver can be any URL that accepts a JSON POST — nothing
+    here is specific to Lime CRM itself, just a URL and one auth header.
+    """
+
+    __tablename__ = "lime_crm_configs"
+
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
+    webhook_url: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
+    #: Single auth header (e.g. "Authorization" / "X-Api-Key"); the token is
+    #: write-only over the API, like TelegramConfig.bot_token.
+    auth_header: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    auth_token: Mapped[str] = mapped_column(String(500), default="", nullable=False)
