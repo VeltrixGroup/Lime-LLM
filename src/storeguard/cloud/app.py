@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
 from storeguard.cloud import telegram
+from storeguard.cloud.live_proxy import build_live_proxy_router
 from storeguard.cloud.auth import (
     current_agent,
     current_membership,
@@ -928,6 +929,8 @@ def create_cloud_app(
         if not index_path.is_file():
             raise HTTPException(status_code=500, detail="cloud UI missing")
         return FileResponse(index_path)
+
+    app.include_router(build_live_proxy_router(settings.dashboard_upstream_url))
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

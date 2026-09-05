@@ -43,6 +43,13 @@ class CloudSettings(BaseSettings):
     #: Reject agent clip uploads larger than this (short alarm clips only).
     agent_clip_max_mb: int = 50
 
+    #: Base URL of the local `storeguard dashboard` process this cloud
+    #: instance proxies "Live view" to. Single-tenant assumption: one cloud
+    #: instance currently proxies to exactly one dashboard (the store PC on
+    #: the cameras' LAN) — revisit if this cloud ever serves more than one
+    #: store's dashboard.
+    dashboard_upstream_url: str = "http://127.0.0.1:8765"
+
     @property
     def is_dev_secret(self) -> bool:
         """True while the insecure default secret is still in use."""

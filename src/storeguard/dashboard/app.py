@@ -599,6 +599,13 @@ def create_app(
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+        # The Vue build uses a relative base ("./assets/...") so its asset
+        # URLs resolve correctly both served standalone at "/" and proxied
+        # under "/live/" through the cloud cabinet — either way that
+        # resolves to "<prefix>/assets/...", not "/static/assets/...".
+        assets_dir = _STATIC_DIR / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
     return app
 

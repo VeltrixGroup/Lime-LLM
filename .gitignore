@@ -33,3 +33,10 @@ data/
 storeguard_events/
 
 .vscode
+
+# cloud + dashboard Vue frontends (built output is committed to each
+# static/; node_modules and Vite's cache are not)
+src/storeguard/cloud/frontend/node_modules/
+src/storeguard/cloud/frontend/.vite/
+src/storeguard/dashboard/frontend/node_modules/
+src/storeguard/dashboard/frontend/.vite/
