@@ -65,8 +65,14 @@ services:
       context: .
       dockerfile: docker/edge.Dockerfile
     profiles: ["agent"]
+    # Compose interpolates every service's environment block up front, even
+    # ones gated behind a profile that isn't active — a required (":?") var
+    # here would break plain `docker compose down`/`build`/`up` for
+    # everyone, not just `agent` users. Leave it optional here; the CLI
+    # itself already errors clearly ("provide --key or set
+    # STOREGUARD_AGENT_KEY") if this is empty when the agent actually starts.
     environment:
-      STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:?set an agent token from Edge devices in the cabinet}
+      STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:-}
     command:
       [
         "storeguard",
