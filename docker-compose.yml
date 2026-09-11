@@ -1,0 +1,89 @@
+# Local/single-machine setup: both services on one box, talking to each
+# other over the Compose network — this is what "docker compose up" gives
+# you, matching how this has been run and tested so far (cloud on :8000,
+# dashboard proxied through it at /live/).
+#
+# A real store deployment usually splits these: the cloud cabinet on a
+# server somewhere (it never touches video, so it doesn't need a GPU or LAN
+# access to the cameras), and the dashboard/agent on the store PC, on the
+# same LAN as the cameras. In that case run this file's `cloud` service on
+# the server on its own, and `dashboard` (or `agent`, see below) on the
+# store PC on its own — and point STOREGUARD_DASHBOARD_UPSTREAM_URL / the
+# `--server` flag at wherever the other half actually lives instead of the
+# service-name URLs used below.
+#
+# GPU passthrough (dashboard/agent) needs Docker Desktop's WSL2 backend with
+# a driver that supports CUDA-on-WSL. Sanity-check that GPU access works at
+# all before troubleshooting anything in this repo:
+#   docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+# If that doesn't show your GPU, the problem is Docker/WSL2/driver setup,
+# not this compose file.
+
+services:
+  cloud:
+    build:
+      context: .
+      dockerfile: docker/cloud.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      STOREGUARD_DATABASE_URL: sqlite:////data/storeguard_cloud.db
+      STOREGUARD_EVENTS_DIR: /data/events
+      # Compose's built-in DNS resolves other services by name — only valid
+      # while cloud and dashboard run in this same compose project.
+      STOREGUARD_DASHBOARD_UPSTREAM_URL: http://dashboard:8765
+    env_file:
+      - .env # STOREGUARD_SECRET_KEY, SMTP settings, etc. — not committed
+    volumes:
+      - ./docker-data/cloud:/data
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/edge.Dockerfile
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./models:/app/models:ro # optional: a trained action.pt, if you have one
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Alternative to `dashboard`: a headless worker that pulls this tenant's
+  # cameras from the cloud and pushes events/clips instead of serving a
+  # browser UI. Don't run both against the same cameras at once — pick one.
+  # Enable with: docker compose --profile agent up agent
+  agent:
+    build:
+      context: .
+      dockerfile: docker/edge.Dockerfile
+    profiles: ["agent"]
+    environment:
+      STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:?set an agent token from Edge devices in the cabinet}
+    command:
+      [
+        "storeguard",
+        "agent",
+        "--server",
+        "http://cloud:8000",
+        "--run",
+        "--device",
+        "auto",
+      ]
+    volumes:
+      - ./models:/app/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

@@ -1,0 +1,31 @@
+.git
+.venv
+.idea
+.claude
+.pytest_cache
+__pycache__
+*.py[oc]
+
+# secrets and local dev state — never bake into an image
+.env
+.env.*
+*.db
+storeguard_events/
+events/
+docker-data/
+
+# large/optional local assets — mounted as volumes, not baked in
+data/
+models/
+datasets/
+runs/
+*.mp4
+*.avi
+*.mkv
+*.dav
+
+# frontend build tooling — only the already-built static/ is needed
+src/storeguard/cloud/frontend/node_modules/
+src/storeguard/cloud/frontend/.vite/
+src/storeguard/dashboard/frontend/node_modules/
+src/storeguard/dashboard/frontend/.vite/

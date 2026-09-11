@@ -22,9 +22,52 @@ _COLOR_PAID = (80, 220, 60)  # green
 _COLOR_NOT_PAID = (60, 60, 255)  # red
 _COLOR_ZONE = (0, 200, 255)
 
-#: Serializes YOLO model construction across sessions so starting many cameras
-#: at once doesn't spike memory or race to download the same weights file.
+#: Cameras commonly stream well above what a grid tile (or even an expanded
+#: single view) needs on screen. JPEG-encoding the full source resolution for
+#: every processed frame, on every camera thread, is real CPU cost that adds
+#: up fast with several cameras running at once — downscale before encoding.
+_PREVIEW_MAX_WIDTH = 960
+
+
+def _resize_for_preview(frame: np.ndarray) -> np.ndarray:
+    """Downscale ``frame`` for the live preview stream if it's wider than needed.
+
+    Runs on the already-annotated copy, after detection — box overlays scale
+    down with it, so this never affects what the tracker actually sees.
+    """
+    h, w = frame.shape[:2]
+    if w <= _PREVIEW_MAX_WIDTH:
+        return frame
+    scale = _PREVIEW_MAX_WIDTH / w
+    return cv2.resize(
+        frame, (_PREVIEW_MAX_WIDTH, round(h * scale)), interpolation=cv2.INTER_AREA
+    )
+
+#: Serializes YOLO model construction the *first* time a given weights path
+#: is loaded in this process, so concurrent sessions can't race to download
+#: the same file. Once a path has loaded successfully once, it's known to
+#: already be on local disk, so later sessions build their own PersonTracker
+#: for it in parallel instead of queueing behind every other camera —
+#: connecting N cameras at once used to take roughly N x one model load
+#: before the last camera's stream even opened.
 _MODEL_INIT_LOCK = threading.Lock()
+_weights_loaded: set[str] = set()
+
+
+def _build_tracker(cfg: DetectorCfg) -> PersonTracker:
+    if cfg.model in _weights_loaded:
+        return PersonTracker(cfg)
+    with _MODEL_INIT_LOCK:
+        first_load = cfg.model not in _weights_loaded
+        if first_load:
+            tracker = PersonTracker(cfg)
+            _weights_loaded.add(cfg.model)
+            return tracker
+    # Another thread finished loading this path while we waited for the
+    # lock — it's on disk now, so build our own instance outside the lock
+    # rather than holding it for a load that no longer needs protecting.
+    return PersonTracker(cfg)
+
 
 #: Seconds to wait for the first frame of a live source before surfacing a
 #: "no video" error to the UI (the worker keeps retrying in the background).
@@ -252,11 +295,7 @@ class DetectionSession:
 
     def _run(self) -> None:
         try:
-            # Serialize model construction: N cameras starting together must not
-            # all load/allocate at once (memory spike) or race to download the
-            # same weights file.
-            with _MODEL_INIT_LOCK:
-                self._tracker = PersonTracker(self.detector_cfg)
+            self._tracker = _build_tracker(self.detector_cfg)
             self._tracker.reset()
             self._payment.reset()
             with self._lock:
@@ -355,8 +394,9 @@ class DetectionSession:
                 annotated = draw_person_overlays(
                     frame, tracks, statuses=statuses, zones=self._zones or None
                 )
+                preview = _resize_for_preview(annotated)
                 ok_enc, buf = cv2.imencode(
-                    ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                    ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
                 )
                 if ok_enc:
                     jpeg = buf.tobytes()
