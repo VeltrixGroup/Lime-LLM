@@ -18,7 +18,8 @@ CLOUD_FRONTEND     := src/storeguard/cloud/frontend
 DASHBOARD_FRONTEND := src/storeguard/dashboard/frontend
 
 .PHONY: help install sync dashboard cloud frontend-build cloud-frontend-build \
-	dashboard-frontend-build run run-show test clean data
+	dashboard-frontend-build run run-show test clean data \
+	docker-build docker-up docker-down docker-logs docker-agent
 
 help:
 	@echo "StoreGuard targets:"
@@ -32,6 +33,11 @@ help:
 	@echo "  make run                    run pipeline (CONFIG=$(CONFIG))"
 	@echo "  make run-show               run pipeline with preview windows"
 	@echo "  make test                   run pytest"
+	@echo "  make docker-build           build the cloud + dashboard Docker images"
+	@echo "  make docker-up              build and start cloud + dashboard in Docker (background)"
+	@echo "  make docker-down            stop the Docker services"
+	@echo "  make docker-logs            follow logs from the Docker services"
+	@echo "  make docker-agent           build and start the headless edge agent in Docker"
 	@echo ""
 	@echo "Put videos in $(DATA)/ then: make dashboard"
 	@echo "Changed a frontend? make frontend-build, then make cloud / make dashboard"
@@ -73,3 +79,20 @@ test: install
 clean:
 	rm -rf .pytest_cache
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
+
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d --build
+	@echo "→ cloud: http://$(HOST):$(CLOUD_PORT)   dashboard: http://$(HOST):$(PORT)"
+	@echo "GPU not showing up? docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi"
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f
+
+docker-agent:
+	docker compose --profile agent up -d --build agent
