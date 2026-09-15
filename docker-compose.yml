@@ -1,5 +1,5 @@
 # Local/single-machine setup: both services on one box, talking to each
-# other over the Compose network — this is what "docker compose up" gives
+# other over the Compose network - this is what "docker compose up" gives
 # you, matching how this has been run and tested so far (cloud on :8000,
 # dashboard proxied through it at /live/).
 #
@@ -8,7 +8,7 @@
 # access to the cameras), and the dashboard/agent on the store PC, on the
 # same LAN as the cameras. In that case run this file's `cloud` service on
 # the server on its own, and `dashboard` (or `agent`, see below) on the
-# store PC on its own — and point STOREGUARD_DASHBOARD_UPSTREAM_URL / the
+# store PC on its own - and point STOREGUARD_DASHBOARD_UPSTREAM_URL / the
 # `--server` flag at wherever the other half actually lives instead of the
 # service-name URLs used below.
 #
@@ -29,11 +29,11 @@ services:
     environment:
       STOREGUARD_DATABASE_URL: sqlite:////data/storeguard_cloud.db
       STOREGUARD_EVENTS_DIR: /data/events
-      # Compose's built-in DNS resolves other services by name — only valid
+      # Compose's built-in DNS resolves other services by name - only valid
       # while cloud and dashboard run in this same compose project.
       STOREGUARD_DASHBOARD_UPSTREAM_URL: http://dashboard:8765
     env_file:
-      - .env # STOREGUARD_SECRET_KEY, SMTP settings, etc. — not committed
+      - .env # STOREGUARD_SECRET_KEY, SMTP settings, etc. - not committed
     volumes:
       - ./docker-data/cloud:/data
     restart: unless-stopped
@@ -58,7 +58,7 @@ services:
 
   # Alternative to `dashboard`: a headless worker that pulls this tenant's
   # cameras from the cloud and pushes events/clips instead of serving a
-  # browser UI. Don't run both against the same cameras at once — pick one.
+  # browser UI. Don't run both against the same cameras at once - pick one.
   # Enable with: docker compose --profile agent up agent
   agent:
     build:
@@ -66,7 +66,7 @@ services:
       dockerfile: docker/edge.Dockerfile
     profiles: ["agent"]
     # Compose interpolates every service's environment block up front, even
-    # ones gated behind a profile that isn't active — a required (":?") var
+    # ones gated behind a profile that isn't active - a required (":?") var
     # here would break plain `docker compose down`/`build`/`up` for
     # everyone, not just `agent` users. Leave it optional here; the CLI
     # itself already errors clearly ("provide --key or set

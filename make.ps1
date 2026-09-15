@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  StoreGuard — common tasks (Windows equivalent of the Makefile).
+  StoreGuard - common tasks (Windows equivalent of the Makefile).
 
 .EXAMPLE
   .\make.ps1 dashboard
@@ -59,7 +59,7 @@ function Show-Help {
     Write-Host ""
     Write-Host "Put videos in $Data\ then: .\make.ps1 dashboard"
     Write-Host "Changed a frontend? .\make.ps1 frontend-build, then .\make.ps1 cloud / dashboard"
-    Write-Host "Note: 'Live view' in the cabinet proxies to the dashboard at http://${BindHost}:${Port} — start both to use it"
+    Write-Host "Note: 'Live view' in the cabinet proxies to the dashboard at http://${BindHost}:${Port} - start both to use it"
     Write-Host "Overrides: -BindHost -Port -CloudPort -Device -Config -Data"
 }
 
