@@ -288,33 +288,6 @@ body {
   gap: 0.65rem 1.15rem;
 }
 
-.hud-people {
-  list-style: none;
-  margin: 0.45rem 0 0;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem 0.75rem;
-  text-transform: none;
-  letter-spacing: 0.02em;
-}
-
-.hud-people li {
-  padding: 0.15rem 0.45rem;
-  border: 1px solid var(--line);
-  font-size: 0.72rem;
-}
-
-.hud-people li.paid {
-  color: var(--lime);
-  border-color: var(--lime-dim);
-}
-
-.hud-people li.not-paid {
-  color: #ff8a7a;
-  border-color: #6a3530;
-}
-
 .controls {
   display: flex;
   flex-wrap: wrap;

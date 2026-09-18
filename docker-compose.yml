@@ -44,6 +44,16 @@ services:
       dockerfile: docker/edge.Dockerfile
     ports:
       - "8765:8765"
+    environment:
+      # Optional: lets the live view also push confirmed exit-without-paying
+      # events + a short clip to the cloud, so its Telegram / Lime CRM
+      # notifications fire. Evidence clips are saved locally either way -
+      # this only adds the cloud push. Create the key in the cabinet's
+      # Devices page; left empty (the default), only local saving happens.
+      # Left optional (":?") would break plain `docker compose down`/`build`/
+      # `up` for everyone, same reasoning as the `agent` service below.
+      STOREGUARD_AGENT_SERVER: http://cloud:8000
+      STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:-}
     volumes:
       - ./configs:/app/configs:ro
       - ./models:/app/models:ro # optional: a trained action.pt, if you have one
