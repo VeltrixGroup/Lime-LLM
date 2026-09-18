@@ -130,6 +130,20 @@ def test_alert_fires_once_per_track() -> None:
     assert events[0].track_id == 9
 
 
+def test_reset_clears_alerted_state_for_a_new_track_pass() -> None:
+    """reset() forgets per-track dwell/alerted state (e.g. a looping file restarts)."""
+    sc = ExitNoPayScenario(
+        "cam-1", make_zones(), shelf_dwell_sec=1.5, checkout_dwell_sec=2.0
+    )
+    path = steps(SHELF_FOOT, 0.0, 5) + steps(EXIT_FOOT, 2.5, 3)
+    first = run_path(sc, 4, path)
+    assert len(first) == 1
+
+    sc.reset()
+    second = run_path(sc, 4, path)
+    assert len(second) == 1
+
+
 def test_paid_and_unpaid_tracks_are_independent() -> None:
     """Per-track state: the paying customer stays silent, the other alerts."""
     sc = ExitNoPayScenario(

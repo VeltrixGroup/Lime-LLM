@@ -79,24 +79,13 @@ const totals = computed(() => {
   let paid = 0;
   let notPaid = 0;
   let fps = 0;
-  const peopleStatus = [];
   for (const s of sessions.value) {
     people += s.people || 0;
     paid += s.paid || 0;
     notPaid += s.not_paid || 0;
     fps += Number(s.fps || 0);
-    for (const p of s.people_status || []) {
-      peopleStatus.push({
-        key: `${s.id}-${p.track_id}`,
-        status: p.status,
-        label:
-          sessions.value.length > 1
-            ? `${s.filename} · id ${p.track_id}: ${p.status}`
-            : `id ${p.track_id}: ${p.status}`,
-      });
-    }
   }
-  return { people, paid, notPaid, fps, peopleStatus };
+  return { people, paid, notPaid, fps };
 });
 
 // ---------- status / camera rows ----------
@@ -237,12 +226,15 @@ function stopStatsPoll() {
 
 // ---------- start / stop ----------
 
-async function startCamerasReq(urls) {
-  setStatus(urls.length === 1 ? "Connecting to camera…" : `Connecting ${urls.length} cameras…`);
+async function startCamerasReq(items, asCameraObjects = false) {
+  setStatus(items.length === 1 ? "Connecting to camera…" : `Connecting ${items.length} cameras…`);
+  const body = asCameraObjects
+    ? { cameras: items, process_every: Number(everyN.value) }
+    : { urls: items, process_every: Number(everyN.value) };
   const res = await fetch(apiPath("/api/session/cameras"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ urls, process_every: Number(everyN.value) }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -284,9 +276,18 @@ async function startFromCabinet() {
     const res = await fetch("/api/cameras"); // cabinet's own origin, not apiPath()
     if (!res.ok) throw new Error(`Could not reach the cabinet (${res.status})`);
     const data = await res.json();
-    const urls = (data.cameras || []).filter((c) => c.enabled).map((c) => c.source);
-    if (!urls.length) throw new Error("No enabled cameras in the cabinet yet");
-    const started = await startCamerasReq(urls);
+    const enabled = (data.cameras || []).filter((c) => c.enabled);
+    if (!enabled.length) throw new Error("No enabled cameras in the cabinet yet");
+    // Carries each camera's cloud id + zones through, so a confirmed
+    // exit-without-paying can be detected and attributed (see AddCameraModal
+    // / CameraRow for how zones get set); plain manual entry has none of this.
+    const cameras = enabled.map((c) => ({
+      source: c.source,
+      name: c.name,
+      camera_id: c.id,
+      zones: c.zones || [],
+    }));
+    const started = await startCamerasReq(cameras, true);
     onSessionsStarted(
       started,
       `Connected ${started.length} camera${started.length === 1 ? "" : "s"} from the cabinet`
@@ -382,11 +383,6 @@ onUnmounted(() => {
             <span>{{ totals.notPaid }} not paid</span>
             <span>{{ totals.fps.toFixed(1) }} fps</span>
           </div>
-          <ul class="hud-people">
-            <li v-for="p in totals.peopleStatus" :key="p.key" :class="p.status === 'paid' ? 'paid' : 'not-paid'">
-              {{ p.label }}
-            </li>
-          </ul>
         </div>
       </div>
     </section>

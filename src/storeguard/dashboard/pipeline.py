@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import cv2
@@ -13,8 +15,9 @@ from storeguard.config import DetectorCfg
 from storeguard.dashboard.payment import PaymentStatusTracker
 from storeguard.detector import PersonTracker
 from storeguard.geometry import Zone
+from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
 from storeguard.stream import VideoStream
-from storeguard.types import Track
+from storeguard.types import Event, Track
 
 # BGR colors
 _COLOR_BOX = (80, 220, 60)
@@ -72,6 +75,15 @@ def _build_tracker(cfg: DetectorCfg) -> PersonTracker:
 #: Seconds to wait for the first frame of a live source before surfacing a
 #: "no video" error to the UI (the worker keeps retrying in the background).
 _CONNECT_TIMEOUT_SEC = 10.0
+
+#: Evidence clips hold this many seconds of buffered frames leading up to a
+#: scenario event (e.g. exit_no_pay). Trimmed by timestamp, not frame count,
+#: so it holds ~15s of real time regardless of camera fps or the "process
+#: every Nth frame" setting.
+_CLIP_SECONDS = 15.0
+#: Hard cap on buffered frames — a safety valve against unbounded memory if
+#: something makes timestamps misbehave (e.g. a stalled/looping source).
+_RING_MAX_FRAMES = 450
 
 
 def draw_person_overlays(
@@ -185,6 +197,8 @@ class DetectionSession:
         zones: list[Zone] | None = None,
         checkout_dwell_sec: float = 2.0,
         kind: str = "",
+        alert_queue: "queue.Queue | None" = None,
+        camera_id: str | None = None,
     ) -> None:
         self.id = session_id
         self.source = source
@@ -197,6 +211,9 @@ class DetectionSession:
         self.loop = False if self._is_url else loop
         self._zones = list(zones or [])
         self._checkout_dwell_sec = checkout_dwell_sec
+        #: Cloud camera id (if this session was started from the cabinet), so
+        #: a raised event can be attributed to the right camera in the cloud.
+        self.camera_id = camera_id
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -207,6 +224,16 @@ class DetectionSession:
         self._stats = SessionStats(filename=filename)
         self._tracker: PersonTracker | None = None
         self._payment = PaymentStatusTracker(self._zones, checkout_dwell_sec)
+        # Fires once per track on a confirmed shelf-dwell-then-exit-without-
+        # paying — a no-op if this camera has no shelf*/exit* zones. Shares
+        # checkout_dwell_sec with PaymentStatusTracker above so "paid" means
+        # the same thing for the HUD label and for whether an alert fires.
+        self._exit_scenario = ExitNoPayScenario(
+            filename, self._zones, checkout_dwell_sec=checkout_dwell_sec
+        )
+        self._alert_queue = alert_queue
+        # (ts, raw frame) pairs from the last ~_CLIP_SECONDS, for evidence clips.
+        self._ring: deque[tuple[float, np.ndarray]] = deque()
 
     @property
     def stats(self) -> SessionStats:
@@ -293,11 +320,53 @@ class DetectionSession:
             return text.replace(self.source, self.filename)
         return text
 
+    def _append_ring(self, ts: float, frame: np.ndarray) -> None:
+        """Buffer one processed frame, trimmed to the last ``_CLIP_SECONDS``."""
+        self._ring.append((ts, frame))
+        while len(self._ring) > 1 and (
+            ts - self._ring[0][0] > _CLIP_SECONDS or len(self._ring) > _RING_MAX_FRAMES
+        ):
+            self._ring.popleft()
+
+    def _dispatch_events(self, events: list[Event]) -> None:
+        """Hand newly-raised events off to the shared alert delivery queue.
+
+        Snapshots the ring buffer once per call (not per event) and estimates
+        the clip's real playback fps from the buffered frames' own
+        timestamps, so it plays back at the true speed of the recorded
+        moment regardless of camera fps or the "process every Nth frame"
+        setting. A full queue drops the oldest pending delivery rather than
+        blocking this camera's frame loop.
+        """
+        if self._alert_queue is None:
+            return
+        snapshot = list(self._ring)
+        frames = [f for _, f in snapshot]
+        fps = None
+        if len(snapshot) >= 2:
+            duration = snapshot[-1][0] - snapshot[0][0]
+            if duration > 0:
+                fps = (len(snapshot) - 1) / duration
+        for ev in events:
+            item = (ev, frames, fps, self.camera_id)
+            try:
+                self._alert_queue.put_nowait(item)
+            except queue.Full:
+                try:
+                    self._alert_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._alert_queue.put_nowait(item)
+                except queue.Full:
+                    pass
+
     def _run(self) -> None:
         try:
             self._tracker = _build_tracker(self.detector_cfg)
             self._tracker.reset()
             self._payment.reset()
+            self._exit_scenario.reset()
             with self._lock:
                 self._stats.running = True
                 self._stats.error = None
@@ -309,6 +378,7 @@ class DetectionSession:
                     break
                 self._tracker.reset()
                 self._payment.reset()
+                self._exit_scenario.reset()
 
         except Exception as exc:  # noqa: BLE001 — surface to UI, keep server up
             with self._lock:
@@ -333,6 +403,7 @@ class DetectionSession:
 
         tracks: list[Track] = []
         statuses: dict[int, str] = {}
+        self._ring.clear()
         frame_idx = 0
         t_fps = time.monotonic()
         t0_wall = time.time()
@@ -381,6 +452,10 @@ class DetectionSession:
                     assert self._tracker is not None
                     tracks = self._tracker.update(frame)
                     statuses = self._payment.update(frame, tracks, ts)
+                    new_events = self._exit_scenario.update(frame, tracks, ts)
+                    self._append_ring(ts, frame)
+                    if new_events:
+                        self._dispatch_events(new_events)
                     processed += 1
                     now = time.monotonic()
                     dt = now - t_fps

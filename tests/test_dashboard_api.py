@@ -29,6 +29,8 @@ class _FakeSession:
         zones=None,
         checkout_dwell_sec=2.0,
         kind="",
+        alert_queue=None,
+        camera_id=None,
     ) -> None:
         self.id = session_id
         self.source = source
@@ -36,6 +38,9 @@ class _FakeSession:
         self.kind = kind
         self.loop = loop
         self.process_every = max(1, int(process_every))
+        self.zones = zones
+        self.alert_queue = alert_queue
+        self.camera_id = camera_id
         self.started = False
         self.stopped = False
 
@@ -253,6 +258,74 @@ def test_cloud_session_caps_at_max_cameras(client: TestClient, monkeypatch) -> N
     body = res.json()
     assert body["count"] == MAX_CAMERAS
     assert body["total_enabled"] == MAX_CAMERAS + 3
+
+
+def test_cameras_bulk_accepts_camera_objects_with_zones(client: TestClient) -> None:
+    res = client.post(
+        "/api/session/cameras",
+        json={
+            "cameras": [
+                {
+                    "source": "rtsp://a.local/1",
+                    "name": "Aisle",
+                    "camera_id": "cam-1",
+                    "zones": [
+                        {"name": "checkout", "points": [[0, 0], [1, 0], [1, 1], [0, 1]]}
+                    ],
+                }
+            ]
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["sessions"][0]["filename"] == "Aisle"
+
+    [session] = client.app.state.sessions.values()
+    assert session.camera_id == "cam-1"
+    assert [z.name for z in session.zones] == ["checkout"]
+
+
+def test_cameras_bulk_mixes_urls_and_camera_objects(client: TestClient) -> None:
+    res = client.post(
+        "/api/session/cameras",
+        json={
+            "urls": ["rtsp://plain.local/1"],
+            "cameras": [{"source": "rtsp://zoned.local/1", "name": "Zoned"}],
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["count"] == 2
+
+
+def test_cloud_session_passes_zones_and_camera_id(
+    client: TestClient, monkeypatch
+) -> None:
+    _FakeCloudClient.config = {
+        "tenant_name": "Store A",
+        "cameras": [
+            {
+                "id": "c1",
+                "name": "Entrance",
+                "source": "rtsp://a/1",
+                "enabled": True,
+                "zones": [
+                    {
+                        "id": "z1",
+                        "name": "checkout",
+                        "points": [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]],
+                    }
+                ],
+            },
+        ],
+    }
+    monkeypatch.setattr(dashboard_app, "CloudClient", _FakeCloudClient)
+    res = client.post(
+        "/api/session/cloud", json={"server": "http://cloud.local", "token": "tok"}
+    )
+    assert res.status_code == 200
+
+    [session] = client.app.state.sessions.values()
+    assert session.camera_id == "c1"
+    assert [z.name for z in session.zones] == ["checkout"]
 
 
 def test_ws_frames_prefixes_session_id(client: TestClient) -> None:

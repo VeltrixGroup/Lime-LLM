@@ -41,8 +41,13 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 def _cmd_dashboard(args: argparse.Namespace) -> None:
     """Handler for ``storeguard dashboard``."""
+    import os
+
     from .config import DetectorCfg, ZoneCfg, load_config
     from .geometry import zones_from_cfg
+
+    agent_server = args.agent_server or os.environ.get("STOREGUARD_AGENT_SERVER", "")
+    agent_key = args.agent_key or os.environ.get("STOREGUARD_AGENT_KEY", "")
 
     detector = DetectorCfg(device=args.device)
     zones = []
@@ -83,6 +88,19 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
             "[yellow]No checkout zones loaded — everyone stays "
             "'not paid'. Pass --config or --zones with a checkout* zone.[/yellow]"
         )
+    if agent_server and agent_key:
+        console.print(
+            f"[dim]Shoplifting alerts: confirmed exit-without-paying events + "
+            f"clips will be pushed to {agent_server}.[/dim]"
+        )
+    else:
+        console.print(
+            "[yellow]No cloud agent key configured — evidence clips are saved "
+            "locally only; no Telegram / Lime CRM notifications will be sent. "
+            "Pass --agent-server/--agent-key or set STOREGUARD_AGENT_SERVER/"
+            "STOREGUARD_AGENT_KEY (create a key in the cabinet's Devices "
+            "page).[/yellow]"
+        )
     from .dashboard.app import serve
 
     serve(
@@ -91,6 +109,8 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
         detector=detector,
         data_dir=data_dir,
         zones=zones,
+        agent_server=agent_server or None,
+        agent_key=agent_key or None,
     )
 
 
@@ -299,6 +319,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="zones YAML (shelf/checkout/exit) for paid / not-paid labels; "
         "overrides zones from --config",
+    )
+    p.add_argument(
+        "--agent-server",
+        default=None,
+        help="cloud base URL to push confirmed exit-without-paying events + "
+        "clips to, enabling Telegram / Lime CRM notifications (or set "
+        "STOREGUARD_AGENT_SERVER); clips are always saved locally either way",
+    )
+    p.add_argument(
+        "--agent-key",
+        default=None,
+        help="agent token for --agent-server, created in the cabinet's "
+        "Devices page (or set STOREGUARD_AGENT_KEY)",
     )
     p.set_defaults(func=_cmd_dashboard)
 

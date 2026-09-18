@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import shutil
 import tempfile
 import threading
@@ -14,11 +15,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.websockets import WebSocketDisconnect
 
 from storeguard.cloud.agent_client import CloudClient
 from storeguard.config import DetectorCfg
+from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
 
@@ -87,6 +89,16 @@ def _clean_camera_url(raw: str) -> str:
     return url
 
 
+def _zones_from_cloud(raw_zones: list[dict]) -> list[Zone] | None:
+    """Build ``Zone`` objects from the cloud's zone dicts (or ``None`` if empty)."""
+    zones = [
+        Zone(z["name"], [tuple(p) for p in z["points"]])
+        for z in raw_zones
+        if z.get("points")
+    ]
+    return zones or None
+
+
 def _camera_label(url: str) -> str:
     """Short label for the HUD (hide credentials)."""
     label = url.split("@")[-1] if "@" in url else url
@@ -113,16 +125,48 @@ class CameraSessionRequest(BaseModel):
     process_every: int = 1
 
 
+class ZoneSpec(BaseModel):
+    """A named polygon zone with points normalized to the 0..1 range."""
+
+    name: str = Field(min_length=1, max_length=120)
+    points: list[tuple[float, float]] = Field(min_length=3)
+
+
+class CameraEntry(BaseModel):
+    """One camera with its cloud identity and zones (for shoplifting alerts)."""
+
+    source: str
+    name: str = ""
+    camera_id: str | None = None
+    zones: list[ZoneSpec] = Field(default_factory=list)
+
+
 class CamerasSessionRequest(BaseModel):
-    """Connect a batch of camera URLs (replaces all current sessions)."""
+    """Connect a batch of cameras (replaces all current sessions).
+
+    ``urls`` is the plain manual-entry form (no zones, so no shoplifting
+    alerts). ``cameras`` carries each camera's cloud id and zones straight
+    from the cabinet, so a confirmed exit-without-paying can be attributed to
+    the right camera and delivered as an alert. Either or both may be given.
+    """
 
     urls: list[str] = Field(
-        ...,
-        min_length=1,
+        default_factory=list,
         max_length=MAX_CAMERAS,
-        description=f"1..{MAX_CAMERAS} camera URLs (rtsp:// or http(s)://)",
+        description=f"up to {MAX_CAMERAS} camera URLs (rtsp:// or http(s)://), no zones",
+    )
+    cameras: list[CameraEntry] = Field(
+        default_factory=list,
+        max_length=MAX_CAMERAS,
+        description=f"up to {MAX_CAMERAS} cameras with their cloud id + zones",
     )
     process_every: int = 1
+
+    @model_validator(mode="after")
+    def _require_one(self) -> "CamerasSessionRequest":
+        if not self.urls and not self.cameras:
+            raise ValueError("either urls or cameras is required")
+        return self
 
 
 class CloudSessionRequest(BaseModel):
@@ -161,6 +205,8 @@ def create_app(
     data_dir: Path | None = None,
     zones: list[Zone] | None = None,
     checkout_dwell_sec: float = 2.0,
+    agent_server: str | None = None,
+    agent_key: str | None = None,
 ) -> FastAPI:
     """Build the dashboard FastAPI application.
 
@@ -168,8 +214,14 @@ def create_app(
         detector: YOLO settings for the person tracker (defaults to DetectorCfg).
         upload_dir: Where browser uploads are stored; a temp dir is used when None.
         data_dir: Folder of local videos to list/open (default: ``./data``).
-        zones: Checkout / shelf / exit polygons for paid status (optional).
+        zones: Checkout / shelf / exit polygons for paid status (optional);
+            applied only to sessions that don't supply their own per-camera
+            zones (see :class:`CameraEntry`).
         checkout_dwell_sec: Seconds in a checkout zone before status becomes paid.
+        agent_server: Cloud base URL for pushing shoplifting events + clips
+            (enables Telegram / Lime CRM notifications). Optional — clips are
+            always saved locally regardless.
+        agent_key: Agent token for ``agent_server``.
     """
     cfg = detector or DetectorCfg()
     own_upload_dir = upload_dir is None
@@ -189,6 +241,8 @@ def create_app(
         # Stopping sessions joins worker threads (up to 5s each); do it off the
         # event loop so shutdown doesn't block the loop.
         await run_in_threadpool(_replace_sessions, [])
+        app.state.alert_queue.put(None)
+        await run_in_threadpool(app.state.alert_thread.join, 5.0)
         if app.state.own_upload_dir and app.state.upload_root.exists():
             shutil.rmtree(app.state.upload_root, ignore_errors=True)
 
@@ -210,6 +264,24 @@ def create_app(
     app.state.sessions: dict[str, DetectionSession] = {}
     app.state.session_lock = threading.Lock()
 
+    # Shoplifting-event delivery: every session hands raised events to this
+    # queue; one shared thread drains it so clip encoding + cloud/Telegram
+    # I/O never stalls a camera's per-frame loop. Evidence clips always land
+    # under data/events/clips on this computer; the cloud push (and the
+    # Telegram / Lime CRM notifications it triggers) only happens when this
+    # dashboard was given cloud agent credentials.
+    app.state.alert_sink = DashboardAlertSink(
+        videos_root / "events" / "clips", build_cloud_client(agent_server, agent_key)
+    )
+    app.state.alert_queue = queue.Queue(maxsize=32)
+    app.state.alert_thread = threading.Thread(
+        target=delivery_loop,
+        args=(app.state.alert_sink, app.state.alert_queue),
+        name="dashboard-alert-delivery",
+        daemon=True,
+    )
+    app.state.alert_thread.start()
+
     def _make_session(
         session_id: str,
         source: str,
@@ -217,6 +289,8 @@ def create_app(
         process_every: int,
         loop: bool,
         kind: str,
+        zones: list[Zone] | None = None,
+        camera_id: str | None = None,
     ) -> DetectionSession:
         return DetectionSession(
             session_id=session_id,
@@ -225,9 +299,11 @@ def create_app(
             detector=app.state.detector,
             process_every=process_every,
             loop=loop,
-            zones=app.state.zones,
+            zones=zones if zones is not None else app.state.zones,
             checkout_dwell_sec=app.state.checkout_dwell_sec,
             kind=kind,
+            alert_queue=app.state.alert_queue,
+            camera_id=camera_id,
         )
 
     def _stop_sessions(sessions: list[DetectionSession]) -> None:
@@ -316,20 +392,31 @@ def create_app(
 
     @app.post("/api/session/cameras")
     def create_camera_sessions(body: CamerasSessionRequest) -> JSONResponse:
-        """Connect up to ``MAX_CAMERAS`` camera URLs at once.
+        """Connect up to ``MAX_CAMERAS`` cameras at once.
 
         Replaces all current sessions and starts detection on every camera
         immediately (unlike the single-source endpoints, which wait for an
-        explicit ``/start``).  Duplicate and blank URLs are dropped.
+        explicit ``/start``). Duplicate and blank sources are dropped.
+        ``cameras`` entries carry their cloud id and zones through to the
+        session, so a confirmed exit-without-paying can be detected and
+        attributed to the right camera; plain ``urls`` get no zones (no
+        shoplifting alerts, same as manual standalone entry always has).
         """
-        urls: list[str] = []
-        for raw in body.urls:
-            url = _clean_camera_url(raw)
-            if url and url not in urls:
-                urls.append(url)
-        if not urls:
+        entries: list[CameraEntry] = [
+            *body.cameras,
+            *(CameraEntry(source=raw) for raw in body.urls),
+        ]
+        seen: set[str] = set()
+        cleaned: list[CameraEntry] = []
+        for entry in entries:
+            url = _clean_camera_url(entry.source)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            cleaned.append(entry.model_copy(update={"source": url}))
+        if not cleaned:
             raise HTTPException(status_code=400, detail="no camera urls given")
-        if len(urls) > MAX_CAMERAS:
+        if len(cleaned) > MAX_CAMERAS:
             raise HTTPException(
                 status_code=400,
                 detail=f"at most {MAX_CAMERAS} cameras are supported",
@@ -337,13 +424,15 @@ def create_app(
         sessions = [
             _make_session(
                 session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
-                source=url,
-                filename=_camera_label(url),
+                source=entry.source,
+                filename=entry.name or _camera_label(entry.source),
                 process_every=body.process_every,
                 loop=False,
                 kind="camera",
+                zones=[Zone(z.name, z.points) for z in entry.zones] or None,
+                camera_id=entry.camera_id,
             )
-            for url in urls
+            for entry in cleaned
         ]
         _replace_sessions(sessions, start=True)
         return JSONResponse(
@@ -388,6 +477,8 @@ def create_app(
                 process_every=body.process_every,
                 loop=False,
                 kind="camera",
+                zones=_zones_from_cloud(c.get("zones", [])),
+                camera_id=c.get("id"),
             )
             for c in cams
         ]
@@ -619,6 +710,8 @@ def serve(
     data_dir: str | Path | None = None,
     zones: list[Zone] | None = None,
     checkout_dwell_sec: float = 2.0,
+    agent_server: str | None = None,
+    agent_key: str | None = None,
 ) -> None:
     """Run the dashboard with uvicorn (blocking)."""
     import uvicorn
@@ -628,5 +721,7 @@ def serve(
         data_dir=Path(data_dir) if data_dir is not None else Path("data"),
         zones=zones,
         checkout_dwell_sec=checkout_dwell_sec,
+        agent_server=agent_server,
+        agent_key=agent_key,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")

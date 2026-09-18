@@ -76,6 +76,10 @@ class ExitNoPayScenario:
         self._checkout_dwell_sec = float(checkout_dwell_sec)
         self._state: dict[int, _TrackState] = {}
 
+    def reset(self) -> None:
+        """Forget all per-track dwell/alerted state (e.g. a looping file restarts)."""
+        self._state.clear()
+
     def update(self, frame: "np.ndarray", tracks: list["Track"], ts: float) -> list[Event]:
         """Process one frame's tracks and return any newly detected events.
 
