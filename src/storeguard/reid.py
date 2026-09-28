@@ -20,6 +20,7 @@ torch / torchvision are imported lazily so importing this module stays cheap.
 from __future__ import annotations
 
 import threading
+import uuid
 from dataclasses import dataclass, field
 
 import cv2
@@ -233,6 +234,10 @@ class IdentityRegistry:
 
     def __init__(self, cfg: ReidCfg | None = None) -> None:
         self.cfg = cfg or ReidCfg()
+        #: Distinguishes this registry's ids from earlier runs: ids restart at
+        #: 1 on every reconnect, so "person 1" alone would merge different
+        #: people in the cabinet's event history.
+        self.run_id = uuid.uuid4().hex[:8]
         self._lock = threading.Lock()
         self._next_gid = 1
         self._identities: dict[int, _Identity] = {}
@@ -249,6 +254,10 @@ class IdentityRegistry:
         if b is None or not b.confirmed:
             return True
         return b.updates % _REFRESH_EVERY == 0
+
+    def person_id(self, gid: int) -> str:
+        """Store-wide person id for events, unique across runs (e.g. ``3f9a1c2e-7``)."""
+        return f"{self.run_id}-{gid}"
 
     # -- lifecycle -------------------------------------------------------
 

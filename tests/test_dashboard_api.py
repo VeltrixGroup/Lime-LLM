@@ -32,6 +32,7 @@ class _FakeSession:
         alert_queue=None,
         camera_id=None,
         identities=None,
+        action=None,
     ) -> None:
         self.id = session_id
         self.source = source
@@ -83,6 +84,46 @@ def _session_ids(client: TestClient) -> list[str]:
     res = client.get("/api/sessions")
     assert res.status_code == 200
     return [s["id"] for s in res.json()["sessions"]]
+
+
+def test_sync_adds_new_camera_and_keeps_running_ones(client: TestClient) -> None:
+    """A camera added in the cabinet must show up without restarting the others."""
+    cams = [{"source": "rtsp://cam0.local/s", "name": "Cam 0", "camera_id": "c0"}]
+    res = client.post("/api/session/cameras/sync", json={"cameras": cams})
+    assert res.status_code == 200
+    first_id = res.json()["sessions"][0]["id"]
+    first = client.app.state.sessions[first_id]
+
+    cams.append({"source": "rtsp://cam1.local/s", "name": "Cam 1", "camera_id": "c1"})
+    res = client.post("/api/session/cameras/sync", json={"cameras": cams})
+    body = res.json()
+    assert body["added"] == 1 and body["removed"] == 0
+    ids = [s["id"] for s in body["sessions"]]
+    assert ids[0] == first_id  # untouched
+    assert not first.stopped
+    new = client.app.state.sessions[ids[1]]
+    assert new.started
+    # The new camera joins the same person-id registry as the running one.
+    assert new.identities is first.identities
+
+
+def test_sync_restarts_edited_and_stops_removed_cameras(client: TestClient) -> None:
+    cams = [
+        {"source": "rtsp://cam0.local/s", "name": "Cam 0"},
+        {"source": "rtsp://cam1.local/s", "name": "Cam 1"},
+    ]
+    ids = [s["id"] for s in client.post("/api/session/cameras/sync", json={"cameras": cams}).json()["sessions"]]
+    old = [client.app.state.sessions[i] for i in ids]
+
+    edited = [{"source": "rtsp://cam0.local/s", "name": "Cam 0 renamed"}]
+    body = client.post("/api/session/cameras/sync", json={"cameras": edited}).json()
+    assert body["added"] == 1 and body["removed"] == 2
+    assert all(s.stopped for s in old)
+    assert _session_ids(client) == [body["sessions"][0]["id"]]
+
+    body = client.post("/api/session/cameras/sync", json={"cameras": []}).json()
+    assert body["count"] == 0
+    assert _session_ids(client) == []
 
 
 def test_cameras_in_one_batch_share_one_identity_registry(client: TestClient) -> None:

@@ -41,6 +41,7 @@ class CashierScenario(PocketScenario):
         buf: "ClipBuffer",
         threshold: float = 0.80,
         zones: list["Zone"] | None = None,
+        classify_every: int = 1,
     ) -> None:
         """Create the scenario for one camera.
 
@@ -53,4 +54,6 @@ class CashierScenario(PocketScenario):
             zones: Optional camera zones; only zones whose name starts with
                 ``"register"`` are used for filtering.
         """
-        super().__init__(camera, model, buf, threshold=threshold, zones=zones)
+        super().__init__(
+            camera, model, buf, threshold=threshold, zones=zones, classify_every=classify_every
+        )

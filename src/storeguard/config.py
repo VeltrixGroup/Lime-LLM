@@ -166,6 +166,37 @@ def load_config(path: str | Path) -> AppCfg:
     return app
 
 
+_cuda_ok: bool | None = None
+
+
+def _cuda_usable() -> bool:
+    """True if CUDA is available *and* can actually run a kernel.
+
+    ``torch.cuda.is_available()`` only says a driver answered. A torch built
+    for a newer CUDA than the GPU supports (e.g. CUDA 13 on a GTX 10xx) still
+    reports True and then fails every kernel with "no kernel image is
+    available" — which used to kill the camera thread instead of falling
+    back to the CPU. Checked once per process.
+    """
+    global _cuda_ok
+    if _cuda_ok is None:
+        import torch
+
+        try:
+            _cuda_ok = bool(torch.cuda.is_available()) and float(
+                (torch.ones(8, device="cuda") * 2).sum()
+            ) == 16.0
+        except Exception as exc:  # noqa: BLE001
+            from rich.console import Console
+
+            Console().print(
+                f"[red]CUDA is present but unusable ({exc}); using cpu. "
+                "Run `storeguard gpu-check`.[/red]"
+            )
+            _cuda_ok = False
+    return _cuda_ok
+
+
 def pick_device(pref: str = "auto") -> str:
     """Resolve a device preference to a concrete torch device string.
 
@@ -177,20 +208,20 @@ def pick_device(pref: str = "auto") -> str:
     import torch  # lazy: keep config import light
 
     if pref != "auto":
-        if pref.startswith("cuda") and not torch.cuda.is_available():
-            # Asking for cuda on a CPU-only torch build used to crash the
-            # camera thread with an opaque error — fall back and say why.
+        if pref.startswith("cuda") and not _cuda_usable():
+            # Asking for an unusable cuda used to crash the camera thread
+            # with an opaque error — fall back and say why.
             from rich.console import Console
 
             Console().print(
-                "[red]device=cuda requested, but this torch build has no CUDA "
-                f"support (torch {torch.__version__}). Falling back to cpu. "
-                "Run `uv sync` again to install the CUDA build of torch.[/red]"
+                f"[red]device=cuda requested, but CUDA is not usable with torch "
+                f"{torch.__version__} (CUDA build: {torch.version.cuda or 'none'}). "
+                "Falling back to cpu. Run `storeguard gpu-check` to see why.[/red]"
             )
             return "cpu"
         return pref
 
-    if torch.cuda.is_available():
+    if _cuda_usable():
         return "cuda"
     if torch.backends.mps.is_available():
         return "mps"

@@ -233,6 +233,36 @@ body {
   display: flex;
 }
 
+/* In the expanded view the corner button is "back to grid" — keep it visible. */
+.tile.is-expanded .tile-close {
+  opacity: 1;
+}
+
+.tile.is-expanded .tile-close:hover {
+  border-color: var(--accent, #b6f24a);
+  color: var(--accent, #b6f24a);
+}
+
+.back-btn {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 2;
+  padding: 0.35rem 0.7rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  color: var(--text, #e8efe4);
+  background: rgba(8, 10, 9, 0.8);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.back-btn:hover {
+  border-color: var(--accent, #b6f24a);
+  color: var(--accent, #b6f24a);
+}
+
 .placeholder {
   position: absolute;
   inset: 0;

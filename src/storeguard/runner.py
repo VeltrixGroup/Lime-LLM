@@ -23,12 +23,12 @@ import threading
 import time
 import traceback
 from collections import deque
-from pathlib import Path
 
 import cv2
 import numpy as np
 from rich.console import Console
 
+from .actions.shared import SharedActionModel, get_action_model
 from .alerts import AlertSink
 from .config import AppCfg, CameraCfg
 from .detector import PersonTracker
@@ -44,24 +44,6 @@ _BANNER_SEC = 3.0  # how long the red event banner stays on screen (show mode)
 # bursty event storm with slow Telegram I/O the unbound queue would retain
 # unbounded frame memory; drop the oldest pending delivery when full.
 _ALERT_QUEUE_MAX = 32
-
-
-class _SharedActionModel:
-    """Thread-safe facade over a single ActionClassifier shared by all cameras.
-
-    The YOLO tracker is per-stream, but the action classifier is one network
-    used by every camera thread — all ``predict`` calls are serialized
-    through one lock so the model stays thread-safe.
-    """
-
-    def __init__(self, model) -> None:
-        self._model = model
-        self._lock = threading.Lock()
-
-    def predict(self, clip) -> dict[str, float]:
-        """Run ``ActionClassifier.predict`` under the shared lock."""
-        with self._lock:
-            return self._model.predict(clip)
 
 
 class _DisplayHub:
@@ -89,37 +71,9 @@ class _DisplayHub:
             return frames
 
 
-_model_lock = threading.Lock()
-_model_cache: dict[str, _SharedActionModel | None] = {}
-
-
-def _get_action_model(app: AppCfg) -> _SharedActionModel | None:
-    """Load the shared action classifier once; ``None`` if weights are missing.
-
-    The result (including the "weights missing" outcome) is cached per
-    weights path, so the model is loaded — and the warning printed — at most
-    once no matter how many cameras ask for it.
-    """
-    weights = app.action.weights
-    with _model_lock:
-        if weights in _model_cache:
-            return _model_cache[weights]
-        if not Path(weights).is_file():
-            console.print(
-                f"[yellow]Action model weights not found at '{weights}' — "
-                "the 'pocket' and 'cashier' scenarios are disabled for this "
-                "run. Train a model first: [bold]storeguard train[/bold]"
-                "[/yellow]"
-            )
-            _model_cache[weights] = None
-            return None
-
-        from .actions.model import ActionClassifier  # heavy import (torch)
-
-        console.print(f"[cyan]Loading action model from '{weights}'…[/cyan]")
-        shared = _SharedActionModel(ActionClassifier.load(weights))
-        _model_cache[weights] = shared
-        return shared
+def _get_action_model(app: AppCfg) -> SharedActionModel | None:
+    """The process-wide action classifier (see :func:`get_action_model`)."""
+    return get_action_model(app.action.weights)
 
 
 def build_scenarios(

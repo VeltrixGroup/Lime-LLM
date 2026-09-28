@@ -17,7 +17,11 @@
 # all before troubleshooting anything in this repo:
 #   docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 # If that doesn't show your GPU, the problem is Docker/WSL2/driver setup,
-# not this compose file.
+# not this compose file. If it does, but the dashboard still logs
+# "Detector device: cpu", run
+#   docker compose exec dashboard storeguard gpu-check
+# and, for an older driver / GPU, rebuild with the CUDA 12.6 torch build:
+#   TORCH_CUDA=cu126 docker compose build dashboard
 
 services:
   cloud:
@@ -42,6 +46,8 @@ services:
     build:
       context: .
       dockerfile: docker/edge.Dockerfile
+      args:
+        TORCH_CUDA: ${TORCH_CUDA:-cu128}
     ports:
       - "8765:8765"
     environment:
@@ -54,6 +60,8 @@ services:
       # `up` for everyone, same reasoning as the `agent` service below.
       STOREGUARD_AGENT_SERVER: http://cloud:8000
       STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:-}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     volumes:
       - ./configs:/app/configs:ro
       - ./models:/app/models:ro # optional: a trained action.pt, if you have one
@@ -74,6 +82,8 @@ services:
     build:
       context: .
       dockerfile: docker/edge.Dockerfile
+      args:
+        TORCH_CUDA: ${TORCH_CUDA:-cu128}
     profiles: ["agent"]
     # Compose interpolates every service's environment block up front, even
     # ones gated behind a profile that isn't active - a required (":?") var
@@ -83,6 +93,8 @@ services:
     # STOREGUARD_AGENT_KEY") if this is empty when the agent actually starts.
     environment:
       STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:-}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
     command:
       [
         "storeguard",

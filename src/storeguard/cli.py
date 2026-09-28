@@ -4,6 +4,7 @@ Subcommands:
 
 * ``run`` — run the detection pipeline from a YAML config.
 * ``dashboard`` — local web UI to upload a video and watch person detection.
+* ``gpu-check`` — diagnose why detection isn't using the NVIDIA GPU.
 * ``draw-zones`` — interactively draw polygon zones over a camera frame.
 * ``annotate`` — keyboard labeler producing a labels CSV from raw videos.
 * ``make-dataset`` — cut labeled segments into per-class training clips.
@@ -43,7 +44,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
     """Handler for ``storeguard dashboard``."""
     import os
 
-    from .config import DetectorCfg, ReidCfg, ZoneCfg, load_config
+    from .config import ActionCfg, DetectorCfg, ReidCfg, ZoneCfg, load_config
     from .geometry import zones_from_cfg
 
     agent_server = args.agent_server or os.environ.get("STOREGUARD_AGENT_SERVER", "")
@@ -51,11 +52,13 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
 
     detector = DetectorCfg(device=args.device)
     reid = ReidCfg()
+    action = ActionCfg()
     zones = []
     if args.config:
         cfg = load_config(args.config)
         detector = cfg.detector
         reid = cfg.reid
+        action = cfg.action
         if args.device != "auto":
             detector = detector.model_copy(update={"device": args.device})
         # Prefer the first camera that has zones (paid / not-paid needs checkout).
@@ -103,6 +106,17 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
             "STOREGUARD_AGENT_KEY (create a key in the cabinet's Devices "
             "page).[/yellow]"
         )
+    if Path(action.weights).is_file():
+        console.print(
+            f"[dim]Action model: {action.weights} — 'pocket' on cameras with shelf* "
+            "zones (or no zones), 'take_cash' on cameras with register* zones.[/dim]"
+        )
+    else:
+        console.print(
+            f"[yellow]No action model at '{action.weights}' — only exit-without-"
+            "paying is detected; 'pocket' / 'take_cash' need a trained model "
+            "(storeguard train).[/yellow]"
+        )
     from .dashboard.app import serve
 
     serve(
@@ -114,7 +128,69 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
         agent_server=agent_server or None,
         agent_key=agent_key or None,
         reid=reid,
+        action=action,
     )
+
+
+def _cmd_gpu_check(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard gpu-check``: why is detection on the CPU?"""
+    import shutil
+    import subprocess
+
+    import torch
+
+    console.print(f"torch {torch.__version__}, CUDA build: {torch.version.cuda or 'none (CPU-only)'}")
+    smi = shutil.which("nvidia-smi")
+    driver = None
+    if smi:
+        try:
+            out = subprocess.run(
+                [smi, "--query-gpu=name,driver_version", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=15,
+            )
+            driver = out.stdout.strip() or out.stderr.strip()
+        except Exception as exc:  # noqa: BLE001
+            driver = f"nvidia-smi failed: {exc}"
+    console.print(f"nvidia-smi: {driver or 'not found (no GPU passed through?)'}")
+
+    ok = False
+    try:
+        ok = torch.cuda.is_available()
+        if ok:
+            name = torch.cuda.get_device_name(0)
+            cap = ".".join(map(str, torch.cuda.get_device_capability(0)))
+            x = torch.ones(1024, 1024, device="cuda")
+            float((x @ x).sum())  # a real kernel: catches "no kernel image" errors
+            console.print(f"[green]CUDA OK: {name} (compute {cap})[/green]")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        console.print(f"[red]CUDA error: {exc}[/red]")
+
+    if ok:
+        return
+    if not torch.version.cuda:
+        console.print(
+            "[red]This torch build has no CUDA.[/red] Natively on Windows: run "
+            "`uv sync` again (pyproject pulls the CUDA build). In Docker: rebuild "
+            "the image (`docker compose build --no-cache dashboard`)."
+        )
+    elif not smi:
+        console.print(
+            "[red]No GPU visible.[/red] In Docker check GPU passthrough: "
+            "`docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 "
+            "nvidia-smi` must list your GPU (Docker Desktop -> WSL2 backend, "
+            "NVIDIA driver installed on Windows)."
+        )
+    else:
+        console.print(
+            f"[red]GPU is visible but torch (CUDA {torch.version.cuda}) can't use "
+            "it[/red] — the driver is too old for this CUDA version, or the GPU "
+            "is too old for it. CUDA 13 needs driver >= 580, CUDA 12.8 >= 570, "
+            "CUDA 12.6 >= 560. Update the NVIDIA driver, or in Docker rebuild "
+            "with an older CUDA: `TORCH_CUDA=cu126 docker compose build "
+            "dashboard`."
+        )
+    raise SystemExit(1)
 
 
 def _cmd_draw_zones(args: argparse.Namespace) -> None:
@@ -337,6 +413,12 @@ def build_parser() -> argparse.ArgumentParser:
         "Devices page (or set STOREGUARD_AGENT_KEY)",
     )
     p.set_defaults(func=_cmd_dashboard)
+
+    p = sub.add_parser(
+        "gpu-check",
+        help="diagnose whether detection can use the NVIDIA GPU (CUDA)",
+    )
+    p.set_defaults(func=_cmd_gpu_check)
 
     p = sub.add_parser(
         "draw-zones",

@@ -87,6 +87,7 @@ docker-up:
 	docker compose up -d --build
 	@echo "→ cloud: http://$(HOST):$(CLOUD_PORT)   dashboard: http://$(HOST):$(PORT)"
 	@echo "GPU not showing up? docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi"
+	@echo "Detection on cpu? docker compose exec dashboard storeguard gpu-check"
 
 docker-down:
 	docker compose down

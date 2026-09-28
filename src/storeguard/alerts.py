@@ -35,6 +35,21 @@ def _safe_name(name: str) -> str:
     return _UNSAFE_FILENAME_CHARS.sub("-", name).strip("-") or "camera"
 
 
+def dedup_key(event: Event) -> tuple:
+    """Key for the sinks' min-gap filter: one person, one camera, one kind.
+
+    Keyed per *person* (global person id if the event carries one, else the
+    track id), not just per camera + kind: two different people leaving
+    without paying within a few seconds of each other are two incidents,
+    and the second one used to be silently dropped. Events without any
+    person (track_id < 0) still share one key per camera + kind.
+    """
+    person = (event.extra or {}).get("person_id")
+    if person is None and event.track_id >= 0:
+        person = event.track_id
+    return (event.camera, event.kind, person)
+
+
 def event_payload(event: Event, clip_path: Path | None = None) -> dict:
     """Build the JSON body sent to webhooks (and mirrored in events.jsonl)."""
     payload = {
@@ -91,7 +106,7 @@ def write_mp4_clip(
 class AlertSink:
     """Persist and deliver events: JSONL log + mp4 clip + Telegram + webhook.
 
-    Applies a per-``(camera, kind)`` minimum gap of :attr:`min_gap_sec`
+    Applies a per-``(camera, kind, person)`` minimum gap (see :func:`dedup_key`) of :attr:`min_gap_sec`
     seconds on top of the scenarios' own per-track cooldowns. Thread-safe:
     one sink instance may be shared by all camera worker threads.
     """
@@ -118,7 +133,7 @@ class AlertSink:
         self._telegram = telegram
         self._notify = notify or NotifyCfg()
         self._events_dir = Path(events_dir)
-        self._last_sent: dict[tuple[str, str], float] = {}
+        self._last_sent: dict[tuple, float] = {}
         self._lock = threading.Lock()
 
     def handle(
@@ -136,7 +151,7 @@ class AlertSink:
                 :attr:`clip_fps` when omitted or invalid.
         """
         with self._lock:
-            key = (event.camera, event.kind)
+            key = dedup_key(event)
             last = self._last_sent.get(key)
             if last is not None and event.ts - last < self.min_gap_sec:
                 return

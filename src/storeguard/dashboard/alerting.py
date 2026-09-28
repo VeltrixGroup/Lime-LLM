@@ -5,7 +5,8 @@ still needs to be caught even when nobody is watching the screen. Every
 :class:`~storeguard.dashboard.pipeline.DetectionSession` that raises a
 scenario event hands it to :class:`DashboardAlertSink`, which:
 
-* always saves a short local evidence clip on this computer, and
+* always saves a short local evidence clip and a line in ``events.jsonl``
+  on this computer, and
 * if the dashboard was started with cloud agent credentials, also pushes the
   event and that same clip to the cloud via the same agent API the headless
   edge agent uses — so the tenant's existing Telegram / Lime CRM
@@ -14,6 +15,7 @@ scenario event hands it to :class:`DashboardAlertSink`, which:
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from datetime import datetime, timezone
@@ -22,7 +24,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from rich.console import Console
 
-from storeguard.alerts import write_mp4_clip
+from storeguard.alerts import dedup_key, event_payload, write_mp4_clip
 from storeguard.cloud.agent_client import CloudClient
 
 if TYPE_CHECKING:
@@ -44,9 +46,11 @@ def _safe_name(name: str) -> str:
 class DashboardAlertSink:
     """Save an evidence clip locally and, if configured, push it to the cloud.
 
-    Applies a per-``(camera, kind)`` minimum gap of :attr:`min_gap_sec` on top
-    of each scenario's own per-track cooldown, so a burst of near-simultaneous
-    events on one camera can't spam clips/notifications. Thread-safe: meant to
+    Every delivered event is also appended to ``events.jsonl`` (see
+    :meth:`_append_log`). Applies a per-``(camera, kind, person)`` minimum gap
+    of :attr:`min_gap_sec` on top of each scenario's own per-track cooldown
+    (see :func:`storeguard.alerts.dedup_key`), so one person can't spam
+    clips/notifications but a second person is never dropped. Thread-safe: meant to
     be driven by one shared :func:`delivery_loop` thread on behalf of every
     camera session.
     """
@@ -54,7 +58,12 @@ class DashboardAlertSink:
     min_gap_sec: ClassVar[float] = 10.0
     clip_fps: ClassVar[float] = 10.0  # fallback when the caller passes no fps
 
-    def __init__(self, clips_dir: Path, cloud_client: CloudClient | None = None) -> None:
+    def __init__(
+        self,
+        clips_dir: Path,
+        cloud_client: CloudClient | None = None,
+        events_log: Path | None = None,
+    ) -> None:
         """Create the sink.
 
         Args:
@@ -63,10 +72,15 @@ class DashboardAlertSink:
             cloud_client: When given, events are also pushed to the cloud
                 (metadata immediately, then the clip once encoded) so its
                 Telegram / Lime CRM delivery fires. ``None`` means local-only.
+            events_log: JSON-lines file every delivered event is appended to
+                (default: ``events.jsonl`` next to ``clips_dir``).
         """
         self._clips_dir = Path(clips_dir)
+        self._events_log = (
+            Path(events_log) if events_log is not None else self._clips_dir.parent / "events.jsonl"
+        )
         self._client = cloud_client
-        self._last_sent: dict[tuple[str, str], float] = {}
+        self._last_sent: dict[tuple, float] = {}
         self._lock = threading.Lock()
 
     @property
@@ -93,15 +107,42 @@ class DashboardAlertSink:
                 cloud attribute the event to the right camera).
         """
         with self._lock:
-            key = (event.camera, event.kind)
+            key = dedup_key(event)
             last = self._last_sent.get(key)
             if last is not None and event.ts - last < self.min_gap_sec:
                 return
             self._last_sent[key] = event.ts
 
         clip_path = self._write_clip(event, frames, fps)
+        cloud_event_id = None
         if self._client is not None:
-            self._push_to_cloud(event, clip_path, camera_id)
+            cloud_event_id = self._push_to_cloud(event, clip_path, camera_id)
+        self._append_log(event, clip_path, camera_id, cloud_event_id)
+
+    def _append_log(
+        self,
+        event: "Event",
+        clip_path: Path | None,
+        camera_id: str | None,
+        cloud_event_id: str | None,
+    ) -> None:
+        """Append one JSON line per delivered event — the local record of it.
+
+        Written whether or not the cloud push worked, so this computer always
+        has a searchable history (time, camera, person, clip) of every
+        incident, even offline or without an agent key.
+        """
+        record = event_payload(event, clip_path)
+        record["camera_id"] = camera_id
+        record["person_id"] = (event.extra or {}).get("person_id")
+        record["cloud_event_id"] = cloud_event_id
+        try:
+            self._events_log.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False)
+            with self._lock, open(self._events_log, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
+            _console.log(f"[red]DashboardAlertSink: could not write {self._events_log}: {exc}[/red]")
 
     def _write_clip(
         self, event: "Event", frames: list["np.ndarray"], fps: float | None
@@ -123,7 +164,8 @@ class DashboardAlertSink:
 
     def _push_to_cloud(
         self, event: "Event", clip_path: Path | None, camera_id: str | None
-    ) -> None:
+    ) -> str | None:
+        """Push the event (+ clip); return the cloud's event id, or None on failure."""
         assert self._client is not None
         iso = datetime.fromtimestamp(event.ts, tz=timezone.utc).isoformat()
         try:
@@ -131,19 +173,24 @@ class DashboardAlertSink:
                 event.kind,
                 message=event.message,
                 camera_id=camera_id,
+                # Store-wide person id (same on every camera), so the cabinet
+                # can group every camera that saw this person.
+                person_id=(event.extra or {}).get("person_id"),
                 track_id=event.track_id,
                 score=event.score,
                 ts=iso,
             )
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: send_event failed: {exc}[/red]")
-            return
-        if clip_path is None:
-            return
+            return None
+        event_id = created.get("id") if isinstance(created, dict) else None
+        if clip_path is None or event_id is None:
+            return event_id
         try:
-            self._client.upload_clip(created["id"], clip_path)
+            self._client.upload_clip(event_id, clip_path)
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: upload_clip failed: {exc}[/red]")
+        return event_id
 
 
 def delivery_loop(sink: DashboardAlertSink, alert_queue: "queue.Queue") -> None:
