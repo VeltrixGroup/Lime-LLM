@@ -170,6 +170,24 @@ class CamerasSessionRequest(BaseModel):
         return self
 
 
+class CamerasSyncRequest(BaseModel):
+    """The full desired camera list for ``/api/session/cameras/sync`` (may be empty)."""
+
+    urls: list[str] = Field(default_factory=list, max_length=MAX_CAMERAS)
+    cameras: list[CameraEntry] = Field(default_factory=list, max_length=MAX_CAMERAS)
+    process_every: int = 1
+
+
+def _entry_key(entry: CameraEntry) -> tuple:
+    """Everything that, if changed, means a camera's session must restart."""
+    return (
+        entry.source,
+        entry.name,
+        entry.camera_id,
+        tuple((z.name, tuple(map(tuple, z.points))) for z in entry.zones),
+    )
+
+
 class CloudSessionRequest(BaseModel):
     """Pull this tenant's enabled cameras from the cloud and connect all of them."""
 
@@ -184,6 +202,7 @@ def _stats_payload(session: DetectionSession) -> dict:
     return {
         "id": session.id,
         "kind": getattr(session, "kind", "") or "",
+        "camera_id": getattr(session, "camera_id", None),
         "filename": s.filename,
         "people": s.people,
         "fps": s.fps,
@@ -268,6 +287,9 @@ def create_app(
     app.state.zones = zone_list
     app.state.checkout_dwell_sec = checkout_dwell_sec
     app.state.reid = reid_cfg
+    # Person-id registry shared by the current batch of camera sessions
+    # (replaced on a full reconnect, reused when /sync adds cameras).
+    app.state.identities: IdentityRegistry | None = None
     # All live sessions keyed by id, in creation order (up to MAX_CAMERAS).
     app.state.sessions: dict[str, DetectionSession] = {}
     app.state.session_lock = threading.Lock()
@@ -315,6 +337,46 @@ def create_app(
             camera_id=camera_id,
             identities=identities,
         )
+
+    def _clean_entries(body: "CamerasSessionRequest | CamerasSyncRequest") -> list[CameraEntry]:
+        """Validated, de-duplicated camera entries (400 on a bad URL / too many)."""
+        entries: list[CameraEntry] = [
+            *body.cameras,
+            *(CameraEntry(source=raw) for raw in body.urls),
+        ]
+        seen: set[str] = set()
+        cleaned: list[CameraEntry] = []
+        for entry in entries:
+            url = _clean_camera_url(entry.source)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            cleaned.append(entry.model_copy(update={"source": url}))
+        if len(cleaned) > MAX_CAMERAS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"at most {MAX_CAMERAS} cameras are supported",
+            )
+        return cleaned
+
+    def _camera_session(
+        entry: CameraEntry, process_every: int, identities: IdentityRegistry | None
+    ) -> DetectionSession:
+        session = _make_session(
+            session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
+            source=entry.source,
+            filename=entry.name or _camera_label(entry.source),
+            process_every=process_every,
+            loop=False,
+            kind="camera",
+            zones=[Zone(z.name, z.points) for z in entry.zones] or None,
+            camera_id=entry.camera_id,
+            identities=identities,
+        )
+        # Lets /api/session/cameras/sync tell "unchanged, keep running" apart
+        # from "new or edited, (re)start".
+        session.sync_key = _entry_key(entry)
+        return session
 
     def _new_identities() -> IdentityRegistry | None:
         """A fresh id registry for one batch of sessions (ids restart at 1).
@@ -421,39 +483,13 @@ def create_app(
         attributed to the right camera; plain ``urls`` get no zones (no
         shoplifting alerts, same as manual standalone entry always has).
         """
-        entries: list[CameraEntry] = [
-            *body.cameras,
-            *(CameraEntry(source=raw) for raw in body.urls),
-        ]
-        seen: set[str] = set()
-        cleaned: list[CameraEntry] = []
-        for entry in entries:
-            url = _clean_camera_url(entry.source)
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            cleaned.append(entry.model_copy(update={"source": url}))
+        cleaned = _clean_entries(body)
         if not cleaned:
             raise HTTPException(status_code=400, detail="no camera urls given")
-        if len(cleaned) > MAX_CAMERAS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"at most {MAX_CAMERAS} cameras are supported",
-            )
         identities = _new_identities()
+        app.state.identities = identities
         sessions = [
-            _make_session(
-                session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
-                source=entry.source,
-                filename=entry.name or _camera_label(entry.source),
-                process_every=body.process_every,
-                loop=False,
-                kind="camera",
-                zones=[Zone(z.name, z.points) for z in entry.zones] or None,
-                camera_id=entry.camera_id,
-                identities=identities,
-            )
-            for entry in cleaned
+            _camera_session(entry, body.process_every, identities) for entry in cleaned
         ]
         _replace_sessions(sessions, start=True)
         return JSONResponse(
@@ -463,6 +499,54 @@ def create_app(
                     {"id": s.id, "filename": s.filename, "source": "camera"}
                     for s in sessions
                 ],
+            }
+        )
+
+    @app.post("/api/session/cameras/sync")
+    def sync_camera_sessions(body: CamerasSyncRequest) -> JSONResponse:
+        """Make the running cameras match ``body`` without restarting the rest.
+
+        Cameras whose source, name and zones are unchanged keep running
+        untouched (same session id, same tracks, same person ids); new or
+        changed cameras are started and join the *current* person-id
+        registry, so ids stay global across old and new cameras; cameras no
+        longer listed are stopped. An empty list stops everything. This is
+        what lets the cabinet's Live view pick up a camera added (or
+        removed / edited) in the cabinet while detection is running.
+        """
+        cleaned = _clean_entries(body)
+        with app.state.session_lock:
+            current = list(app.state.sessions.values())
+        by_key = {getattr(s, "sync_key", None): s for s in current}
+        identities = app.state.identities
+        if identities is None or not any(s.kind == "camera" for s in current):
+            identities = _new_identities()
+            app.state.identities = identities
+
+        ordered: list[DetectionSession] = []
+        started: list[DetectionSession] = []
+        for entry in cleaned:
+            existing = by_key.pop(_entry_key(entry), None)
+            if existing is not None and existing.is_alive():
+                ordered.append(existing)
+                continue
+            session = _camera_session(entry, body.process_every, identities)
+            ordered.append(session)
+            started.append(session)
+        kept = {s.id for s in ordered}
+        stale = [s for s in current if s.id not in kept]
+
+        with app.state.session_lock:
+            app.state.sessions = {s.id: s for s in ordered}
+            for session in started:
+                session.start()
+        _stop_sessions(stale)
+        return JSONResponse(
+            {
+                "count": len(ordered),
+                "added": len(started),
+                "removed": len(stale),
+                "sessions": [_stats_payload(s) for s in ordered],
             }
         )
 

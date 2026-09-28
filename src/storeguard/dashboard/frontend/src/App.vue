@@ -111,7 +111,45 @@ function toggleExpand(id) {
   expandedId.value = expandedId.value === id ? null : id;
 }
 
+function collapse() {
+  expandedId.value = null;
+}
+
+function onKeydown(ev) {
+  if (ev.key === "Escape" && expandedId.value) collapse();
+}
+
+// Tiles the user closed with ✕ in this tab. The cabinet sync below would
+// otherwise bring a closed cabinet camera straight back on its next round.
+// "Reconnect" clears it.
+const DISMISSED_KEY = "storeguard.dismissedCameras";
+const dismissedCameras = new Set(
+  (() => {
+    try {
+      return JSON.parse(sessionStorage.getItem(DISMISSED_KEY) || "[]");
+    } catch {
+      return [];
+    }
+  })()
+);
+
+function saveDismissed() {
+  try {
+    sessionStorage.setItem(DISMISSED_KEY, JSON.stringify([...dismissedCameras]));
+  } catch {
+    /* storage unavailable — the dismissal just won't survive a reload */
+  }
+}
+
 async function removeTile(id) {
+  const session = sessions.value.find((s) => s.id === id);
+  const name = session ? session.filename : "this camera";
+  // ✕ disconnects the camera — never do that on a stray click.
+  if (!window.confirm(`Disconnect ${name}?`)) return;
+  if (session && session.camera_id) {
+    dismissedCameras.add(session.camera_id);
+    saveDismissed();
+  }
   try {
     await fetch(apiPath(`/api/session/${id}`), { method: "DELETE" });
   } catch {
@@ -269,34 +307,102 @@ async function onStart() {
   }
 }
 
-async function startFromCabinet() {
-  try {
-    running.value = true;
-    setStatus("Loading cameras from the cabinet…");
-    const res = await fetch("/api/cameras"); // cabinet's own origin, not apiPath()
-    if (!res.ok) throw new Error(`Could not reach the cabinet (${res.status})`);
-    const data = await res.json();
-    const enabled = (data.cameras || []).filter((c) => c.enabled);
-    if (!enabled.length) throw new Error("No enabled cameras in the cabinet yet");
-    // Carries each camera's cloud id + zones through, so a confirmed
-    // exit-without-paying can be detected and attributed (see AddCameraModal
-    // / CameraRow for how zones get set); plain manual entry has none of this.
-    const cameras = enabled.map((c) => ({
+// How often the Live view re-reads the cabinet's camera list while running,
+// so a camera added / edited / disabled there shows up here on its own.
+const CABINET_SYNC_MS = 10000;
+let cabinetTimer = null;
+let lastCabinetSig = null;
+let syncing = false;
+
+async function fetchCabinetCameras() {
+  const res = await fetch("/api/cameras"); // cabinet's own origin, not apiPath()
+  if (!res.ok) throw new Error(`Could not reach the cabinet (${res.status})`);
+  const data = await res.json();
+  // Carries each camera's cloud id + zones through, so a confirmed
+  // exit-without-paying can be detected and attributed (see AddCameraModal
+  // / CameraRow for how zones get set); plain manual entry has none of this.
+  return (data.cameras || [])
+    .filter((c) => c.enabled && !dismissedCameras.has(c.id))
+    .map((c) => ({
       source: c.source,
       name: c.name,
       camera_id: c.id,
       zones: c.zones || [],
     }));
-    const started = await startCamerasReq(cameras, true);
-    onSessionsStarted(
-      started,
-      `Connected ${started.length} camera${started.length === 1 ? "" : "s"} from the cabinet`
-    );
+}
+
+// Make the running cameras match the cabinet. Only new / edited / removed
+// cameras are touched server-side; the others keep running (and keep their
+// person ids).
+async function syncFromCabinet({ quiet = false } = {}) {
+  if (syncing) return;
+  syncing = true;
+  try {
+    const cameras = await fetchCabinetCameras();
+    const sig = JSON.stringify(cameras);
+    if (quiet && sig === lastCabinetSig) return;
+    if (!cameras.length) {
+      lastCabinetSig = sig;
+      if (running.value) await stopAll(true);
+      setStatus("No enabled cameras in the cabinet yet", true);
+      return;
+    }
+    const res = await fetch(apiPath("/api/session/cameras/sync"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cameras, process_every: Number(everyN.value) }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `Camera connect failed (${res.status})`);
+    }
+    lastCabinetSig = sig;
+    const data = await res.json();
+    const synced = data.sessions || [];
+    if (!running.value) {
+      running.value = true;
+      onSessionsStarted(
+        synced,
+        `Connected ${synced.length} camera${synced.length === 1 ? "" : "s"} from the cabinet`
+      );
+    } else {
+      sessions.value = synced;
+      if (data.added || data.removed) {
+        const parts = [];
+        if (data.added) parts.push(`${data.added} added`);
+        if (data.removed) parts.push(`${data.removed} removed`);
+        setStatus(`Cameras updated from the cabinet: ${parts.join(", ")}`);
+      }
+    }
   } catch (err) {
-    running.value = false;
-    clearTiles();
-    setStatus(err.message || String(err), true);
+    if (!quiet) setStatus(err.message || String(err), true);
+  } finally {
+    syncing = false;
   }
+}
+
+function startCabinetSync() {
+  stopCabinetSync();
+  cabinetTimer = setInterval(() => {
+    if (running.value) syncFromCabinet({ quiet: true });
+  }, CABINET_SYNC_MS);
+}
+
+function stopCabinetSync() {
+  if (cabinetTimer) {
+    clearInterval(cabinetTimer);
+    cabinetTimer = null;
+  }
+}
+
+async function startFromCabinet() {
+  // "Reconnect": bring back cameras closed with ✕ and re-read the cabinet.
+  dismissedCameras.clear();
+  saveDismissed();
+  lastCabinetSig = null;
+  if (!running.value) setStatus("Loading cameras from the cabinet…");
+  await syncFromCabinet();
+  if (running.value) startCabinetSync();
 }
 
 async function stopAll(callServer = true) {
@@ -309,6 +415,7 @@ async function stopAll(callServer = true) {
   }
   closeWs();
   stopStatsPoll();
+  stopCabinetSync();
   clearTiles();
   running.value = false;
   setStatus("Stopped");
@@ -333,15 +440,21 @@ async function reattachRunningSessions() {
 }
 
 onMounted(async () => {
+  window.addEventListener("keydown", onKeydown);
   await reattachRunningSessions();
-  if (isProxied && !running.value) {
-    startFromCabinet();
+  if (isProxied) {
+    // Also when sessions were already running: cameras added in the
+    // cabinet since then get connected now instead of being ignored.
+    await syncFromCabinet({ quiet: running.value });
+    if (running.value) startCabinetSync();
   }
 });
 
 onUnmounted(() => {
+  window.removeEventListener("keydown", onKeydown);
   closeWs();
   stopStatsPoll();
+  stopCabinetSync();
 });
 </script>
 
@@ -371,6 +484,15 @@ onUnmounted(() => {
             @close="removeTile(s.id)"
           />
         </div>
+        <button
+          v-if="isExpanded && sessions.length > 1"
+          type="button"
+          class="back-btn"
+          title="Back to all cameras (Esc)"
+          @click="collapse"
+        >
+          ← All cameras
+        </button>
         <div class="placeholder" :hidden="sessions.length > 0">
           <p v-if="isProxied">Loading cameras from the cabinet…</p>
           <p v-else>Add up to {{ MAX_CAMERAS }} camera URLs to start.</p>
@@ -427,8 +549,13 @@ onUnmounted(() => {
       <div class="cameras" v-else>
         <div class="cameras-head">
           <span class="picker-label">Cameras from the cabinet</span>
-          <button type="button" class="btn ghost" :disabled="running" @click="startFromCabinet">
-            Reconnect
+          <button
+            type="button"
+            class="btn ghost"
+            title="Re-read the cabinet's cameras (also brings back cameras closed with ✕)"
+            @click="startFromCabinet"
+          >
+            {{ running ? "Refresh cameras" : "Reconnect" }}
           </button>
         </div>
       </div>

@@ -139,6 +139,7 @@ function Invoke-DockerUp {
     Test-LastExit "docker compose up"
     Write-Host "-> cloud: http://${BindHost}:${CloudPort}   dashboard: http://${BindHost}:${Port}"
     Write-Host "GPU not showing up? docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi"
+    Write-Host "Detection on cpu? docker compose exec dashboard storeguard gpu-check"
 }
 
 function Invoke-DockerDown {
