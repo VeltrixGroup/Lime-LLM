@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -16,6 +17,31 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 import cv2
 import numpy as np
+
+
+def _open_ffmpeg(source: str) -> cv2.VideoCapture:
+    """Open a network source via FFmpeg, with hardware decoding if available.
+
+    A 4MP Hikvision main stream costs a whole CPU core per camera to decode in
+    software; ``VIDEO_ACCELERATION_ANY`` lets OpenCV use D3D11 / VAAPI / etc.
+    when the build supports it and silently falls back to software otherwise.
+    """
+    params: list[int] = []
+    if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
+        params = [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY]
+    try:
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, params) if params else None
+    except (cv2.error, TypeError):
+        cap = None
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except cv2.error:
+        pass
+    return cap
 
 
 class VideoStream:
@@ -54,7 +80,7 @@ class VideoStream:
     def _open(self) -> None:
         """(Re)open the underlying capture."""
         if self._is_rtsp:
-            self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            self._cap = _open_ffmpeg(self.source)
         else:
             self._cap = cv2.VideoCapture(self.source)
         if not self._cap.isOpened():
@@ -97,3 +123,65 @@ class VideoStream:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
+
+class LatestFrameReader:
+    """Read a live source on its own thread, keeping only the newest frame.
+
+    Reading a camera synchronously from the detection loop means every frame
+    the camera sends has to be decoded *and* wait its turn behind detection:
+    once detection is slower than the camera, frames queue up in FFmpeg's
+    buffer and the picture lags further and further behind reality (and the
+    HUD fps collapses). This drains the stream as fast as it arrives and
+    hands the consumer only the latest frame, so detection always runs on
+    "now" and simply skips whatever it had no time for.
+    """
+
+    def __init__(self, stream: VideoStream) -> None:
+        """Start draining ``stream`` (a network :class:`VideoStream`); owns it from now on."""
+        self._stream = stream
+        self._cond = threading.Condition()
+        self._frame: np.ndarray | None = None
+        self._seq = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"grab-{id(self):x}", daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def fps(self) -> float:
+        return self._stream.fps
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                frame = self._stream.read()
+                if frame is None:
+                    # Down / reconnecting — VideoStream handles the backoff.
+                    self._stop.wait(0.05)
+                    continue
+                with self._cond:
+                    self._frame = frame
+                    self._seq += 1
+                    self._cond.notify_all()
+        finally:
+            # Released here, on the thread that reads it: a read blocked on a
+            # dead camera can outlive release()'s join timeout, and freeing
+            # the capture underneath it would crash FFmpeg.
+            self._stream.release()
+
+    def read_latest(self, after_seq: int, timeout: float = 0.5) -> tuple[np.ndarray, int] | None:
+        """Newest frame with sequence number > ``after_seq`` (or ``None`` on timeout)."""
+        with self._cond:
+            if self._seq <= after_seq:
+                self._cond.wait(timeout=timeout)
+            if self._frame is None or self._seq <= after_seq:
+                return None
+            return self._frame, self._seq
+
+    def release(self) -> None:
+        self._stop.set()
+        with self._cond:
+            self._cond.notify_all()
+        self._thread.join(timeout=5.0)

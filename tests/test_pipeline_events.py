@@ -46,6 +46,10 @@ class _ScriptedStream:
     def read(self):
         if self._remaining <= 0:
             return None  # "stream down" — DetectionSession waits, doesn't end
+        # Paced like a real camera: live sources are drained on a reader
+        # thread that keeps only the newest frame, so an instant burst would
+        # (correctly) be collapsed into its last frame.
+        time.sleep(0.05)
         self._remaining -= 1
         return np.zeros((100, 100, 3), dtype=np.uint8)
 

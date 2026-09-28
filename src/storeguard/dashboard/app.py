@@ -19,10 +19,11 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.websockets import WebSocketDisconnect
 
 from storeguard.cloud.agent_client import CloudClient
-from storeguard.config import DetectorCfg
+from storeguard.config import DetectorCfg, ReidCfg
 from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
+from storeguard.reid import IdentityRegistry
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v"}
@@ -207,6 +208,7 @@ def create_app(
     checkout_dwell_sec: float = 2.0,
     agent_server: str | None = None,
     agent_key: str | None = None,
+    reid: ReidCfg | None = None,
 ) -> FastAPI:
     """Build the dashboard FastAPI application.
 
@@ -222,8 +224,13 @@ def create_app(
             (enables Telegram / Lime CRM notifications). Optional — clips are
             always saved locally regardless.
         agent_key: Agent token for ``agent_server``.
+        reid: Cross-camera re-identification settings. When enabled (the
+            default) every batch of connected cameras shares one
+            :class:`IdentityRegistry`, so a person keeps the same id on
+            every camera.
     """
     cfg = detector or DetectorCfg()
+    reid_cfg = reid or ReidCfg()
     own_upload_dir = upload_dir is None
     root = (
         Path(upload_dir)
@@ -260,6 +267,7 @@ def create_app(
     app.state.data_dir = videos_root
     app.state.zones = zone_list
     app.state.checkout_dwell_sec = checkout_dwell_sec
+    app.state.reid = reid_cfg
     # All live sessions keyed by id, in creation order (up to MAX_CAMERAS).
     app.state.sessions: dict[str, DetectionSession] = {}
     app.state.session_lock = threading.Lock()
@@ -291,6 +299,7 @@ def create_app(
         kind: str,
         zones: list[Zone] | None = None,
         camera_id: str | None = None,
+        identities: IdentityRegistry | None = None,
     ) -> DetectionSession:
         return DetectionSession(
             session_id=session_id,
@@ -304,7 +313,16 @@ def create_app(
             kind=kind,
             alert_queue=app.state.alert_queue,
             camera_id=camera_id,
+            identities=identities,
         )
+
+    def _new_identities() -> IdentityRegistry | None:
+        """A fresh id registry for one batch of sessions (ids restart at 1).
+
+        Every session of the batch gets the *same* instance — that's what
+        makes person ids global across cameras.
+        """
+        return IdentityRegistry(app.state.reid) if app.state.reid.enabled else None
 
     def _stop_sessions(sessions: list[DetectionSession]) -> None:
         """Stop many sessions in parallel: signal all, then join each."""
@@ -378,6 +396,7 @@ def create_app(
             process_every=body.process_every,
             loop=body.loop,
             kind="local",
+            identities=_new_identities(),
         )
         _replace_sessions([session])
         return JSONResponse(
@@ -421,6 +440,7 @@ def create_app(
                 status_code=400,
                 detail=f"at most {MAX_CAMERAS} cameras are supported",
             )
+        identities = _new_identities()
         sessions = [
             _make_session(
                 session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
@@ -431,6 +451,7 @@ def create_app(
                 kind="camera",
                 zones=[Zone(z.name, z.points) for z in entry.zones] or None,
                 camera_id=entry.camera_id,
+                identities=identities,
             )
             for entry in cleaned
         ]
@@ -469,6 +490,7 @@ def create_app(
             )
         total = len(cams)
         cams = cams[:MAX_CAMERAS]
+        identities = _new_identities()
         sessions = [
             _make_session(
                 session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
@@ -479,6 +501,7 @@ def create_app(
                 kind="camera",
                 zones=_zones_from_cloud(c.get("zones", [])),
                 camera_id=c.get("id"),
+                identities=identities,
             )
             for c in cams
         ]
@@ -510,6 +533,7 @@ def create_app(
             process_every=body.process_every,
             loop=False,
             kind="camera",
+            identities=_new_identities(),
         )
         _replace_sessions([session])
         return JSONResponse(
@@ -560,6 +584,7 @@ def create_app(
             process_every=process_every,
             loop=loop,
             kind="upload",
+            identities=_new_identities(),
         )
         # create_session is async: run the (thread-joining) swap off the loop.
         await run_in_threadpool(_replace_sessions, [session])
@@ -712,6 +737,7 @@ def serve(
     checkout_dwell_sec: float = 2.0,
     agent_server: str | None = None,
     agent_key: str | None = None,
+    reid: ReidCfg | None = None,
 ) -> None:
     """Run the dashboard with uvicorn (blocking)."""
     import uvicorn
@@ -723,5 +749,6 @@ def serve(
         checkout_dwell_sec=checkout_dwell_sec,
         agent_server=agent_server,
         agent_key=agent_key,
+        reid=reid,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")
