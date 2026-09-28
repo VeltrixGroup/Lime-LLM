@@ -44,7 +44,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
     """Handler for ``storeguard dashboard``."""
     import os
 
-    from .config import DetectorCfg, ReidCfg, ZoneCfg, load_config
+    from .config import ActionCfg, DetectorCfg, ReidCfg, ZoneCfg, load_config
     from .geometry import zones_from_cfg
 
     agent_server = args.agent_server or os.environ.get("STOREGUARD_AGENT_SERVER", "")
@@ -52,11 +52,13 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
 
     detector = DetectorCfg(device=args.device)
     reid = ReidCfg()
+    action = ActionCfg()
     zones = []
     if args.config:
         cfg = load_config(args.config)
         detector = cfg.detector
         reid = cfg.reid
+        action = cfg.action
         if args.device != "auto":
             detector = detector.model_copy(update={"device": args.device})
         # Prefer the first camera that has zones (paid / not-paid needs checkout).
@@ -104,6 +106,17 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
             "STOREGUARD_AGENT_KEY (create a key in the cabinet's Devices "
             "page).[/yellow]"
         )
+    if Path(action.weights).is_file():
+        console.print(
+            f"[dim]Action model: {action.weights} — 'pocket' on cameras with shelf* "
+            "zones (or no zones), 'take_cash' on cameras with register* zones.[/dim]"
+        )
+    else:
+        console.print(
+            f"[yellow]No action model at '{action.weights}' — only exit-without-"
+            "paying is detected; 'pocket' / 'take_cash' need a trained model "
+            "(storeguard train).[/yellow]"
+        )
     from .dashboard.app import serve
 
     serve(
@@ -115,6 +128,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
         agent_server=agent_server or None,
         agent_key=agent_key or None,
         reid=reid,
+        action=action,
     )
 
 

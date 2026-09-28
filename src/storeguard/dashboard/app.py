@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.websockets import WebSocketDisconnect
 
 from storeguard.cloud.agent_client import CloudClient
-from storeguard.config import DetectorCfg, ReidCfg
+from storeguard.config import ActionCfg, DetectorCfg, ReidCfg
 from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
@@ -228,6 +228,7 @@ def create_app(
     agent_server: str | None = None,
     agent_key: str | None = None,
     reid: ReidCfg | None = None,
+    action: ActionCfg | None = None,
 ) -> FastAPI:
     """Build the dashboard FastAPI application.
 
@@ -247,6 +248,10 @@ def create_app(
             default) every batch of connected cameras shares one
             :class:`IdentityRegistry`, so a person keeps the same id on
             every camera.
+        action: Trained action classifier settings. When its weights file
+            (``models/action.pt`` by default) exists, cameras also detect
+            ``pocket`` / ``take_cash`` (see
+            :func:`~storeguard.dashboard.pipeline.build_action_scenarios`).
     """
     cfg = detector or DetectorCfg()
     reid_cfg = reid or ReidCfg()
@@ -287,6 +292,7 @@ def create_app(
     app.state.zones = zone_list
     app.state.checkout_dwell_sec = checkout_dwell_sec
     app.state.reid = reid_cfg
+    app.state.action = action or ActionCfg()
     # Person-id registry shared by the current batch of camera sessions
     # (replaced on a full reconnect, reused when /sync adds cameras).
     app.state.identities: IdentityRegistry | None = None
@@ -336,6 +342,7 @@ def create_app(
             alert_queue=app.state.alert_queue,
             camera_id=camera_id,
             identities=identities,
+            action=app.state.action,
         )
 
     def _clean_entries(body: "CamerasSessionRequest | CamerasSyncRequest") -> list[CameraEntry]:
@@ -822,6 +829,7 @@ def serve(
     agent_server: str | None = None,
     agent_key: str | None = None,
     reid: ReidCfg | None = None,
+    action: ActionCfg | None = None,
 ) -> None:
     """Run the dashboard with uvicorn (blocking)."""
     import uvicorn
@@ -834,5 +842,6 @@ def serve(
         agent_server=agent_server,
         agent_key=agent_key,
         reid=reid,
+        action=action,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")

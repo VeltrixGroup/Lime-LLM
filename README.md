@@ -38,6 +38,13 @@ every camera) and the cabinet's `cloud_event_id` when the push succeeded.
 Repeat alerts are suppressed for 10 s per person, not per camera, so two
 different people are never merged into one alert.
 
+The live dashboard also runs `pocket` and `take_cash` as soon as a trained
+`models/action.pt` exists (in Docker: put it in `./models/`). Cabinet cameras
+carry zones but no scenario list, so the zones decide: `pocket` on cameras
+with a `shelf*` zone (or no zones at all), `take_cash` only on cameras with a
+`register*` zone. The dashboard log says at startup whether the model was
+found.
+
 ## How the whole workflow looks
 
 Because the developer works from another country and only has the
