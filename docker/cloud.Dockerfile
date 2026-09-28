@@ -7,9 +7,16 @@
 # Run:    docker compose up cloud   (see docker-compose.yml)
 FROM python:3.13-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# APT_MIRROR: swap deb.debian.org for a closer / reachable mirror when the
+# default one times out (see the edge Dockerfile for details).
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+ && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 update \
+ && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
     libgl1 libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
 

@@ -24,9 +24,18 @@
 # Run:    docker compose up dashboard   (needs GPU passthrough)
 FROM python:3.13-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Debian packages: retry flaky downloads instead of failing the whole build
+# on one dropped connection. If deb.debian.org is unreachable from your
+# network altogether, point APT_MIRROR at another Debian mirror, e.g.
+#   $env:APT_MIRROR="https://mirror.yandex.ru"; docker compose build
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+ && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 update \
+ && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
     libgl1 libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir uv
 

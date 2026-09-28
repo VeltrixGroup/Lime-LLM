@@ -28,6 +28,10 @@ services:
     build:
       context: .
       dockerfile: docker/cloud.Dockerfile
+      args:
+        # Optional Debian mirror if deb.debian.org times out during build,
+        # e.g.  $env:APT_MIRROR="https://mirror.yandex.ru"
+        APT_MIRROR: ${APT_MIRROR:-}
     ports:
       - "8000:8000"
     environment:
@@ -48,6 +52,7 @@ services:
       dockerfile: docker/edge.Dockerfile
       args:
         TORCH_CUDA: ${TORCH_CUDA:-cu128}
+        APT_MIRROR: ${APT_MIRROR:-}
     ports:
       - "8765:8765"
     environment:
@@ -84,6 +89,7 @@ services:
       dockerfile: docker/edge.Dockerfile
       args:
         TORCH_CUDA: ${TORCH_CUDA:-cu128}
+        APT_MIRROR: ${APT_MIRROR:-}
     profiles: ["agent"]
     # Compose interpolates every service's environment block up front, even
     # ones gated behind a profile that isn't active - a required (":?") var
