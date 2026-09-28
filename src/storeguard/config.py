@@ -20,13 +20,58 @@ class ZoneCfg(BaseModel):
     points: list[tuple[float, float]] = Field(min_length=3)
 
 
+#: Model / input size picked by ``model: auto`` / ``imgsz: 0``. Overhead
+#: store cameras are wide-angle, so shoppers far from the lens are only a few
+#: dozen pixels tall — the nano model at 640px misses most of them. A GPU has
+#: headroom for a bigger model at a higher input resolution; a CPU doesn't.
+_AUTO_MODEL = {"cuda": "yolo11m.pt", "mps": "yolo11s.pt", "cpu": "yolo11s.pt"}
+_AUTO_IMGSZ = {"cuda": 1280, "mps": 960, "cpu": 800}
+
+
 class DetectorCfg(BaseModel):
     """Settings for the YOLO11 person detector + ByteTrack tracker."""
 
-    model: str = "yolo11n.pt"
-    conf: float = 0.35
-    imgsz: int = 640
+    model: str = "auto"  # "auto" or a weights path, e.g. "yolo11m.pt"
+    # Score needed to keep a person track matched. Lower-score detections
+    # still reach ByteTrack's second pass (see detector._TRACK_LOW_THRESH).
+    conf: float = 0.25
+    imgsz: int = 0  # 0 = auto (by device)
     device: str = "auto"  # "auto" | "cpu" | "cuda" | "mps"
+
+    def resolved(self) -> "DetectorCfg":
+        """Return a copy with ``auto`` device / model / imgsz made concrete."""
+        device = pick_device(self.device)
+        kind = device.split(":", 1)[0]
+        return self.model_copy(
+            update={
+                "device": device,
+                "model": _AUTO_MODEL.get(kind, "yolo11s.pt")
+                if self.model == "auto"
+                else self.model,
+                "imgsz": _AUTO_IMGSZ.get(kind, 800) if self.imgsz <= 0 else self.imgsz,
+            }
+        )
+
+
+class ReidCfg(BaseModel):
+    """Cross-camera person re-identification (one global id per person).
+
+    Every tracked person gets an appearance embedding; a registry shared by
+    all cameras matches it against people seen recently, so someone who was
+    ``id 1`` on the hall camera is still ``id 1`` on the checkout camera.
+    """
+
+    enabled: bool = True
+    # "auto" = ImageNet ResNet (resnet50 on GPU, resnet18 on CPU), or a path
+    # to a TorchScript person-ReID model (e.g. an exported OSNet) that takes
+    # a (N, 3, 256, 128) ImageNet-normalized batch and returns (N, D).
+    model: str = "auto"
+    # Combined appearance similarity (0..1) needed to reuse an existing id.
+    # Raise it if different people get merged, lower it if the same person
+    # keeps getting new ids across cameras.
+    threshold: float = 0.6
+    # Forget a person that no camera has seen for this long.
+    ttl_sec: float = 1800.0
 
 
 class ActionCfg(BaseModel):
@@ -81,6 +126,7 @@ class AppCfg(BaseModel):
 
     cameras: list[CameraCfg]
     detector: DetectorCfg = DetectorCfg()
+    reid: ReidCfg = ReidCfg()
     action: ActionCfg = ActionCfg()
     telegram: TelegramCfg = TelegramCfg()
     notify: NotifyCfg = NotifyCfg()
@@ -124,12 +170,25 @@ def pick_device(pref: str = "auto") -> str:
     """Resolve a device preference to a concrete torch device string.
 
     ``"auto"`` picks ``"cuda"`` if available, else ``"mps"`` if available,
-    else ``"cpu"``.  Any explicit preference is returned unchanged.  torch is
+    else ``"cpu"``.  An explicit preference is returned unchanged, except
+    ``cuda`` on a torch build without CUDA, which falls back to ``"cpu"``.  torch is
     imported lazily so importing this module never pulls it in.
     """
-    if pref != "auto":
-        return pref
     import torch  # lazy: keep config import light
+
+    if pref != "auto":
+        if pref.startswith("cuda") and not torch.cuda.is_available():
+            # Asking for cuda on a CPU-only torch build used to crash the
+            # camera thread with an opaque error — fall back and say why.
+            from rich.console import Console
+
+            Console().print(
+                "[red]device=cuda requested, but this torch build has no CUDA "
+                f"support (torch {torch.__version__}). Falling back to cpu. "
+                "Run `uv sync` again to install the CUDA build of torch.[/red]"
+            )
+            return "cpu"
+        return pref
 
     if torch.cuda.is_available():
         return "cuda"

@@ -39,7 +39,8 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 # Pre-download the YOLO weights at build time so a fresh container never
 # needs outbound network access just to start detecting.
-RUN python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
+RUN python -c "from ultralytics import YOLO; [YOLO(m) for m in ('yolo11n.pt', 'yolo11s.pt', 'yolo11m.pt')]" \
+ && python -c "import torchvision as tv; tv.models.resnet18(weights='DEFAULT'); tv.models.resnet50(weights='DEFAULT')"
 
 EXPOSE 8765
 

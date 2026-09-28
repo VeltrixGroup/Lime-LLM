@@ -1,8 +1,15 @@
 detector:
-  model: yolo11n.pt
-  conf: 0.35
-  imgsz: 640
+  model: auto        # auto = yolo11m.pt on GPU, yolo11s.pt on CPU (or a weights path)
+  conf: 0.25
+  imgsz: 0           # 0 = auto: 1280 on GPU, 800 on CPU
   device: auto
+# One person id across all cameras (person seen as id 1 on one camera stays
+# id 1 on the others).
+reid:
+  enabled: true
+  model: auto        # auto = ImageNet ResNet, or a TorchScript person-ReID model path
+  threshold: 0.6     # raise if different people share an id, lower if one person gets several
+  ttl_sec: 1800
 action:
   weights: models/action.pt
   clip_len: 16

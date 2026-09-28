@@ -11,12 +11,13 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from storeguard.config import DetectorCfg
+from storeguard.config import DetectorCfg, ReidCfg
 from storeguard.dashboard.payment import PaymentStatusTracker
 from storeguard.detector import PersonTracker
 from storeguard.geometry import Zone
+from storeguard.reid import IdentityRegistry, assign_global_ids, get_encoder
 from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
-from storeguard.stream import VideoStream
+from storeguard.stream import LatestFrameReader, VideoStream
 from storeguard.types import Event, Track
 
 # BGR colors
@@ -86,13 +87,29 @@ _CLIP_SECONDS = 15.0
 _RING_MAX_FRAMES = 450
 
 
+def scale_tracks(tracks: list[Track], scale: float) -> list[Track]:
+    """Tracks with boxes scaled by ``scale`` (for drawing on a resized frame)."""
+    if scale == 1.0:
+        return tracks
+    return [
+        Track(track_id=t.track_id, box=tuple(v * scale for v in t.box), conf=t.conf)
+        for t in tracks
+    ]
+
+
 def draw_person_overlays(
     frame: np.ndarray,
     tracks: list[Track],
     statuses: dict[int, str] | None = None,
     zones: list[Zone] | None = None,
 ) -> np.ndarray:
-    """Draw boxes, track ids and paid / not-paid labels (and optional zones)."""
+    """Draw boxes, track ids and paid / not-paid labels (and optional zones).
+
+    Pass the frame at display size (see :func:`_resize_for_preview` and
+    :func:`scale_tracks`): line widths and font sizes are fixed in pixels, so
+    drawing on a 4MP frame and shrinking it afterwards made every label an
+    unreadable smudge.
+    """
     out = frame.copy()
     h, w = out.shape[:2]
     statuses = statuses or {}
@@ -120,7 +137,7 @@ def draw_person_overlays(
         label = f"id {tr.track_id}  {status}"
         text_y = max(18, y1 - 8)
         # Dark bar behind text for readability
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(
             out,
             (x1, text_y - th - 4),
@@ -133,9 +150,10 @@ def draw_person_overlays(
             label,
             (x1 + 3, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.5,
             color,
-            2,
+            1,
+            cv2.LINE_AA,
         )
 
     n = len(tracks)
@@ -149,6 +167,7 @@ def draw_person_overlays(
         0.7,
         (180, 255, 120),
         2,
+        cv2.LINE_AA,
     )
     return out
 
@@ -199,6 +218,7 @@ class DetectionSession:
         kind: str = "",
         alert_queue: "queue.Queue | None" = None,
         camera_id: str | None = None,
+        identities: IdentityRegistry | None = None,
     ) -> None:
         self.id = session_id
         self.source = source
@@ -214,6 +234,10 @@ class DetectionSession:
         #: Cloud camera id (if this session was started from the cabinet), so
         #: a raised event can be attributed to the right camera in the cloud.
         self.camera_id = camera_id
+        #: Shared by every session of the dashboard: maps this camera's local
+        #: ByteTrack ids to store-wide person ids (None = local ids only).
+        self._identities = identities
+        self._encoder = None
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -286,6 +310,8 @@ class DetectionSession:
         if thread is not None:
             thread.join(timeout=5.0)
             self._thread = None
+        if self._identities is not None:
+            self._identities.forget_camera(self.id)
         with self._lock:
             self._stats.running = False
 
@@ -361,12 +387,22 @@ class DetectionSession:
                 except queue.Full:
                     pass
 
+    def _reset_state(self) -> None:
+        assert self._tracker is not None
+        self._tracker.reset()
+        self._payment.reset()
+        self._exit_scenario.reset()
+        if self._identities is not None:
+            self._identities.forget_camera(self.id)
+
     def _run(self) -> None:
         try:
             self._tracker = _build_tracker(self.detector_cfg)
-            self._tracker.reset()
-            self._payment.reset()
-            self._exit_scenario.reset()
+            if self._identities is not None:
+                self._encoder = get_encoder(
+                    self._identities.cfg, getattr(self._tracker, "device", "cpu")
+                )
+            self._reset_state()
             with self._lock:
                 self._stats.running = True
                 self._stats.error = None
@@ -376,9 +412,7 @@ class DetectionSession:
                     break
                 if not self.loop:
                     break
-                self._tracker.reset()
-                self._payment.reset()
-                self._exit_scenario.reset()
+                self._reset_state()
 
         except Exception as exc:  # noqa: BLE001 — surface to UI, keep server up
             with self._lock:
@@ -394,6 +428,10 @@ class DetectionSession:
         is_file = stream.is_file and not self._is_url
         src_fps = stream.fps
         frame_delay = 1.0 / src_fps if is_file else 0.0
+        # Live cameras are drained on their own thread so detection always
+        # runs on the newest frame instead of falling ever further behind.
+        reader = None if is_file else LatestFrameReader(stream)
+        last_seq = 0
 
         # Probe openness: try one read for live; for files VideoStream opens immediately.
         # If the path is bad, first reads return None forever for files.
@@ -415,7 +453,13 @@ class DetectionSession:
         try:
             while not self._stop.is_set():
                 t0 = time.monotonic()
-                frame = stream.read()
+                if reader is None:
+                    frame = stream.read()
+                else:
+                    latest = reader.read_latest(last_seq, timeout=0.1)
+                    frame = None
+                    if latest is not None:
+                        frame, last_seq = latest
                 if frame is None:
                     if is_file:
                         # EOF
@@ -431,7 +475,7 @@ class DetectionSession:
                         with self._lock:
                             self._stats.error = f"no video from {self.filename}"
                         connect_error_set = True
-                    if self._stop.wait(timeout=0.1):
+                    if self._stop.wait(timeout=0.01):
                         break
                     continue
 
@@ -451,6 +495,10 @@ class DetectionSession:
                 if (frame_idx - 1) % every == 0:
                     assert self._tracker is not None
                     tracks = self._tracker.update(frame)
+                    if self._identities is not None:
+                        tracks = assign_global_ids(
+                            self._identities, self._encoder, self.id, frame, tracks, ts
+                        )
                     statuses = self._payment.update(frame, tracks, ts)
                     new_events = self._exit_scenario.update(frame, tracks, ts)
                     self._append_ring(ts, frame)
@@ -466,10 +514,13 @@ class DetectionSession:
                         with self._lock:
                             self._stats.fps = round(inst_fps, 1)
 
-                annotated = draw_person_overlays(
-                    frame, tracks, statuses=statuses, zones=self._zones or None
+                small = _resize_for_preview(frame)
+                preview = draw_person_overlays(
+                    small,
+                    scale_tracks(tracks, small.shape[1] / frame.shape[1]),
+                    statuses=statuses,
+                    zones=self._zones or None,
                 )
-                preview = _resize_for_preview(annotated)
                 ok_enc, buf = cv2.imencode(
                     ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
                 )
@@ -500,7 +551,10 @@ class DetectionSession:
                     if sleep_for > 0 and self._stop.wait(timeout=sleep_for):
                         break
         finally:
-            stream.release()
+            if reader is not None:
+                reader.release()
+            else:
+                stream.release()
 
         if not got_any:
             with self._lock:

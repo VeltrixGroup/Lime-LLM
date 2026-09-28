@@ -45,6 +45,20 @@ dev = [
     "pytest>=8.0",
 ]
 
+# CUDA build of torch on Windows. PyPI only ships CPU-only torch wheels for
+# Windows, so a plain `uv sync` there left the GPU idle and detection on the
+# CPU ("Detector device: cpu" in the log). Linux keeps PyPI's torch, which
+# already bundles CUDA. cu128 needs an NVIDIA driver >= 570; for an older
+# driver / GPU, switch the url to .../whl/cu126 and run `uv sync` again.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

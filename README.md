@@ -8,7 +8,7 @@ theft-related actions.
 
 | # | Detection | How it works | Needs training? |
 |---|-----------|--------------|-----------------|
-| 1 | **People** — every person in the frame is detected and gets a track id | YOLO11 + ByteTrack | No |
+| 1 | **People** — every person in the frame is detected and gets an id that is the same on every camera (cross-camera re-identification) | YOLO11 + ByteTrack + appearance ReID | No |
 | 2 | **`pocket`** — a shopper takes a product from the shelf and hides it in a pocket / clothes / bag | Action classifier (3D CNN) on person crops | **Yes** |
 | 3 | **`exit_no_pay`** — a person spends time at the shelves and then goes to the exit **without** passing the checkout | Pure zone logic (shelf / checkout / exit polygons) | No |
 | 4 | **`take_cash`** — an employee takes money out of the register drawer and carries it away | Action classifier (3D CNN) on person crops | **Yes** |
@@ -185,25 +185,12 @@ The store PC is on the same LAN/WiFi as the cameras, so RTSP works there.
    cd C:\storeguard
    uv sync
    ```
-4. **If the PC has an NVIDIA GPU** — important: on Windows a plain
-   `uv sync` installs the **CPU-only** torch build, so CUDA would never be
-   used and `device: auto` would silently fall back to `cpu`. To get the
-   CUDA build, add this to the end of `pyproject.toml` on the store PC
-   (`cu126` suits most current NVIDIA drivers; see
-   <https://pytorch.org/get-started/locally/> for other CUDA versions):
-
-   ```toml
-   [[tool.uv.index]]
-   name = "pytorch-cuda"
-   url = "https://download.pytorch.org/whl/cu126"
-   explicit = true
-
-   [tool.uv.sources]
-   torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
-   torchvision = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
-   ```
-
-   then run `uv sync` again and verify CUDA is actually picked up:
+4. **If the PC has an NVIDIA GPU** — nothing extra to do: PyPI only ships
+   CPU-only torch for Windows, so `pyproject.toml` already points torch /
+   torchvision on Windows at PyTorch's CUDA index (`cu128`, needs an NVIDIA
+   driver >= 570 — for an older driver change the index url to `.../cu126`
+   and run `uv sync` again). If you installed the project before this was
+   added, just run `uv sync` once more. Verify CUDA is actually picked up:
 
    ```powershell
    uv run python -c "import torch; print(torch.cuda.is_available())"
@@ -218,9 +205,12 @@ project to e.g. `/opt/storeguard`, then `uv sync`. For an NVIDIA GPU on
 Linux no extra step is needed — the default torch wheels already bundle
 CUDA.
 
-> Note: on the first `run`, ultralytics downloads `yolo11n.pt`
-> automatically (needs internet once). If the store PC is offline, copy your
-> local `yolo11n.pt` into the project folder too.
+> Note: on the first `run`, ultralytics downloads the detector weights
+> automatically (needs internet once): with `model: auto` that is
+> `yolo11m.pt` on a GPU, `yolo11s.pt` on a CPU. Cross-camera person ids
+> (`reid:`) download ImageNet ResNet weights on first use too. If the store
+> PC is offline, copy the `.pt` files into the project folder (and
+> `~/.cache/torch`) too.
 
 ### 4.2 Camera RTSP URLs
 
@@ -264,10 +254,13 @@ Create `configs/storeguard.yaml` (a full realistic example — also see
 
 ```yaml
 detector:
-  model: yolo11n.pt
-  conf: 0.35
-  imgsz: 640
+  model: auto           # auto -> yolo11m.pt on GPU, yolo11s.pt on CPU
+  conf: 0.25
+  imgsz: 0              # 0 = auto -> 1280 on GPU, 800 on CPU
   device: auto          # auto -> cuda if available, else mps, else cpu
+reid:                   # same person id on every camera
+  enabled: true
+  threshold: 0.6        # raise if different people share an id
 action:
   weights: models/action.pt
   clip_len: 16
@@ -431,14 +424,12 @@ return 2xx. Failures are logged and never stop the camera pipeline.
 
 ## Hardware guidance
 
-- **1–2 cameras**: a modern desktop CPU is enough. Use `yolo11n.pt` and
+- **1–2 cameras**: a modern desktop CPU is enough. Use `model: yolo11n.pt` and
   `process_every: 2` or `3` in the config (process every 2nd–3rd frame).
   Using the camera substream (`…/Channels/102`) also reduces load.
 - **4+ cameras**, or if you need faster reaction: use an NVIDIA GPU
   (e.g. **RTX 3050 or better**) and keep `device: auto`. On **Windows**
-  you must also install the CUDA torch build (see step 4.1 — a plain
-  `uv sync` installs CPU-only torch there and the GPU is silently ignored);
-  verify with
+  `uv sync` installs the CUDA torch build (see step 4.1); verify with
   `uv run python -c "import torch; print(torch.cuda.is_available())"`.
 - RAM: 8 GB minimum, 16 GB comfortable.
 
@@ -514,8 +505,8 @@ uv run storeguard dashboard
    chat_id через `getUpdates`, вписать в конфиг, `enabled: true`.
 6. **Железо:** 1–2 камеры — достаточно обычного CPU (`process_every: 2-3`,
    модель `yolo11n`); 4+ камер или быстрее реакция — нужна NVIDIA GPU
-   (например, RTX 3050+). На Windows обычный `uv sync` ставит CPU-версию
-   torch — для GPU нужно подключить CUDA-сборку (см. шаг 4.1).
+   (например, RTX 3050+). На Windows `uv sync` ставит CUDA-сборку
+   torch из индекса PyTorch (см. шаг 4.1).
 7. **Юридически:** повесить таблички о видеонаблюдении и письменно
    уведомить сотрудников — стандартная практика по закону о персональных
    данных.

@@ -7,15 +7,75 @@ must only be imported by code that actually runs detection — never from
 
 from __future__ import annotations
 
+import os
+import tempfile
+import threading
+from pathlib import Path
+
 import numpy as np
 from rich.console import Console
 from ultralytics import YOLO
 
-from .config import DetectorCfg, pick_device
+from .config import DetectorCfg
 from .types import Track
 
 _console = Console()
 _logged_devices: set[str] = set()
+
+#: Lowest detection score handed to ByteTrack. Its second association pass
+#: exists to keep tracks alive through low-score detections (a shopper half
+#: hidden by a shelf) — cutting those off at ``cfg.conf`` up front is what
+#: made boxes flicker and ids churn.
+_TRACK_LOW_THRESH = 0.1
+
+def _precision_kwargs(half: bool) -> dict:
+    """FP16 switch in whichever spelling this ultralytics version accepts.
+
+    ultralytics 8.4 replaced ``half=`` with ``quantize=`` and logs a
+    deprecation warning on *every* call that still passes ``half`` — once
+    per frame per camera.
+    """
+    try:
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+
+        if "quantize" in DEFAULT_CFG_DICT:
+            return {"quantize": 16} if half else {}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"half": half}
+
+
+_tracker_cfg_lock = threading.Lock()
+_tracker_cfgs: dict[float, str] = {}
+
+
+def _tracker_cfg(conf: float) -> str:
+    """Path to a ByteTrack YAML tuned for store cameras (cached per ``conf``).
+
+    ``conf`` becomes the score needed to match a track in the first pass;
+    starting a brand-new track needs a bit more, so shelf clutter that
+    flickers at the threshold doesn't spawn short-lived phantom people.
+    Lost tracks are kept for 60 processed frames (people disappear behind
+    shelves) so they come back under the same id.
+    """
+    with _tracker_cfg_lock:
+        path = _tracker_cfgs.get(conf)
+        if path is not None and Path(path).is_file():
+            return path
+        text = (
+            "tracker_type: bytetrack\n"
+            f"track_high_thresh: {conf}\n"
+            f"track_low_thresh: {min(_TRACK_LOW_THRESH, conf)}\n"
+            f"new_track_thresh: {min(conf + 0.1, 0.9)}\n"
+            "track_buffer: 60\n"
+            "match_thresh: 0.8\n"
+            "fuse_score: True\n"
+        )
+        fd, path = tempfile.mkstemp(prefix="storeguard-bytetrack-", suffix=".yaml")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        _tracker_cfgs[conf] = path
+        return path
 
 
 class PersonTracker:
@@ -31,15 +91,17 @@ class PersonTracker:
 
         Args:
             cfg: Detector settings (model weights path, confidence threshold,
-                inference image size and device preference).
+                inference image size and device preference). ``auto`` values
+                are resolved here, see :meth:`DetectorCfg.resolved`.
         """
-        self.cfg = cfg
-        self.device = pick_device(cfg.device)
+        self.cfg = cfg.resolved()
+        self.device = self.cfg.device
         # Half-precision only helps (and is only supported) on CUDA — leave
         # CPU/MPS at full precision.
         self.half = self.device.startswith("cuda")
+        self._precision = _precision_kwargs(self.half)
         self._log_device_once()
-        self.model = YOLO(cfg.model)
+        self.model = YOLO(self.cfg.model)
 
     def _log_device_once(self) -> None:
         """Print the resolved inference device once per process.
@@ -52,7 +114,11 @@ class PersonTracker:
         if self.device in _logged_devices:
             return
         _logged_devices.add(self.device)
-        if self.device == "cuda":
+        _console.print(
+            f"[cyan]Detector model: {self.cfg.model}, imgsz={self.cfg.imgsz}, "
+            f"conf={self.cfg.conf}[/cyan]"
+        )
+        if self.device.startswith("cuda"):
             try:
                 import torch
 
@@ -61,11 +127,28 @@ class PersonTracker:
                 name = "unknown GPU"
             _console.print(f"[green]Detector device: cuda ({name}), half precision on[/green]")
         elif self.device == "cpu":
+            try:
+                import torch
+
+                version, cuda_build = torch.__version__, torch.version.cuda
+            except Exception:
+                version, cuda_build = "?", None
+            if cuda_build:
+                hint = (
+                    f"torch {version} has CUDA {cuda_build}, but no usable NVIDIA "
+                    "GPU was found — check that `nvidia-smi` works and the driver "
+                    "is new enough for this CUDA version."
+                )
+            else:
+                hint = (
+                    f"torch {version} is a CPU-only build. On Windows run `uv sync` "
+                    "again: the project pulls the CUDA build of torch from "
+                    "download.pytorch.org."
+                )
             _console.print(
-                "[yellow]Detector device: cpu — detection will be much slower than "
-                "on a GPU. If this machine has an NVIDIA GPU, check that torch was "
-                "installed with CUDA support (`python -c \"import torch; "
-                'print(torch.cuda.is_available())"` should print True).[/yellow]'
+                "[yellow]Detector device: cpu — detection will be much slower "
+                f"than on a GPU. {hint} Verify with `uv run python -c \"import "
+                'torch; print(torch.cuda.is_available())"` (must print True).[/yellow]'
             )
         else:
             _console.print(f"[green]Detector device: {self.device}[/green]")
@@ -100,12 +183,12 @@ class PersonTracker:
             frame,
             persist=True,
             classes=[0],
-            conf=self.cfg.conf,
+            conf=min(_TRACK_LOW_THRESH, self.cfg.conf),
             imgsz=self.cfg.imgsz,
-            tracker="bytetrack.yaml",
+            tracker=_tracker_cfg(self.cfg.conf),
             device=self.device,
-            half=self.half,
             verbose=False,
+            **self._precision,
         )
         tracks: list[Track] = []
         if not results:
@@ -139,8 +222,8 @@ class PersonTracker:
             conf=self.cfg.conf,
             imgsz=self.cfg.imgsz,
             device=self.device,
-            half=self.half,
             verbose=False,
+            **self._precision,
         )
         boxes: list[tuple[float, float, float, float]] = []
         if not results:

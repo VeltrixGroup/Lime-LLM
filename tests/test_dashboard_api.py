@@ -31,6 +31,7 @@ class _FakeSession:
         kind="",
         alert_queue=None,
         camera_id=None,
+        identities=None,
     ) -> None:
         self.id = session_id
         self.source = source
@@ -41,6 +42,7 @@ class _FakeSession:
         self.zones = zones
         self.alert_queue = alert_queue
         self.camera_id = camera_id
+        self.identities = identities
         self.started = False
         self.stopped = False
 
@@ -81,6 +83,16 @@ def _session_ids(client: TestClient) -> list[str]:
     res = client.get("/api/sessions")
     assert res.status_code == 200
     return [s["id"] for s in res.json()["sessions"]]
+
+
+def test_cameras_in_one_batch_share_one_identity_registry(client: TestClient) -> None:
+    """Global person ids only work if every camera maps into the same registry."""
+    urls = [f"rtsp://cam{i}.local/stream" for i in range(3)]
+    assert client.post("/api/session/cameras", json={"urls": urls}).status_code == 200
+    sessions = list(client.app.state.sessions.values())
+    registries = {id(s.identities) for s in sessions}
+    assert len(registries) == 1
+    assert sessions[0].identities is not None
 
 
 def test_cameras_bulk_create_starts_all(client: TestClient) -> None:

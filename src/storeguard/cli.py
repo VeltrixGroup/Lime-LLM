@@ -43,17 +43,19 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
     """Handler for ``storeguard dashboard``."""
     import os
 
-    from .config import DetectorCfg, ZoneCfg, load_config
+    from .config import DetectorCfg, ReidCfg, ZoneCfg, load_config
     from .geometry import zones_from_cfg
 
     agent_server = args.agent_server or os.environ.get("STOREGUARD_AGENT_SERVER", "")
     agent_key = args.agent_key or os.environ.get("STOREGUARD_AGENT_KEY", "")
 
     detector = DetectorCfg(device=args.device)
+    reid = ReidCfg()
     zones = []
     if args.config:
         cfg = load_config(args.config)
         detector = cfg.detector
+        reid = cfg.reid
         if args.device != "auto":
             detector = detector.model_copy(update={"device": args.device})
         # Prefer the first camera that has zones (paid / not-paid needs checkout).
@@ -111,6 +113,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
         zones=zones,
         agent_server=agent_server or None,
         agent_key=agent_key or None,
+        reid=reid,
     )
 
 
