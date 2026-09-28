@@ -31,6 +31,13 @@ Every alert produces three things:
 2. A saved **mp4 clip** of the moment: `events/clips/<camera>_<kind>_<time>.mp4`.
 3. A line in the **event log**: `events/events.jsonl`.
 
+In the live dashboard (`storeguard dashboard` / the cabinet's Live view) the
+same lands under `data/events/`: `clips/*.mp4` plus `events.jsonl`, whose
+lines also carry `camera_id`, the store-wide `person_id` (the same person on
+every camera) and the cabinet's `cloud_event_id` when the push succeeded.
+Repeat alerts are suppressed for 10 s per person, not per camera, so two
+different people are never merged into one alert.
+
 ## How the whole workflow looks
 
 Because the developer works from another country and only has the

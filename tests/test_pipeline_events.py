@@ -14,9 +14,10 @@ import time
 import numpy as np
 
 import storeguard.dashboard.pipeline as pipeline
-from storeguard.config import DetectorCfg
+from storeguard.config import DetectorCfg, ReidCfg
 from storeguard.dashboard.pipeline import DetectionSession
 from storeguard.geometry import Zone
+from storeguard.reid import IdentityRegistry
 from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
 from storeguard.types import Track
 
@@ -116,6 +117,26 @@ def test_detection_session_dispatches_exit_no_pay_event(monkeypatch) -> None:
     assert len(frames) == 3
     assert all(isinstance(f, np.ndarray) for f in frames)
     assert fps is not None and fps > 0
+
+
+def test_event_carries_store_wide_person_id(monkeypatch) -> None:
+    """With the shared id registry, events are tagged with a cross-run person id."""
+    monkeypatch.setattr(pipeline, "VideoStream", _ScriptedStream)
+    monkeypatch.setattr(pipeline, "PersonTracker", _WalkingTracker)
+    monkeypatch.setattr(pipeline, "ExitNoPayScenario", _InstantExitNoPay)
+    monkeypatch.setattr(pipeline, "get_encoder", lambda cfg, device: None)
+
+    registry = IdentityRegistry(ReidCfg())
+    alert_queue: queue.Queue = queue.Queue()
+    session = _session(alert_queue=alert_queue, identities=registry)
+    session.start()
+    try:
+        event, _frames, _fps, _cam = alert_queue.get(timeout=5.0)
+    finally:
+        session.stop()
+
+    assert event.track_id == 1  # global id
+    assert event.extra["person_id"] == f"{registry.run_id}-1"
 
 
 def test_detection_session_without_alert_queue_does_not_crash(monkeypatch) -> None:

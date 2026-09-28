@@ -8,6 +8,7 @@ feature, and it must hold regardless of whether cloud push is configured.
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 
@@ -58,6 +59,47 @@ def test_sink_dedups_within_min_gap(tmp_path) -> None:
     sink.handle(Event("exit_no_pay", "Aisle", "", base + 5), _frames(), fps=10)  # within 10s
     sink.handle(Event("exit_no_pay", "Aisle", "", base + 20), _frames(), fps=10)  # after gap
     assert len(list((tmp_path / "clips").glob("*.mp4"))) == 2
+
+
+def test_sink_does_not_drop_a_second_person_within_min_gap(tmp_path) -> None:
+    """Two different people leaving unpaid seconds apart are two incidents."""
+    sink = DashboardAlertSink(tmp_path / "clips")
+    base = 1000.0
+    sink.handle(Event("exit_no_pay", "Aisle", "", base, track_id=1), _frames(), fps=10)
+    sink.handle(Event("exit_no_pay", "Aisle", "", base + 2, track_id=2), _frames(), fps=10)
+    sink.handle(Event("exit_no_pay", "Aisle", "", base + 3, track_id=1), _frames(), fps=10)  # repeat
+    lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["track_id"] for line in lines] == [1, 2]
+
+
+def test_sink_appends_events_jsonl(tmp_path) -> None:
+    fc = _FakeClient()
+    sink = DashboardAlertSink(tmp_path / "clips", cloud_client=fc)
+    ev = Event("exit_no_pay", "Aisle", "grab", 1000.0, track_id=7, extra={"person_id": "run1-7"})
+    sink.handle(ev, _frames(), fps=10, camera_id="cam-1")
+
+    (line,) = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    rec = json.loads(line)
+    assert rec["kind"] == "exit_no_pay"
+    assert rec["camera"] == "Aisle"
+    assert rec["camera_id"] == "cam-1"
+    assert rec["person_id"] == "run1-7"
+    assert rec["track_id"] == 7
+    assert rec["cloud_event_id"] == "ev1"
+    assert rec["clip_path"].endswith(".mp4")
+    # the same person id reaches the cloud
+    assert fc.events[0][1]["person_id"] == "run1-7"
+
+
+def test_sink_logs_event_even_when_cloud_push_fails(tmp_path) -> None:
+    class _DownClient(_FakeClient):
+        def send_event(self, kind, **kw):
+            raise ConnectionError("cloud down")
+
+    sink = DashboardAlertSink(tmp_path / "clips", cloud_client=_DownClient())
+    sink.handle(Event("exit_no_pay", "Aisle", "", 1000.0, track_id=1), _frames(), fps=10)
+    (line,) = (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(line)["cloud_event_id"] is None
 
 
 def test_sink_pushes_to_cloud_and_keeps_local_copy(tmp_path) -> None:

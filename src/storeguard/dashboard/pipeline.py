@@ -374,6 +374,10 @@ class DetectionSession:
             if duration > 0:
                 fps = (len(snapshot) - 1) / duration
         for ev in events:
+            if self._identities is not None and ev.track_id >= 0:
+                # track_id is already the global person id (same on every
+                # camera); tag it so the cloud can group this person's events.
+                ev.extra = {**(ev.extra or {}), "person_id": self._identities.person_id(ev.track_id)}
             item = (ev, frames, fps, self.camera_id)
             try:
                 self._alert_queue.put_nowait(item)
