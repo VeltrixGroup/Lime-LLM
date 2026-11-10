@@ -65,6 +65,12 @@ class CloudSettings(BaseSettings):
     #: link inside password-reset emails, e.g. "https://cabinet.example.com".
     public_base_url: str = "http://127.0.0.1:8000"
 
+    #: Telegram Bot API base URL. Empty = https://api.telegram.org. Set it to
+    #: your reverse proxy where Telegram is blocked, e.g.
+    #: STOREGUARD_TELEGRAM_API_BASE=https://notify.example.com/<secret>
+    #: (treat that URL like a password).
+    telegram_api_base: str = ""
+
     @property
     def is_dev_secret(self) -> bool:
         """True while the insecure default secret is still in use."""

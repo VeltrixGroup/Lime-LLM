@@ -166,3 +166,15 @@ def test_api_base_uses_proxy_override(monkeypatch):
     monkeypatch.setattr(telegram_mod.requests, "post", lambda url, **kw: calls.append(url) or _Resp())
     assert telegram_mod.send_message("123:abc", "42", "hi")
     assert calls == ["https://tg.example.test/secret/bot123:abc/sendMessage"]
+
+
+def test_api_base_reads_storeguard_setting(monkeypatch):
+    from storeguard.cloud.settings import get_settings
+
+    monkeypatch.delenv("TELEGRAM_API_BASE", raising=False)
+    monkeypatch.setenv("STOREGUARD_TELEGRAM_API_BASE", "https://notify.example.test/s3cret/")
+    get_settings.cache_clear()
+    try:
+        assert telegram_mod.api_base() == "https://notify.example.test/s3cret"
+    finally:
+        get_settings.cache_clear()

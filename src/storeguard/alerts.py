@@ -8,7 +8,6 @@ delivery can never crash the video pipeline.
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 from datetime import datetime
@@ -27,7 +26,6 @@ if TYPE_CHECKING:
 
 _console = Console(stderr=True)
 
-_TELEGRAM_API = "https://api.telegram.org"  # override with TELEGRAM_API_BASE
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -254,8 +252,9 @@ class AlertSink:
 
     def _send_telegram(self, event: Event, clip_path: Path | None) -> None:
         """Send the event message and, if available, the saved clip."""
-        api = (os.environ.get("TELEGRAM_API_BASE") or _TELEGRAM_API).rstrip("/")
-        base = f"{api}/bot{self._telegram.bot_token}"
+        from storeguard.cloud.telegram import api_base
+
+        base = f"{api_base()}/bot{self._telegram.bot_token}"
         try:
             resp = requests.post(
                 f"{base}/sendMessage",

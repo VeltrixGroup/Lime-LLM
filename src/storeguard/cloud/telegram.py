@@ -18,13 +18,21 @@ _DEFAULT_API = "https://api.telegram.org"
 
 
 def api_base() -> str:
-    """Telegram Bot API base URL.
+    """Telegram Bot API base URL (no trailing slash).
 
-    Override with ``TELEGRAM_API_BASE`` (e.g. a reverse proxy outside a region
-    where api.telegram.org is blocked). Read on every call so it can be changed
-    without a code change.
+    Where Telegram is blocked, point this at a reverse proxy: set
+    ``STOREGUARD_TELEGRAM_API_BASE`` in ``.env`` (or the environment).
+    ``TELEGRAM_API_BASE`` in the environment is also honoured.
     """
-    return (os.environ.get("TELEGRAM_API_BASE") or _DEFAULT_API).rstrip("/")
+    override = os.environ.get("TELEGRAM_API_BASE", "")
+    if not override:
+        try:
+            from storeguard.cloud.settings import get_settings
+
+            override = get_settings().telegram_api_base
+        except Exception:  # noqa: BLE001 - never block delivery on settings errors
+            override = ""
+    return (override.strip() or _DEFAULT_API).rstrip("/")
 
 
 def send_message(bot_token: str, chat_id: str, text: str, timeout: float = 20.0) -> bool:
