@@ -12,13 +12,26 @@ import cv2
 import numpy as np
 
 from storeguard.actions.shared import get_action_model
-from storeguard.config import ActionCfg, DetectorCfg, ReidCfg
+from storeguard.config import ActionCfg, DetectorCfg
+from storeguard.dashboard.context import (
+    COLOR_ALERT,
+    COLOR_STAFF,
+    COLOR_VISITOR,
+    COLOR_WARN,
+    KIND_TITLES,
+    StoreContext,
+    fmt_duration,
+    mmss,
+)
 from storeguard.dashboard.payment import PaymentStatusTracker
 from storeguard.detector import PersonTracker
 from storeguard.geometry import Zone
-from storeguard.reid import IdentityRegistry, assign_global_ids, get_encoder
+from storeguard.reid import CameraIdentities, IdentityRegistry
 from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
-from storeguard.stream import LatestFrameReader, VideoStream
+from storeguard.scenarios.idle import IdleScenario
+from storeguard.scenarios.phone import PhoneScenario
+from storeguard.staff import Observation, zone_kind
+from storeguard.stream import VideoStream
 from storeguard.types import Event, Track
 
 # BGR colors
@@ -37,8 +50,8 @@ _PREVIEW_MAX_WIDTH = 960
 def _resize_for_preview(frame: np.ndarray) -> np.ndarray:
     """Downscale ``frame`` for the live preview stream if it's wider than needed.
 
-    Runs on the already-annotated copy, after detection — box overlays scale
-    down with it, so this never affects what the tracker actually sees.
+    Runs after detection, on the frame about to be annotated for display —
+    never on what the tracker sees.
     """
     h, w = frame.shape[:2]
     if w <= _PREVIEW_MAX_WIDTH:
@@ -48,30 +61,14 @@ def _resize_for_preview(frame: np.ndarray) -> np.ndarray:
         frame, (_PREVIEW_MAX_WIDTH, round(h * scale)), interpolation=cv2.INTER_AREA
     )
 
-#: Serializes YOLO model construction the *first* time a given weights path
-#: is loaded in this process, so concurrent sessions can't race to download
-#: the same file. Once a path has loaded successfully once, it's known to
-#: already be on local disk, so later sessions build their own PersonTracker
-#: for it in parallel instead of queueing behind every other camera —
-#: connecting N cameras at once used to take roughly N x one model load
-#: before the last camera's stream even opened.
-_MODEL_INIT_LOCK = threading.Lock()
-_weights_loaded: set[str] = set()
-
-
-def _build_tracker(cfg: DetectorCfg) -> PersonTracker:
-    if cfg.model in _weights_loaded:
-        return PersonTracker(cfg)
-    with _MODEL_INIT_LOCK:
-        first_load = cfg.model not in _weights_loaded
-        if first_load:
-            tracker = PersonTracker(cfg)
-            _weights_loaded.add(cfg.model)
-            return tracker
-    # Another thread finished loading this path while we waited for the
-    # lock — it's on disk now, so build our own instance outside the lock
-    # rather than holding it for a load that no longer needs protecting.
-    return PersonTracker(cfg)
+def _scale_tracks(tracks: list[Track], scale: float) -> list[Track]:
+    """Tracks with boxes scaled by ``scale`` (for drawing on the preview)."""
+    if scale == 1.0:
+        return tracks
+    return [
+        Track(track_id=t.track_id, box=tuple(v * scale for v in t.box), conf=t.conf)  # type: ignore[arg-type]
+        for t in tracks
+    ]
 
 
 #: Ready tracks are re-classified on every Nth processed frame only (their
@@ -118,9 +115,7 @@ def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | N
     if want_pocket:
         scenarios.append(
             PocketScenario(
-                camera,
-                model,
-                buf(),
+                camera, model, buf(),
                 threshold=action.thresholds.get("pocket", 0.75),
                 zones=zones or None,
                 classify_every=_ACTION_CLASSIFY_EVERY,
@@ -129,15 +124,39 @@ def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | N
     if has_register:
         scenarios.append(
             CashierScenario(
-                camera,
-                model,
-                buf(),
+                camera, model, buf(),
                 threshold=action.thresholds.get("take_cash", 0.80),
                 zones=zones,
                 classify_every=_ACTION_CLASSIFY_EVERY,
             )
         )
     return scenarios
+
+
+#: Serializes YOLO model construction the *first* time a given weights path
+#: is loaded in this process, so concurrent sessions can't race to download
+#: the same file. Once a path has loaded successfully once, it's known to
+#: already be on local disk, so later sessions build their own PersonTracker
+#: for it in parallel instead of queueing behind every other camera —
+#: connecting N cameras at once used to take roughly N x one model load
+#: before the last camera's stream even opened.
+_MODEL_INIT_LOCK = threading.Lock()
+_weights_loaded: set[str] = set()
+
+
+def _build_tracker(cfg: DetectorCfg) -> PersonTracker:
+    if cfg.model in _weights_loaded:
+        return PersonTracker(cfg)
+    with _MODEL_INIT_LOCK:
+        first_load = cfg.model not in _weights_loaded
+        if first_load:
+            tracker = PersonTracker(cfg)
+            _weights_loaded.add(cfg.model)
+            return tracker
+    # Another thread finished loading this path while we waited for the
+    # lock — it's on disk now, so build our own instance outside the lock
+    # rather than holding it for a load that no longer needs protecting.
+    return PersonTracker(cfg)
 
 
 #: Seconds to wait for the first frame of a live source before surfacing a
@@ -152,16 +171,12 @@ _CLIP_SECONDS = 15.0
 #: Hard cap on buffered frames — a safety valve against unbounded memory if
 #: something makes timestamps misbehave (e.g. a stalled/looping source).
 _RING_MAX_FRAMES = 450
-
-
-def scale_tracks(tracks: list[Track], scale: float) -> list[Track]:
-    """Tracks with boxes scaled by ``scale`` (for drawing on a resized frame)."""
-    if scale == 1.0:
-        return tracks
-    return [
-        Track(track_id=t.track_id, box=tuple(v * scale for v in t.box), conf=t.conf)
-        for t in tracks
-    ]
+#: A live camera with no frames for this long raises one "camera_offline".
+_OFFLINE_AFTER_SEC = 60.0
+#: Show the idle timer on an employee's box after this much stillness.
+_IDLE_SHOW_AFTER_SEC = 60.0
+#: Grab a crop of a possible new employee at most this often (seconds).
+_CROP_EVERY_SEC = 5.0
 
 
 def draw_person_overlays(
@@ -170,13 +185,7 @@ def draw_person_overlays(
     statuses: dict[int, str] | None = None,
     zones: list[Zone] | None = None,
 ) -> np.ndarray:
-    """Draw boxes, track ids and paid / not-paid labels (and optional zones).
-
-    Pass the frame at display size (see :func:`_resize_for_preview` and
-    :func:`scale_tracks`): line widths and font sizes are fixed in pixels, so
-    drawing on a 4MP frame and shrinking it afterwards made every label an
-    unreadable smudge.
-    """
+    """Draw boxes, track ids and paid / not-paid labels (and optional zones)."""
     out = frame.copy()
     h, w = out.shape[:2]
     statuses = statuses or {}
@@ -204,7 +213,7 @@ def draw_person_overlays(
         label = f"id {tr.track_id}  {status}"
         text_y = max(18, y1 - 8)
         # Dark bar behind text for readability
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         cv2.rectangle(
             out,
             (x1, text_y - th - 4),
@@ -217,10 +226,9 @@ def draw_person_overlays(
             label,
             (x1 + 3, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.55,
             color,
-            1,
-            cv2.LINE_AA,
+            2,
         )
 
     n = len(tracks)
@@ -234,7 +242,6 @@ def draw_person_overlays(
         0.7,
         (180, 255, 120),
         2,
-        cv2.LINE_AA,
     )
     return out
 
@@ -286,6 +293,7 @@ class DetectionSession:
         alert_queue: "queue.Queue | None" = None,
         camera_id: str | None = None,
         identities: IdentityRegistry | None = None,
+        context: StoreContext | None = None,
         action: ActionCfg | None = None,
     ) -> None:
         self.id = session_id
@@ -302,13 +310,6 @@ class DetectionSession:
         #: Cloud camera id (if this session was started from the cabinet), so
         #: a raised event can be attributed to the right camera in the cloud.
         self.camera_id = camera_id
-        #: Shared by every session of the dashboard: maps this camera's local
-        #: ByteTrack ids to store-wide person ids (None = local ids only).
-        self._identities = identities
-        self._encoder = None
-        #: Trained-model detections (pocket / take_cash); built on start.
-        self._action_cfg = action
-        self._action_scenarios: list = []
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -318,13 +319,45 @@ class DetectionSession:
         self._frame_ready = threading.Condition(self._lock)
         self._stats = SessionStats(filename=filename)
         self._tracker: PersonTracker | None = None
+        #: Global person ids. Shared by every camera connected together, so
+        #: one person keeps one id (and one paid status) on all of them; a
+        #: standalone session gets a private registry, which still re-joins
+        #: a person's id after an occlusion split their track.
+        self._own_registry = identities is None and context is None
+        if context is None:
+            context = StoreContext(
+                identities
+                or IdentityRegistry(detector.reid_threshold, detector.reid_forget_sec)
+            )
+        #: Store-wide shared state (ids, staff gallery, rules, stats, live feed).
+        self.context = context
+        self._registry = context.registry
+        self._phone: PhoneScenario | None = None
+        self._idle = IdleScenario(filename)
+        #: Per-frame overlay data for the cabinet's live view (drawn client-side).
+        self._meta: dict = {"people": [], "counts": {"all": 0, "staff": 0, "visitors": 0}}
+        self._raw_jpeg: bytes | None = None
+        #: Viewers that want raw frames + metadata (the cabinet "Камеры онлайн").
+        self.meta_viewers = 0
+        self._paid_seen: set[int] = set()
+        self._announced: set[tuple[str, int]] = set()
+        self._crop_at: dict[int, float] = {}
+        self._offline_reported = False
+        self._action_cfg = action
+        self._action_scenarios: list = []
+        self._last_raw: np.ndarray | None = None
+        self._seen_at: dict[int, float] = {}
+        self._identities: CameraIdentities | None = None
         self._payment = PaymentStatusTracker(self._zones, checkout_dwell_sec)
         # Fires once per track on a confirmed shelf-dwell-then-exit-without-
         # paying — a no-op if this camera has no shelf*/exit* zones. Shares
         # checkout_dwell_sec with PaymentStatusTracker above so "paid" means
         # the same thing for the HUD label and for whether an alert fires.
         self._exit_scenario = ExitNoPayScenario(
-            filename, self._zones, checkout_dwell_sec=checkout_dwell_sec
+            filename,
+            self._zones,
+            checkout_dwell_sec=checkout_dwell_sec,
+            is_paid=self._registry.is_paid,
         )
         self._alert_queue = alert_queue
         # (ts, raw frame) pairs from the last ~_CLIP_SECONDS, for evidence clips.
@@ -381,8 +414,6 @@ class DetectionSession:
         if thread is not None:
             thread.join(timeout=5.0)
             self._thread = None
-        if self._identities is not None:
-            self._identities.forget_camera(self.id)
         with self._lock:
             self._stats.running = False
 
@@ -407,6 +438,30 @@ class DetectionSession:
             if self._jpeg is not None and self._jpeg_seq > after_seq:
                 return self._jpeg, self._jpeg_seq
             return None
+
+    def peek_meta(self, after_seq: int) -> tuple[bytes, dict, int] | None:
+        """Latest raw JPEG + overlay metadata if newer than ``after_seq``."""
+        with self._lock:
+            if self._raw_jpeg is not None and self._jpeg_seq > after_seq:
+                return self._raw_jpeg, self._meta, self._jpeg_seq
+            return None
+
+    def snapshot(self) -> bytes | None:
+        """The newest raw frame as JPEG (the "Снимок" button)."""
+        if not self._ring and self._last_raw is None:
+            return None
+        raw = self._last_raw if self._last_raw is not None else self._ring[-1][1]
+        ok, buf = cv2.imencode(".jpg", raw, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        return buf.tobytes() if ok else None
+
+    def recent_frames(self) -> tuple[list[np.ndarray], float | None]:
+        """The buffered last ~15 s of raw frames and their real fps."""
+        snapshot = list(self._ring)
+        frames = [f for _, f in snapshot]
+        fps = None
+        if len(snapshot) >= 2 and snapshot[-1][0] > snapshot[0][0]:
+            fps = (len(snapshot) - 1) / (snapshot[-1][0] - snapshot[0][0])
+        return frames, fps
 
     def is_alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -445,11 +500,7 @@ class DetectionSession:
             if duration > 0:
                 fps = (len(snapshot) - 1) / duration
         for ev in events:
-            if self._identities is not None and ev.track_id >= 0:
-                # track_id is already the global person id (same on every
-                # camera); tag it so the cloud can group this person's events.
-                ev.extra = {**(ev.extra or {}), "person_id": self._identities.person_id(ev.track_id)}
-            item = (ev, frames, fps, self.camera_id)
+            item = (ev, frames, fps, self.camera_id, self.context.port)
             try:
                 self._alert_queue.put_nowait(item)
             except queue.Full:
@@ -462,26 +513,157 @@ class DetectionSession:
                 except queue.Full:
                     pass
 
-    def _reset_state(self) -> None:
-        assert self._tracker is not None
-        self._tracker.reset()
-        self._payment.reset()
-        self._exit_scenario.reset()
-        if self._identities is not None:
-            self._identities.forget_camera(self.id)
-        # Fresh clip buffers / cooldowns (the scenarios have no reset()).
-        self._action_scenarios = build_action_scenarios(
-            self.filename, self._zones, self._action_cfg
+    def _check_offline(self, now: float, last_frame_wall: float) -> None:
+        """One ``camera_offline`` incident after a minute without frames."""
+        if self._offline_reported or now - last_frame_wall < _OFFLINE_AFTER_SEC:
+            return
+        self._offline_reported = True
+        self.context.set_camera_online(self.camera_id or self.id, False)
+        since = time.strftime("%H:%M", time.localtime(last_frame_wall))
+        ev = Event(
+            kind="camera_offline",
+            camera=self.filename,
+            message=f"{self.filename}: нет сигнала с {since}",
+            ts=now,
         )
+        self.context.add_feed(f"{self.filename} потеряла сигнал", self.filename, COLOR_ALERT, now)
+        self._dispatch_events([ev])
+
+    def _analyse(
+        self,
+        frame: np.ndarray,
+        tracks: list[Track],
+        statuses: dict[int, str],
+        ts: float,
+    ) -> list[Event]:
+        """Staff recognition, phone/idle, visitor funnel, live feed, overlay data."""
+        ctx = self.context
+        h, w = frame.shape[:2]
+        cam = self.filename
+        staff_tracks = [t for t in tracks if ctx.activity.is_staff(t.track_id)]
+        events: list[Event] = []
+
+        # Phone / idle only for recognised employees, thresholds from the rules.
+        self._idle.idle_sec = ctx.idle_sec
+        idle_events = self._idle.update(frame, staff_tracks, ts)
+        phone_events: list[Event] = []
+        if self._phone is not None and staff_tracks:
+            self._phone.phone_sec = ctx.phone_sec
+            phone_events = self._phone.update(frame, staff_tracks, ts)
+
+        obs: list[Observation] = []
+        people: list[dict] = []
+        n_staff = 0
+        for t in tracks:
+            gid = t.track_id
+            emp_id, name = ctx.activity.label(gid)
+            zones = [z.name for z in self._zones if z.contains(t.foot, w, h)]
+            phone_for = self._phone.holding_for(gid, ts) if (self._phone and emp_id) else None
+            still_for = self._idle.still_for(gid, ts) if emp_id else None
+            idle = still_for is not None and still_for >= _IDLE_SHOW_AFTER_SEC
+            crop = None
+            area = (t.box[2] - t.box[0]) * (t.box[3] - t.box[1])
+            if emp_id is None and any(zone_kind(z) == "staff" for z in zones):
+                if ts - self._crop_at.get(gid, -1e9) >= _CROP_EVERY_SEC:
+                    self._crop_at[gid] = ts
+                    crop = _crop_jpeg(frame, t.box)
+            obs.append(Observation(
+                camera=cam,
+                gid=gid, zones=zones, paid=statuses.get(gid) == "paid",
+                phone=phone_for is not None, idle=idle,
+                feature=self._registry.feature(gid), crop_jpeg=crop, area=area,
+            ))
+            # overlay label / colour as in the design
+            if emp_id:
+                n_staff += 1
+                label, color, rec = name or "Сотрудник", COLOR_STAFF, False
+                if phone_for is not None:
+                    rec = phone_for >= ctx.phone_sec
+                    color = COLOR_ALERT if rec else COLOR_WARN
+                    label = f"{label} · телефон {mmss(phone_for)}" + (" · REC" if rec else "")
+                    if ("phone", gid) not in self._announced:
+                        self._announced.add(("phone", gid))
+                        ctx.add_feed(f"{name} взял телефон", cam, COLOR_WARN, ts)
+                elif idle:
+                    rec = still_for >= ctx.idle_sec
+                    color = COLOR_ALERT if rec else COLOR_WARN
+                    label = f"{label} · бездействие {mmss(still_for)}" + (" · REC" if rec else "")
+                    if ("idle", gid) not in self._announced:
+                        self._announced.add(("idle", gid))
+                        ctx.add_feed(f"{name} без движения", cam, COLOR_WARN, ts)
+                else:
+                    self._announced.discard(("phone", gid))
+                    self._announced.discard(("idle", gid))
+            else:
+                paid = statuses.get(gid) == "paid"
+                label = f"Посетитель #{gid} · {round(t.conf * 100)}%" + (" · оплатил" if paid else "")
+                color, rec = COLOR_VISITOR, False
+            people.append({
+                "id": gid,
+                "box": [round(t.box[0] / w, 4), round(t.box[1] / h, 4),
+                        round((t.box[2] - t.box[0]) / w, 4), round((t.box[3] - t.box[1]) / h, 4)],
+                "label": label, "color": color, "rec": rec,
+                "kind": "staff" if emp_id else "visitor",
+            })
+            # Served at a register -> POS receipt cross-check.
+            if statuses.get(gid) == "paid" and gid not in self._paid_seen:
+                self._paid_seen.add(gid)
+                zone = next((z for z in zones if zone_kind(z) == "checkout"), "")
+                # "checkout Касса 2" -> "Касса 2" (what the POS calls the register)
+                register = zone.split(" ", 1)[1].strip() if " " in zone else zone
+                ctx.report_checkout(ts, self.camera_id, gid, register)
+        ctx.activity.observe(obs, ts)
+        for item in ctx.activity.take_feed():
+            title = "Посетитель вошёл" if item["kind"] == "enter" else "Посетитель вышел"
+            ctx.add_feed(title, item.get("camera") or cam, COLOR_VISITOR, item["ts"])
+        # Per-person bookkeeping must not grow forever on a 24/7 camera.
+        for t in tracks:
+            self._seen_at[t.track_id] = ts
+        if len(self._seen_at) > 500:
+            old = {g for g, s in self._seen_at.items() if ts - s > 900}
+            for g in old:
+                self._seen_at.pop(g, None)
+                self._paid_seen.discard(g)
+                self._crop_at.pop(g, None)
+                self._announced.discard(("phone", g))
+                self._announced.discard(("idle", g))
+
+        # Enrich incidents: Russian text, who, how long.
+        for ev in [*phone_events, *idle_events]:
+            emp_id, name = ctx.activity.label(ev.track_id)
+            dur = ev.extra.get("phone_sec") or ev.extra.get("idle_sec") or 0
+            base = "В телефоне" if ev.kind == "on_phone" else "Бездействие"
+            ev.message = f"{base} {fmt_duration(dur)}"
+            ev.extra.update({"employee_id": emp_id, "duration_sec": dur, "person_id": str(ev.track_id)})
+            ctx.add_feed(f"{name} {base.lower()} > {int(dur // 60)} мин — клип отправлен", cam, COLOR_ALERT, ts)
+            events.append(ev)
+        with self._lock:
+            self._meta = {
+                "people": people,
+                "counts": {"all": len(tracks), "staff": n_staff, "visitors": len(tracks) - n_staff},
+                "rec": any(p["rec"] for p in people),
+            }
+        return events
 
     def _run(self) -> None:
         try:
             self._tracker = _build_tracker(self.detector_cfg)
-            if self._identities is not None:
-                self._encoder = get_encoder(
-                    self._identities.cfg, getattr(self._tracker, "device", "cpu")
-                )
-            self._reset_state()
+            self._tracker.reset()
+            # Test doubles and older trackers have no ReID model: fall back
+            # to colour histograms inside CameraIdentities.
+            get_encoder = getattr(self._tracker, "appearance_encoder", None)
+            encoder = get_encoder() if get_encoder is not None else None
+            self._identities = CameraIdentities(
+                self._registry, encoder.encode if encoder is not None else None
+            )
+            self._action_scenarios = build_action_scenarios(
+                self.filename, self._zones, self._action_cfg
+            )
+            detect_phones = getattr(self._tracker, "detect_phones", None)
+            if detect_phones is not None:
+                self._phone = PhoneScenario(self.filename, detect_phones)
+            self._payment.reset()
+            self._exit_scenario.reset()
             with self._lock:
                 self._stats.running = True
                 self._stats.error = None
@@ -491,7 +673,21 @@ class DetectionSession:
                     break
                 if not self.loop:
                     break
-                self._reset_state()
+                self._tracker.reset()
+                self._identities.reset()
+                if self._own_registry:
+                    self._registry.reset()
+                    self.context.activity.reset()
+                self._payment.reset()
+                self._exit_scenario.reset()
+                # Ids restart at 1 on the next pass: drop everything keyed by them.
+                self._idle = IdleScenario(self.filename)
+                if self._phone is not None:
+                    self._phone = PhoneScenario(self.filename, self._phone._detect)
+                self._paid_seen.clear()
+                self._announced.clear()
+                self._crop_at.clear()
+                self._seen_at.clear()
 
         except Exception as exc:  # noqa: BLE001 — surface to UI, keep server up
             with self._lock:
@@ -503,14 +699,13 @@ class DetectionSession:
 
     def _play_once(self) -> bool:
         """Decode the source once (or until stop for live URLs)."""
-        stream = VideoStream(self.source)
+        # Live cameras: always detect on the newest frame instead of working
+        # through a backlog that grows whenever detection is slower than the
+        # camera (which made the view lag further and further behind).
+        stream = VideoStream(self.source, latest_only=self._is_url)
         is_file = stream.is_file and not self._is_url
         src_fps = stream.fps
         frame_delay = 1.0 / src_fps if is_file else 0.0
-        # Live cameras are drained on their own thread so detection always
-        # runs on the newest frame instead of falling ever further behind.
-        reader = None if is_file else LatestFrameReader(stream)
-        last_seq = 0
 
         # Probe openness: try one read for live; for files VideoStream opens immediately.
         # If the path is bad, first reads return None forever for files.
@@ -528,21 +723,17 @@ class DetectionSession:
         processed = 0
         got_any = False
         connect_error_set = False
+        last_frame_wall = time.time()
 
         try:
             while not self._stop.is_set():
                 t0 = time.monotonic()
-                if reader is None:
-                    frame = stream.read()
-                else:
-                    latest = reader.read_latest(last_seq, timeout=0.1)
-                    frame = None
-                    if latest is not None:
-                        frame, last_seq = latest
+                frame = stream.read()
                 if frame is None:
                     if is_file:
                         # EOF
                         break
+                    self._check_offline(time.time(), last_frame_wall)
                     # Live stream down — wait for reconnect without ending the
                     # session. If it never connected, surface an error so a dead
                     # camera doesn't look like a healthy one watching an empty aisle.
@@ -554,7 +745,7 @@ class DetectionSession:
                         with self._lock:
                             self._stats.error = f"no video from {self.filename}"
                         connect_error_set = True
-                    if self._stop.wait(timeout=0.01):
+                    if self._stop.wait(timeout=0.1):
                         break
                     continue
 
@@ -564,6 +755,11 @@ class DetectionSession:
                         self._stats.error = None
                     connect_error_set = False
                 got_any = True
+                last_frame_wall = time.time()
+                if self._offline_reported:
+                    self._offline_reported = False
+                    self.context.add_feed(f"{self.filename}: сигнал восстановлен", self.filename, COLOR_STAFF)
+                self.context.set_camera_online(self.camera_id or self.id, True)
                 frame_idx += 1
                 if is_file:
                     ts = t0_wall + (frame_idx - 1) / src_fps
@@ -572,13 +768,29 @@ class DetectionSession:
 
                 every = self.process_every
                 if (frame_idx - 1) % every == 0:
-                    assert self._tracker is not None
-                    tracks = self._tracker.update(frame)
-                    if self._identities is not None:
-                        tracks = assign_global_ids(
-                            self._identities, self._encoder, self.id, frame, tracks, ts
-                        )
+                    assert self._tracker is not None and self._identities is not None
+                    try:
+                        tracks = self._tracker.update(frame)
+                    except Exception as exc:  # noqa: BLE001
+                        if is_file:
+                            raise
+                        # One bad frame / transient GPU error mustn't end a live camera.
+                        with self._lock:
+                            self._stats.error = self._sanitize(f"detection error: {exc}")
+                        if self._stop.wait(timeout=1.0):
+                            break
+                        continue
+                    with self._lock:
+                        if self._stats.error and self._stats.error.startswith("detection error"):
+                            self._stats.error = None
+                    tracks = self._identities.update(frame, tracks, ts)
                     statuses = self._payment.update(frame, tracks, ts)
+                    # Paid anywhere (e.g. at the cashier camera) is paid everywhere.
+                    for gid, status in statuses.items():
+                        if status == "paid":
+                            self._registry.mark_paid(gid)
+                        elif self._registry.is_paid(gid):
+                            statuses[gid] = "paid"
                     new_events = self._exit_scenario.update(frame, tracks, ts)
                     for sc in self._action_scenarios:
                         try:
@@ -586,8 +798,20 @@ class DetectionSession:
                         except Exception as exc:  # noqa: BLE001 — never kill the camera
                             with self._lock:
                                 self._stats.error = f"{sc.kind} detection failed: {exc}"
-                    self._append_ring(ts, frame)
+                    new_events += self._analyse(frame, tracks, statuses, ts)
+                    # Evidence ring: preview-size frames (full 1080p frames
+                    # would cost ~3 GB per camera); keep the newest raw frame
+                    # for full-quality snapshots.
+                    self._last_raw = frame
+                    self._append_ring(ts, _resize_for_preview(frame))
                     if new_events:
+                        for ev in new_events:
+                            if ev.kind in ("exit_no_pay", "pocket", "take_cash"):
+                                ev.message = KIND_TITLES[ev.kind]
+                                ev.extra.setdefault("person_id", str(ev.track_id))
+                                self.context.add_feed(
+                                    f"{ev.message} — клип отправлен", self.filename, COLOR_ALERT, ts
+                                )
                         self._dispatch_events(new_events)
                     processed += 1
                     now = time.monotonic()
@@ -599,16 +823,26 @@ class DetectionSession:
                         with self._lock:
                             self._stats.fps = round(inst_fps, 1)
 
+                # Downscale first, then draw: cheaper than copying and drawing
+                # on a multi-megapixel frame, and labels stay readable instead
+                # of shrinking along with the picture.
                 small = _resize_for_preview(frame)
+                scale = small.shape[1] / frame.shape[1]
                 preview = draw_person_overlays(
                     small,
-                    scale_tracks(tracks, small.shape[1] / frame.shape[1]),
+                    _scale_tracks(tracks, scale),
                     statuses=statuses,
                     zones=self._zones or None,
                 )
                 ok_enc, buf = cv2.imencode(
                     ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
                 )
+                raw_jpeg = None
+                if self.meta_viewers > 0:
+                    ok_raw, raw_buf = cv2.imencode(
+                        ".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                    )
+                    raw_jpeg = raw_buf.tobytes() if ok_raw else None
                 if ok_enc:
                     jpeg = buf.tobytes()
                     people_status = [
@@ -621,6 +855,7 @@ class DetectionSession:
                     n_paid = sum(1 for p in people_status if p.status == "paid")
                     with self._frame_ready:
                         self._jpeg = jpeg
+                        self._raw_jpeg = raw_jpeg
                         self._jpeg_seq += 1
                         self._stats.people = len(tracks)
                         self._stats.frame = frame_idx
@@ -636,13 +871,25 @@ class DetectionSession:
                     if sleep_for > 0 and self._stop.wait(timeout=sleep_for):
                         break
         finally:
-            if reader is not None:
-                reader.release()
-            else:
-                stream.release()
+            stream.release()
 
         if not got_any:
             with self._lock:
                 self._stats.error = f"could not open source: {self.filename}"
             return False
         return True
+
+
+def _crop_jpeg(frame: np.ndarray, box: tuple[float, float, float, float]) -> bytes | None:
+    """A small JPEG of one person (for the "Новые лица" cards)."""
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in box)
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    if x2 - x1 < 8 or y2 - y1 < 16:
+        return None
+    crop = frame[y1:y2, x1:x2]
+    if crop.shape[0] > 256:
+        scale = 256 / crop.shape[0]
+        crop = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)), 256), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    return buf.tobytes() if ok else None

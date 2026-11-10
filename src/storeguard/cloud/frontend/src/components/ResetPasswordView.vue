@@ -9,7 +9,7 @@ const done = ref(false);
 
 async function submit() {
   if (form.password !== form.confirm) {
-    setStatus("Passwords don't match", true);
+    setStatus("Пароли не совпадают", true);
     return;
   }
   try {
@@ -29,49 +29,19 @@ function backToLogin() {
 </script>
 
 <template>
-  <main class="auth-shell">
-    <header class="top">
-      <h1 class="brand">storeguard</h1>
-      <p class="tagline">cloud control plane</p>
-    </header>
-
-    <div class="card form">
-      <template v-if="!token">
-        <p class="hint">This reset link is missing its token — open the link from your email again.</p>
-        <button type="button" class="btn primary" @click="backToLogin">Back to log in</button>
-      </template>
-      <template v-else-if="done">
-        <p class="hint">Password updated — you can log in with your new password now.</p>
-        <button type="button" class="btn primary" @click="backToLogin">Back to log in</button>
-      </template>
-      <template v-else>
-        <form @submit.prevent="submit">
-          <label>
-            New password
-            <input
-              type="password"
-              v-model="form.password"
-              autocomplete="new-password"
-              minlength="8"
-              maxlength="72"
-              required
-            />
-          </label>
-          <label>
-            Confirm new password
-            <input
-              type="password"
-              v-model="form.confirm"
-              autocomplete="new-password"
-              minlength="8"
-              maxlength="72"
-              required
-            />
-          </label>
-          <button class="btn primary" type="submit">Set new password</button>
-        </form>
-        <button type="button" class="link-btn" @click="backToLogin">Back to log in</button>
-      </template>
-    </div>
-  </main>
+  <div class="auth">
+    <section class="auth-form">
+      <form v-if="!done" @submit.prevent="submit">
+        <h1>Новый пароль</h1>
+        <label class="field">Пароль<input v-model="form.password" type="password" minlength="8" autocomplete="new-password" required /></label>
+        <label class="field">Повторите пароль<input v-model="form.confirm" type="password" minlength="8" autocomplete="new-password" required /></label>
+        <button class="btn primary lg" type="submit">Сохранить пароль</button>
+      </form>
+      <form v-else @submit.prevent="backToLogin">
+        <h1>Пароль изменён</h1>
+        <span class="muted">Теперь войдите с новым паролем.</span>
+        <button class="btn primary lg" type="submit">Ко входу</button>
+      </form>
+    </section>
+  </div>
 </template>

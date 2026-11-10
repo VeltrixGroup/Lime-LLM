@@ -8,14 +8,14 @@ theft-related actions.
 
 | # | Detection | How it works | Needs training? |
 |---|-----------|--------------|-----------------|
-| 1 | **People** — every person in the frame is detected and gets an id that is the same on every camera (cross-camera re-identification) | YOLO11 + ByteTrack + appearance ReID | No |
+| 1 | **People** — every person in the frame is detected and gets an id that is the same on every camera (cross-camera re-identification) | YOLO26 + ByteTrack + appearance ReID | No |
 | 2 | **`pocket`** — a shopper takes a product from the shelf and hides it in a pocket / clothes / bag | Action classifier (3D CNN) on person crops | **Yes** |
 | 3 | **`exit_no_pay`** — a person spends time at the shelves and then goes to the exit **without** passing the checkout | Pure zone logic (shelf / checkout / exit polygons) | No |
 | 4 | **`take_cash`** — an employee takes money out of the register drawer and carries it away | Action classifier (3D CNN) on person crops | **Yes** |
 
 ### Two-stage architecture (short)
 
-- **Stage 1 — works out of the box.** YOLO11 detects people, ByteTrack gives
+- **Stage 1 — works out of the box.** YOLO26 detects people, ByteTrack gives
   each person a stable id, and polygon zones that you draw on the frame
   ("shelf…", "checkout", "exit", "register…") drive the `exit_no_pay` logic.
   No training needed.
@@ -39,7 +39,7 @@ Repeat alerts are suppressed for 10 s per person, not per camera, so two
 different people are never merged into one alert.
 
 The live dashboard also runs `pocket` and `take_cash` as soon as a trained
-`models/action.pt` exists (in Docker: put it in `./models/`). Cabinet cameras
+`models/action.pt` exists. Cabinet cameras
 carry zones but no scenario list, so the zones decide: `pocket` on cameras
 with a `shelf*` zone (or no zones at all), `take_cash` only on cameras with a
 `register*` zone. The dashboard log says at startup whether the model was
@@ -119,7 +119,7 @@ main (most-visible) person, and writes a small mp4 of letterboxed person
 crops — the same crop geometry the classifier sees in production — under
 `data/clips/<class>/`, printing a per-class count table at the end.
 
-> Note: the detector weights (`yolo11n.pt`) are downloaded automatically on
+> Note: the detector weights (`yolo26*.pt`) are downloaded automatically on
 > first use (needs internet once). Segments where no person is detected are
 > skipped with a warning.
 
@@ -199,19 +199,20 @@ The store PC is on the same LAN/WiFi as the cameras, so RTSP works there.
    cd C:\storeguard
    uv sync
    ```
-4. **If the PC has an NVIDIA GPU** — nothing extra to do: PyPI only ships
-   CPU-only torch for Windows, so `pyproject.toml` already points torch /
-   torchvision on Windows at PyTorch's CUDA index (`cu128`, needs an NVIDIA
-   driver >= 570 — for an older driver change the index url to `.../cu126`
-   and run `uv sync` again). If you installed the project before this was
-   added, just run `uv sync` once more. Verify CUDA is actually picked up:
+4. **If the PC has an NVIDIA GPU**: nothing extra to install, no Docker
+   needed. `pyproject.toml` already pulls the CUDA 12.8 torch build on
+   Windows (PyPI only has CPU-only torch for Windows). It needs an NVIDIA
+   driver **570 or newer** (check with `nvidia-smi`). Check it once:
 
    ```powershell
-   uv run python -c "import torch; print(torch.cuda.is_available())"
+   .\make.ps1 gpu-check
    ```
 
-   It must print `True` — otherwise the GPU will sit idle while the CPU
-   struggles.
+   It must print `OK: detection will run on the GPU - <your card>`. If the
+   PC still has the old CPU-only torch, `gpu-check` re-installs the CUDA
+   build by itself (one-time ~3 GB download). `.\make.ps1 serve`, `dashboard` and
+   `.\make.ps1 run` run the same check before starting. In the dashboard
+   log, look for `Detector device: cuda (...)`.
 
 **Linux**: same idea — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 (this installs `uv` into `~/.local/bin` of the current user), copy the
@@ -219,12 +220,11 @@ project to e.g. `/opt/storeguard`, then `uv sync`. For an NVIDIA GPU on
 Linux no extra step is needed — the default torch wheels already bundle
 CUDA.
 
-> Note: on the first `run`, ultralytics downloads the detector weights
-> automatically (needs internet once): with `model: auto` that is
-> `yolo11m.pt` on a GPU, `yolo11s.pt` on a CPU. Cross-camera person ids
-> (`reid:`) download ImageNet ResNet weights on first use too. If the store
-> PC is offline, copy the `.pt` files into the project folder (and
-> `~/.cache/torch`) too.
+> Note: on the first `run`, ultralytics downloads the YOLO weights
+> (`yolo26m.pt` on GPU, `yolo26n.pt` on CPU) and the ReID model
+> `yolo26n-reid.onnx` automatically (needs internet once). If the store PC
+> is offline, copy those files from a machine that has them into the
+> project folder too.
 
 ### 4.2 Camera RTSP URLs
 
@@ -268,9 +268,10 @@ Create `configs/storeguard.yaml` (a full realistic example — also see
 
 ```yaml
 detector:
-  model: auto           # auto -> yolo11m.pt on GPU, yolo11s.pt on CPU
-  conf: 0.25
-  imgsz: 0              # 0 = auto -> 1280 on GPU, 800 on CPU
+  model: auto           # yolo26m on CUDA, yolo26s on MPS, yolo26n on CPU
+  conf: 0.45            # score to keep matching a person to their track
+  new_track_conf: 0.6   # score needed to start a new person (fewer false people)
+  imgsz: 640
   device: auto          # auto -> cuda if available, else mps, else cpu
 reid:                   # same person id on every camera
   enabled: true
@@ -438,14 +439,25 @@ return 2xx. Failures are logged and never stop the camera pipeline.
 
 ## Hardware guidance
 
-- **1–2 cameras**: a modern desktop CPU is enough. Use `model: yolo11n.pt` and
+- **1–2 cameras**: a modern desktop CPU is enough (`model: auto` uses
+  `yolo26n.pt` there). Use
   `process_every: 2` or `3` in the config (process every 2nd–3rd frame).
   Using the camera substream (`…/Channels/102`) also reduces load.
 - **4+ cameras**, or if you need faster reaction: use an NVIDIA GPU
-  (e.g. **RTX 3050 or better**) and keep `device: auto`. On **Windows**
-  `uv sync` installs the CUDA torch build (see step 4.1); verify with
+  (e.g. **RTX 3050 or better**) and keep `device: auto` / `model: auto`
+  (`yolo26m.pt`, far fewer false detections on shelves). All cameras share
+  one model on the GPU and are batched together. Verify CUDA with
   `uv run python -c "import torch; print(torch.cuda.is_available())"`.
 - RAM: 8 GB minimum, 16 GB comfortable.
+- **TensorRT (NVIDIA only):** on a PC with an NVIDIA card, `serve` / `dev`
+  install TensorRT and, on the first start, build an FP16 TensorRT engine of
+  the detector in the background (a few minutes, once per machine; cached in
+  `models/optimized/`). Detection runs on PyTorch until it is ready, then
+  switches over by itself — typically 2-3x more frames per second. Build it
+  ahead of time and see the speed-up with `.\make.ps1 optimize` (or
+  `make optimize`). Turn it off with `detector.optimize: off` in the config.
+  Macs and CPU-only PCs keep PyTorch: measured on Apple silicon, CoreML
+  export fails for YOLO26 and ONNX/OpenVINO were not a consistent win.
 
 ## Legal note
 
@@ -459,6 +471,7 @@ management before going live.
 
 ```text
 storeguard run          --config configs/storeguard.yaml [--show]
+storeguard cloud        --with-dashboard [--port 8000] [--device auto] [--config …]
 storeguard dashboard    [--host 127.0.0.1] [--port 8765] [--device auto] [--config …]
 storeguard draw-zones   --source <rtsp|video|image> --out configs/zones/cam1.yaml
 storeguard annotate     --videos <dir> --out labels.csv [--classes normal,pocket,take_cash]
@@ -466,7 +479,68 @@ storeguard make-dataset --videos <dir> --labels labels.csv --out data/clips
 storeguard train        --data data/clips --out models/action.pt [--epochs 30] [--batch 8] [--lr 1e-4]
 ```
 
-### Detection dashboard (local preview)
+### Running everything on one PC (one port)
+
+The control panel stores its data in **Postgres**, which runs in Docker
+(only the database — the app itself runs directly on the PC so detection
+can use the GPU). Install Docker Desktop once and keep it running.
+
+```bash
+make serve                 # Windows: .\make.ps1 serve
+```
+
+This starts Postgres (`docker compose up -d db`), applies the database
+migrations (`alembic upgrade head`) and runs the control panel and live
+detection in one process on **port 8000**:
+
+| Address | What |
+|---|---|
+| http://127.0.0.1:8000 | control panel (login, cameras, zones, alerts) |
+| http://127.0.0.1:8000/live/ | live detection (after login; "Камеры онлайн" in the sidebar) |
+
+While working on the panel's frontend use `make dev` instead: the same
+backend plus the Vite dev server with hot reload at http://localhost:5173
+(Ctrl+C stops both). When done, `make frontend-build`.
+
+First time: open http://127.0.0.1:8000/register and create the owner account.
+
+Database commands:
+
+| Command | What |
+|---|---|
+| `make db-up` / `make db-down` | start / stop Postgres (data is kept in the `pgdata` volume) |
+| `make migrate` | apply migrations (done automatically by `serve` / `dev`) |
+| `make db-shell` | `psql` into the database |
+
+Connection: `postgresql+psycopg://storeguard:storeguard@127.0.0.1:5432/storeguard`.
+To change the password or port, set `STOREGUARD_DB_PASSWORD` /
+`STOREGUARD_DB_PORT` and `STOREGUARD_DATABASE_URL` in `.env`.
+
+### Control panel (Лайм AI) — what feeds each screen
+
+| Screen | Data comes from |
+|---|---|
+| Обзор, Аналитика | hourly visitor counts from the cameras (entered → shelves → checkout → paid) + incidents |
+| Камеры онлайн | live video with AI boxes, drawn in the browser; event feed |
+| Инциденты | every alert; confirm / false alarm here or with the Telegram buttons |
+| Сотрудники | people the cameras recognise as staff (by appearance) + their phone / idle time |
+| Доступ и роли | users and the permission matrix (Владелец has everything) |
+| Настройки | alert thresholds, store hours, Telegram bot + recipients, POS, edge keys |
+
+Zone names decide what a zone does (draw them in *Камеры онлайн → Настройка
+камер → Изменить → Зоны*): `checkout …` (касса — paid status, funnel),
+`shelf …` (полка — funnel, theft), `exit …` (выход — leaving without paying),
+`staff …` (служебная зона: склад, за кассой). An unknown person who keeps
+spending time in a `staff` zone shows up under *Сотрудники → Новые лица*;
+press **Сотрудник** once and the cameras recognise them from then on. Phone
+and idle alerts only fire for recognised staff, within store hours.
+
+"Касса без чека" and "возврат без чека" need receipt data: let the POS POST
+each receipt to the address shown in *Настройки → Касса (POS)*. Until
+receipts arrive those checks stay off. Pocket / cash-taking detection turns
+on by itself once a trained `models/action.pt` exists.
+
+### Detection dashboard (standalone preview)
 
 Upload a video in the browser and watch YOLO person boxes + track ids — or
 drop files into ``data/`` and pick them from the dropdown:
@@ -518,9 +592,9 @@ uv run storeguard dashboard
 5. **Telegram:** создать бота через @BotFather, получить токен, узнать свой
    chat_id через `getUpdates`, вписать в конфиг, `enabled: true`.
 6. **Железо:** 1–2 камеры — достаточно обычного CPU (`process_every: 2-3`,
-   модель `yolo11n`); 4+ камер или быстрее реакция — нужна NVIDIA GPU
-   (например, RTX 3050+). На Windows `uv sync` ставит CUDA-сборку
-   torch из индекса PyTorch (см. шаг 4.1).
+   модель `yolo26n`); 4+ камер или быстрее реакция — нужна NVIDIA GPU
+   (например, RTX 3050+, драйвер 570+). CUDA-сборка torch для Windows уже
+   прописана в `pyproject.toml` (см. шаг 4.1).
 7. **Юридически:** повесить таблички о видеонаблюдении и письменно
    уведомить сотрудников — стандартная практика по закону о персональных
    данных.

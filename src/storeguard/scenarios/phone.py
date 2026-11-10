@@ -27,9 +27,15 @@ if TYPE_CHECKING:
 _Box = tuple[float, float, float, float]
 
 
+#: A phone missing for less than this (missed detection, hand turned) doesn't
+#: end the "on the phone" streak; longer, and the timer starts over.
+PHONE_GRACE_SEC = 4.0
+
+
 @dataclass
 class _PhoneState:
     since: float | None = None
+    last_holding: float = 0.0
     last_seen: float = 0.0
     alerted: bool = False
 
@@ -51,6 +57,13 @@ class PhoneScenario:
         self.phone_sec = phone_sec
         self._state: dict[int, _PhoneState] = {}
 
+    def holding_for(self, track_id: int, ts: float) -> float | None:
+        """Seconds this track has been holding a phone, or ``None``."""
+        st = self._state.get(track_id)
+        if st is None or st.since is None or ts - st.last_holding > PHONE_GRACE_SEC:
+            return None
+        return ts - st.since
+
     @staticmethod
     def _holds(person_box: _Box, phone_box: _Box) -> bool:
         pcx = (phone_box[0] + phone_box[2]) / 2.0
@@ -67,10 +80,11 @@ class PhoneScenario:
             st = self._state.setdefault(tr.track_id, _PhoneState())
             st.last_seen = ts
             if phones and any(self._holds(tr.box, pb) for pb in phones):
-                if st.since is None:
+                if st.since is None or ts - st.last_holding > PHONE_GRACE_SEC:
                     st.since = ts
                     st.alerted = False
-                elif ts - st.since >= self.phone_sec and not st.alerted:
+                st.last_holding = ts
+                if ts - st.since >= self.phone_sec and not st.alerted:
                     st.alerted = True
                     events.append(
                         Event(
@@ -86,7 +100,7 @@ class PhoneScenario:
                             extra={"phone_sec": round(ts - st.since, 1)},
                         )
                     )
-            else:
+            elif st.since is not None and ts - st.last_holding > PHONE_GRACE_SEC:
                 st.since = None
                 st.alerted = False
         self._forget(ts)

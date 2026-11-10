@@ -3,17 +3,38 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from datetime import datetime
 from urllib.parse import quote
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from storeguard.cloud.models import ROLE_STAFF, ROLES, CameraDefaults
+from storeguard.cloud.models import ROLE_SECURITY, ROLE_STAFF, CameraDefaults
+
+_ROLE_KEY_RE = re.compile(r"^[a-z0-9_]{2,40}$")
 
 
 def _validate_role(value: str) -> str:
-    if value not in ROLES:
-        raise ValueError(f"role must be one of {ROLES}")
+    """A role key (built-in or custom); whether it exists is checked per tenant.
+
+    The legacy ``staff`` role is accepted as an alias of ``security``.
+    """
+    value = value.strip().lower()
+    if value == ROLE_STAFF:
+        return ROLE_SECURITY
+    if not _ROLE_KEY_RE.match(value):
+        raise ValueError("role must be 2-40 chars of a-z, 0-9, _")
+    return value
+
+
+_PHONE_STRIP_RE = re.compile(r"[\s()\-]")
+
+
+def normalize_phone(value: str) -> str:
+    """Digits with an optional leading '+', e.g. '+79000000000'."""
+    value = _PHONE_STRIP_RE.sub("", value.strip())
+    if not re.fullmatch(r"\+?\d{7,15}", value):
+        raise ValueError("invalid phone number")
     return value
 
 
@@ -89,23 +110,37 @@ class SignupRequest(BaseModel):
     password: str = Field(min_length=8, max_length=72)
     full_name: str = ""
     org_name: str = Field(min_length=1, max_length=200)
+    phone: str = ""
+    address: str = Field(default="", max_length=300)
 
     _norm_email = field_validator("email")(_validate_email)
 
+    @field_validator("phone")
+    @classmethod
+    def _norm_phone(cls, value: str) -> str:
+        return normalize_phone(value) if value.strip() else ""
+
 
 class LoginRequest(BaseModel):
-    """Authenticate an existing user."""
+    """Authenticate an existing user by email or phone ("Телефон или email")."""
 
     email: str
     password: str = Field(min_length=1, max_length=72)
 
-    _norm_email = field_validator("email")(_validate_email)
+    @field_validator("email")
+    @classmethod
+    def _norm_login(cls, value: str) -> str:
+        value = value.strip()
+        if "@" in value:
+            return _validate_email(value)
+        return normalize_phone(value)
 
 
 class UserOut(BaseModel):
     id: str
     email: str
     full_name: str
+    phone: str | None = None
 
 
 class TenantOut(BaseModel):
@@ -113,6 +148,8 @@ class TenantOut(BaseModel):
     name: str
     slug: str
     role: str
+    role_name: str = ""
+    permissions: list[str] = []
 
 
 class MeOut(BaseModel):
@@ -125,6 +162,8 @@ class MemberOut(BaseModel):
     email: str
     full_name: str
     role: str
+    phone: str | None = None
+    last_login_at: datetime | None = None
 
 
 class MembersOut(BaseModel):
@@ -137,7 +176,8 @@ class AddMemberRequest(BaseModel):
     email: str
     password: str = Field(min_length=8, max_length=72)
     full_name: str = ""
-    role: str = ROLE_STAFF
+    role: str = ROLE_SECURITY
+    phone: str = ""
 
     _norm_email = field_validator("email")(_validate_email)
     _norm_role = field_validator("role")(_validate_role)
@@ -314,6 +354,14 @@ class AgentConfigOut(BaseModel):
     tenant_id: str
     tenant_name: str
     cameras: list[CameraOut]
+    #: Alert thresholds/toggles ("Правила срабатывания").
+    rules: dict = {}
+    #: Store hours: {"open_time": "09:00", "close_time": "21:00"}.
+    store: dict = {}
+    #: Employee gallery: [{"id", "name", "embeddings": [[float, ...], ...]}].
+    employees: list[dict] = []
+    #: True once the store's POS sends receipts (enables checkout cross-checks).
+    pos_enabled: bool = False
 
 
 class EventIn(BaseModel):
@@ -327,6 +375,8 @@ class EventIn(BaseModel):
     track_id: int | None = None
     score: float | None = None
     ts: datetime | None = None
+    employee_id: str | None = None
+    duration_sec: float | None = None
 
 
 class EventOut(BaseModel):
@@ -341,6 +391,11 @@ class EventOut(BaseModel):
     ts: datetime
     created_at: datetime
     has_clip: bool
+    status: str = "new"
+    category: str = "theft"
+    employee_id: str | None = None
+    employee_name: str | None = None
+    duration_sec: float | None = None
 
 
 class EventsOut(BaseModel):
@@ -353,6 +408,15 @@ class TelegramConfigIn(BaseModel):
     enabled: bool = False
     bot_token: str = Field(default="", max_length=200)
     chat_id: str = Field(default="", max_length=64)
+    format: str = Field(default="clip", pattern="^(clip|photo|text)$")
+    buttons: bool = True
+    include_link: bool = True
+    notify_offline: bool = True
+    remind_min: int = Field(default=15, ge=0, le=1440)
+    quiet_enabled: bool = False
+    quiet_from: str = Field(default="22:00", pattern=r"^\d{2}:\d{2}$")
+    quiet_to: str = Field(default="08:00", pattern=r"^\d{2}:\d{2}$")
+    language: str = Field(default="ru", pattern="^(ru|uz|en)$")
 
 
 class TelegramConfigOut(BaseModel):
@@ -361,6 +425,17 @@ class TelegramConfigOut(BaseModel):
     enabled: bool
     chat_id: str
     token_set: bool
+    bot_username: str = ""
+    format: str = "clip"
+    buttons: bool = True
+    include_link: bool = True
+    notify_offline: bool = True
+    remind_min: int = 15
+    quiet_enabled: bool = False
+    quiet_from: str = "22:00"
+    quiet_to: str = "08:00"
+    language: str = "ru"
+    last_delivered_at: datetime | None = None
 
 
 def _validate_webhook_url(value: str) -> str:

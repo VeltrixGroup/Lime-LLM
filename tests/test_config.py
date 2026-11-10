@@ -80,8 +80,9 @@ def test_load_config_defaults(tmp_path: Path) -> None:
     assert cam.zones_file is None
 
     assert cfg.detector.model == "auto"
-    assert cfg.detector.conf == 0.25
-    assert cfg.detector.imgsz == 0
+    assert cfg.detector.conf == 0.45
+    assert cfg.detector.new_track_conf == 0.6
+    assert cfg.detector.imgsz == 640
     assert cfg.detector.device == "auto"
 
     assert cfg.action.weights == "models/action.pt"

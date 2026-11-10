@@ -114,7 +114,7 @@ def test_live_session_raises_pocket_event(monkeypatch) -> None:
     )
     session.start()
     try:
-        event, frames, _fps, _cam = alert_queue.get(timeout=5.0)
+        event, frames, _fps, _cam, _port = alert_queue.get(timeout=5.0)
     finally:
         session.stop()
     assert event.kind == "pocket"

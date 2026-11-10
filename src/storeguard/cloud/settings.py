@@ -22,9 +22,10 @@ class CloudSettings(BaseSettings):
         extra="ignore",
     )
 
-    #: SQLAlchemy URL. SQLite by default for local dev; use Postgres in prod,
-    #: e.g. ``postgresql+psycopg://user:pass@host/storeguard``.
-    database_url: str = "sqlite:///./storeguard_cloud.db"
+    #: SQLAlchemy URL. Postgres from ``docker-compose.yml`` (``make db-up``).
+    #: Any SQLAlchemy URL works, e.g. ``sqlite:///./storeguard_cloud.db`` for
+    #: a throwaway file database.
+    database_url: str = "postgresql+psycopg://storeguard:storeguard@127.0.0.1:5432/storeguard"
 
     #: Secret used to sign session cookies. CHANGE THIS in production — a
     #: leaked/guessable key lets anyone forge a logged-in session.

@@ -15,7 +15,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from storeguard.cloud.db import get_db
-from storeguard.cloud.models import ROLE_OWNER, AgentKey, Membership, User
+from storeguard.cloud.models import (
+    DEFAULT_ROLES,
+    PERMISSIONS,
+    ROLE_OWNER,
+    ROLE_SECURITY,
+    ROLE_STAFF,
+    AgentKey,
+    Membership,
+    Role,
+    User,
+)
 from storeguard.cloud.security import hash_token
 
 _USER_KEY = "user_id"
@@ -71,6 +81,58 @@ def current_membership(
     if membership is None:
         raise HTTPException(status_code=403, detail="not a member of this tenant")
     return membership
+
+
+def ensure_system_roles(db: Session, tenant_id: str) -> dict[str, Role]:
+    """Create any missing built-in :class:`Role` rows for a tenant; return all roles."""
+    roles = {r.key: r for r in db.scalars(select(Role).where(Role.tenant_id == tenant_id))}
+    added = False
+    for key, spec in DEFAULT_ROLES.items():
+        if key not in roles:
+            role = Role(
+                tenant_id=tenant_id,
+                key=key,
+                name=spec["name"],
+                color=spec["color"],
+                permissions=list(spec["permissions"]),
+                is_system=True,
+            )
+            db.add(role)
+            roles[key] = role
+            added = True
+    if added:
+        db.flush()
+    return roles
+
+
+def permissions_of(db: Session, membership: Membership) -> set[str]:
+    """The permission keys a membership holds (the owner holds all)."""
+    if membership.role == ROLE_OWNER:
+        return set(PERMISSIONS)
+    key = ROLE_SECURITY if membership.role == ROLE_STAFF else membership.role
+    role = db.scalar(
+        select(Role).where(Role.tenant_id == membership.tenant_id, Role.key == key)
+    )
+    if role is None:
+        spec = DEFAULT_ROLES.get(key)
+        return set(spec["permissions"]) if spec else set()
+    return set(role.permissions or [])
+
+
+def require_perm(perm: str):
+    """Dependency factory: 403 unless the caller's role holds ``perm``."""
+    if perm not in PERMISSIONS:
+        raise ValueError(f"unknown permission {perm!r}")
+
+    def _dep(
+        db: Session = Depends(get_db),
+        membership: Membership = Depends(current_membership),
+    ) -> Membership:
+        if perm not in permissions_of(db, membership):
+            raise HTTPException(status_code=403, detail=f"permission '{perm}' required")
+        return membership
+
+    return _dep
 
 
 def require_owner(

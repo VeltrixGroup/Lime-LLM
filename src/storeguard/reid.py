@@ -1,478 +1,290 @@
-"""Cross-camera person re-identification: one global id per person.
+"""Cross-camera person identity: one person keeps one id on every camera.
 
-ByteTrack ids are per camera (and per track — a person lost behind a shelf
-comes back with a new one). This module gives each person a *global* id that
-is shared by every camera of the store:
+Every camera's tracker hands out its own local track ids. This module maps
+each ``(camera, local id)`` to a *global* id shared by all cameras, by
+comparing appearance embeddings:
 
-* :class:`AppearanceEncoder` turns a person crop into an appearance
-  signature: a deep embedding (ImageNet ResNet by default, or any TorchScript
-  person-ReID model) plus clothing color histograms of the upper and lower
-  body.
-* :class:`IdentityRegistry` is shared by all cameras. It keeps a small
-  gallery of signatures per global id and, when a camera starts a new local
-  track, matches it against people seen recently. A person who was ``id 1``
-  on the hall camera is ``id 1`` again on the checkout camera, and again
-  after a ByteTrack id switch on the same camera.
+* :class:`IdentityRegistry` — one per group of cameras (the dashboard creates
+  one per "connect cameras" batch). Holds every identity seen recently with a
+  small bank of appearance features, plus shared state such as "paid".
+* :class:`CameraIdentities` — one per camera. Embeds each visible track,
+  asks the registry for a global id and rewrites the tracks' ids.
 
-torch / torchvision are imported lazily so importing this module stays cheap.
+A new local track is matched against identities *not* currently visible on
+the same camera (one person can't be in two places in one view), so a person
+walking from camera 1 to camera 2 — or re-appearing on camera 1 after an
+occlusion that made ByteTrack start a new track — gets their old id back.
+For its first few frames a mapping is provisional and re-checked with the
+averaged feature, which fixes most first-frame mismatches (motion blur,
+half-visible body).
+
+This module is pure numpy: the deep embedding model lives in
+:mod:`storeguard.detector` and is passed in as a callable. Without one, an
+HSV colour histogram is used — weaker, but dependency-free.
 """
 
 from __future__ import annotations
 
 import threading
-import uuid
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
-
-import cv2
 import numpy as np
-from rich.console import Console
 
-from .config import ReidCfg
-from .types import Track
+from storeguard.types import Track
 
-_console = Console()
+#: ``(frame, xyxy boxes) -> one normalised feature per box``
+Encoder = Callable[[np.ndarray, list[tuple[float, float, float, float]]], list[np.ndarray]]
 
-#: Weight of the deep embedding vs. the color histograms in the combined
-#: similarity (they sum to 1, so the similarity stays in 0..1).
-_W_DEEP = 0.6
-_W_COLOR = 0.4
-
-#: Crops smaller than this (pixels) are too blurry to describe anyone.
-_MIN_BOX_H = 40
-_MIN_BOX_W = 16
-
-#: Deep embeddings of *any* two people are fairly similar in raw ImageNet
-#: feature space. Subtracting the running mean of everything seen so far
-#: ("centering") is what makes cosine similarity discriminate between
-#: people; until that mean has seen enough crops no match is attempted.
-_MEAN_WARMUP = 30
-
-#: A new local track is "unconfirmed" for its first few embeddings: during
-#: that window it may still be merged into a better-matching existing id
-#: (its very first crop is often a partial body entering the frame).
-_CONFIRM_AFTER = 5
-#: Confirmed tracks refresh their gallery on every Nth update only.
-_REFRESH_EVERY = 5
-#: A local track missing for this long is unbound (its global id lives on).
-_LOST_SEC = 5.0
-#: Gallery size per identity, and how different a new signature must be
-#: from the stored ones to be worth keeping.
-_GALLERY_MAX = 20
-_GALLERY_NOVELTY = 0.92
-
-
-@dataclass
-class Signature:
-    """Appearance of one person crop.
-
-    ``deep`` is L2-normalized (or ``None`` when no deep model is available);
-    ``color`` holds square-rooted histograms, L2-normalized, so the dot
-    product of two of them is their Bhattacharyya coefficient.
-    """
-
-    deep: np.ndarray | None
-    color: np.ndarray
-
-
-def _color_signature(crop: np.ndarray) -> np.ndarray:
-    """Hue/saturation + brightness histograms of the torso and the legs."""
-    h, w = crop.shape[:2]
-    # Central columns only: the box edges are mostly shelf / floor.
-    x0, x1 = int(w * 0.2), max(int(w * 0.8), int(w * 0.2) + 1)
-    parts = (
-        crop[int(h * 0.15) : max(int(h * 0.55), int(h * 0.15) + 1), x0:x1],
-        crop[int(h * 0.55) : max(int(h * 0.95), int(h * 0.55) + 1), x0:x1],
-    )
-    out = []
-    for part in parts:
-        hsv = cv2.cvtColor(part, cv2.COLOR_BGR2HSV)
-        # Hue is meaningless for grey / black / white clothes — describe those
-        # by brightness instead.
-        colored = cv2.inRange(hsv, (0, 50, 40), (180, 256, 256))
-        hs = cv2.calcHist([hsv], [0, 1], colored, [16, 4], [0, 180, 50, 256]).ravel()
-        v = cv2.calcHist([hsv], [2], cv2.bitwise_not(colored), [8], [0, 256]).ravel()
-        hist = np.concatenate([hs, v]).astype(np.float32)
-        total = float(hist.sum())
-        if total > 0:
-            hist /= total
-        hist = np.sqrt(hist)
-        norm = float(np.linalg.norm(hist))
-        if norm > 0:
-            hist /= norm
-        out.append(hist)
-    return (np.concatenate(out) / np.sqrt(2.0)).astype(np.float32)
-
-
-class AppearanceEncoder:
-    """Person crop -> :class:`Signature`. One instance is shared by all cameras."""
-
-    _INPUT_HW = (256, 128)
-
-    def __init__(self, cfg: ReidCfg, device: str) -> None:
-        self.cfg = cfg
-        self.device = device
-        self._lock = threading.Lock()
-        self._model = None
-        self._torch = None
-        try:
-            self._model = self._load_model()
-        except Exception as exc:  # noqa: BLE001 — degrade to color-only ReID
-            _console.print(
-                f"[yellow]ReID: could not load the appearance model ({exc}); "
-                "matching people across cameras by clothing colors only.[/yellow]"
-            )
-
-    def _load_model(self):
-        import torch
-
-        self._torch = torch
-        name = self.cfg.model
-        if name == "auto":
-            name = "resnet50" if self.device.startswith("cuda") else "resnet18"
-        if name in ("resnet18", "resnet50"):
-            import torchvision
-
-            weights = {
-                "resnet18": torchvision.models.ResNet18_Weights.DEFAULT,
-                "resnet50": torchvision.models.ResNet50_Weights.DEFAULT,
-            }[name]
-            model = getattr(torchvision.models, name)(weights=weights)
-            model.fc = torch.nn.Identity()
-        else:
-            model = torch.jit.load(name, map_location=self.device)
-        model = model.to(self.device).eval()
-        _console.print(f"[green]ReID model: {name} on {self.device}[/green]")
-        return model
-
-    def encode(self, frame: np.ndarray, boxes: list[tuple[float, float, float, float]]) -> list[Signature | None]:
-        """Signatures for ``boxes`` in ``frame`` (``None`` for unusable crops)."""
-        fh, fw = frame.shape[:2]
-        crops: list[np.ndarray | None] = []
-        for x1, y1, x2, y2 in boxes:
-            xa, ya = max(0, int(x1)), max(0, int(y1))
-            xb, yb = min(fw, int(x2)), min(fh, int(y2))
-            if yb - ya < _MIN_BOX_H or xb - xa < _MIN_BOX_W:
-                crops.append(None)
-            else:
-                crops.append(frame[ya:yb, xa:xb])
-
-        valid = [i for i, c in enumerate(crops) if c is not None]
-        out: list[Signature | None] = [None] * len(boxes)
-        if not valid:
-            return out
-        deep = self._deep([crops[i] for i in valid]) if self._model is not None else None
-        for k, i in enumerate(valid):
-            out[i] = Signature(
-                deep=None if deep is None else deep[k],
-                color=_color_signature(crops[i]),
-            )
-        return out
-
-    def _deep(self, crops: list[np.ndarray]) -> np.ndarray | None:
-        torch = self._torch
-        h, w = self._INPUT_HW
-        batch = np.stack(
-            [cv2.cvtColor(cv2.resize(c, (w, h), interpolation=cv2.INTER_LINEAR), cv2.COLOR_BGR2RGB) for c in crops]
-        ).astype(np.float32) / 255.0
-        batch = (batch - np.array([0.485, 0.456, 0.406], np.float32)) / np.array(
-            [0.229, 0.224, 0.225], np.float32
-        )
-        try:
-            with self._lock, torch.inference_mode():
-                x = torch.from_numpy(batch.transpose(0, 3, 1, 2).copy()).to(self.device)
-                feats = self._model(x).float().cpu().numpy()
-        except Exception as exc:  # noqa: BLE001 — never kill the camera loop
-            _console.print(f"[yellow]ReID: embedding failed ({exc})[/yellow]")
-            return None
-        feats = feats.reshape(len(crops), -1)
-        norms = np.linalg.norm(feats, axis=1, keepdims=True)
-        return feats / np.maximum(norms, 1e-6)
-
-
-_encoders: dict[tuple[str, str], AppearanceEncoder] = {}
-_encoders_lock = threading.Lock()
-
-
-def get_encoder(cfg: ReidCfg, device: str) -> AppearanceEncoder:
-    """Process-wide encoder per (model, device), so N cameras share one model."""
-    key = (cfg.model, device)
-    with _encoders_lock:
-        enc = _encoders.get(key)
-        if enc is None:
-            enc = AppearanceEncoder(cfg, device)
-            _encoders[key] = enc
-        return enc
+#: Colour histograms are far less discriminative than a ReID network — two
+#: people in dark jackets easily score 0.8 — so they need a stricter bar.
+HISTOGRAM_THRESHOLD = 0.9
 
 
 @dataclass
 class _Identity:
     gid: int
-    last_seen: float
-    gallery: list[Signature] = field(default_factory=list)
-
-
-@dataclass
-class _Binding:
-    """One camera's local track currently shown as global id ``gid``."""
-
-    gid: int
-    last_seen: float
-    updates: int = 0
-    embeddings: int = 0
-    confirmed: bool = False
-    #: The identity was created for this track (not matched to anyone), so
-    #: it may still be folded into an existing id while unconfirmed.
-    private: bool = True
+    bank: deque = field(default_factory=lambda: deque(maxlen=24))
+    last_seen: float = 0.0
+    paid: bool = False
 
 
 class IdentityRegistry:
-    """Global person ids shared by every camera of one dashboard / runner.
+    """Global ids shared by a group of cameras (thread-safe)."""
 
-    Thread-safe: every camera thread calls :meth:`assign` on the same
-    instance. Camera keys are arbitrary strings (session ids, camera names).
-    """
-
-    def __init__(self, cfg: ReidCfg | None = None) -> None:
-        self.cfg = cfg or ReidCfg()
-        #: Distinguishes this registry's ids from earlier runs: ids restart at
-        #: 1 on every reconnect, so "person 1" alone would merge different
-        #: people in the cabinet's event history.
-        self.run_id = uuid.uuid4().hex[:8]
+    def __init__(self, threshold: float = 0.6, forget_after_sec: float = 900.0) -> None:
+        self.threshold = float(threshold)
+        self.forget_after_sec = float(forget_after_sec)
         self._lock = threading.Lock()
-        self._next_gid = 1
-        self._identities: dict[int, _Identity] = {}
-        self._bindings: dict[str, dict[int, _Binding]] = {}
-        self._mean: np.ndarray | None = None
-        self._mean_n = 0
+        self._ids: dict[int, _Identity] = {}
+        self._next = 1
 
-    # -- queries ---------------------------------------------------------
-
-    def wants_signature(self, camera: str, local_id: int) -> bool:
-        """Whether :meth:`assign` would use a fresh signature for this track."""
-        with self._lock:
-            b = self._bindings.get(camera, {}).get(local_id)
-        if b is None or not b.confirmed:
-            return True
-        return b.updates % _REFRESH_EVERY == 0
-
-    def person_id(self, gid: int) -> str:
-        """Store-wide person id for events, unique across runs (e.g. ``3f9a1c2e-7``)."""
-        return f"{self.run_id}-{gid}"
-
-    # -- lifecycle -------------------------------------------------------
-
-    def forget_camera(self, camera: str) -> None:
-        """Unbind every local track of ``camera`` (its tracker was reset)."""
-        with self._lock:
-            self._bindings.pop(camera, None)
-
-    # -- core ------------------------------------------------------------
-
-    def assign(
+    def match(
         self,
-        camera: str,
-        tracks: list[Track],
-        signatures: dict[int, Signature],
+        feature: np.ndarray | None,
         ts: float,
-    ) -> dict[int, int]:
-        """Map this frame's local track ids to global ids.
+        exclude: set[int],
+        current: int | None = None,
+        threshold: float | None = None,
+    ) -> int:
+        """Return the best-matching global id for ``feature``, creating one if needed.
 
         Args:
-            camera: Key of the camera the tracks come from.
-            tracks: All tracks of the current frame (local ByteTrack ids).
-            signatures: Appearance of some of them, by local id (see
-                :meth:`wants_signature`); tracks without one keep whatever
-                id they already have, or get a new one.
-            ts: Frame time (unix seconds).
+            feature: Normalised appearance feature (``None`` = no appearance
+                information, always a new identity).
+            ts: Current time (seconds).
+            exclude: Ids that must not be returned (visible elsewhere in the
+                same camera view).
+            current: The provisional id this track already holds, if any. It
+                is kept unless another identity matches better; if it is
+                dropped and nothing else ever used it, its number is reused.
+            threshold: Override of :attr:`threshold` (e.g. for histograms).
         """
+        thr = self.threshold if threshold is None else threshold
         with self._lock:
-            for sig in signatures.values():
-                if sig.deep is not None:
-                    self._update_mean(sig.deep)
-
-            self._expire(ts)
-            bindings = self._bindings.setdefault(camera, {})
-            present = {t.track_id for t in tracks}
-            for lid in [lid for lid, b in bindings.items() if lid not in present]:
-                if ts - bindings[lid].last_seen > _LOST_SEC:
-                    del bindings[lid]
-
-            result: dict[int, int] = {}
-            new_ids: list[int] = []
-            for t in tracks:
-                b = bindings.get(t.track_id)
-                if b is None:
-                    new_ids.append(t.track_id)
-                    continue
-                b.last_seen = ts
-                b.updates += 1
-                sig = signatures.get(t.track_id)
-                if sig is not None:
-                    b.embeddings += 1
-                    if not b.confirmed and b.private:
-                        self._try_merge(camera, bindings, b, sig)
-                    self._add_to_gallery(self._identities[b.gid], sig)
-                    if b.embeddings >= _CONFIRM_AFTER:
-                        b.confirmed = True
-                self._identities[b.gid].last_seen = ts
-                result[t.track_id] = b.gid
-
-            self._assign_new(camera, bindings, new_ids, signatures, ts, result)
-            return result
-
-    def _assign_new(
-        self,
-        camera: str,
-        bindings: dict[int, _Binding],
-        new_ids: list[int],
-        signatures: dict[int, Signature],
-        ts: float,
-        result: dict[int, int],
-    ) -> None:
-        taken = {b.gid for b in bindings.values()}
-        pairs: list[tuple[float, int, int]] = []
-        if self._matching_ready():
-            for lid in new_ids:
-                sig = signatures.get(lid)
-                if sig is None:
-                    continue
-                for gid, ident in self._identities.items():
-                    if gid in taken:
+            self._forget(ts)
+            best, best_sim = None, thr
+            if feature is not None:
+                for ident in self._ids.values():
+                    # ``current`` only holds this track's own samples, so it
+                    # would always win; it is the fallback, not a candidate.
+                    if ident.gid in exclude or ident.gid == current or not ident.bank:
                         continue
-                    s = self._similarity(sig, ident)
-                    if s >= self.cfg.threshold:
-                        pairs.append((s, lid, gid))
-        pairs.sort(reverse=True)
-        matched: dict[int, int] = {}
-        used: set[int] = set()
-        for _s, lid, gid in pairs:
-            if lid in matched or gid in used:
-                continue
-            matched[lid] = gid
-            used.add(gid)
+                    sim = self._similarity(ident, feature)
+                    if sim >= best_sim:
+                        best, best_sim = ident.gid, sim
+            if best is not None:
+                if current is not None and current != best:
+                    self._drop_if_unused(current)
+                return best
+            if current is not None and current in self._ids:
+                return current
+            ident = _Identity(gid=self._next, last_seen=ts)
+            self._next += 1
+            self._ids[ident.gid] = ident
+            return ident.gid
 
-        for lid in new_ids:
-            sig = signatures.get(lid)
-            if lid in matched:
-                gid = matched[lid]
-                private = False
-            else:
-                gid = self._next_gid
-                self._next_gid += 1
-                self._identities[gid] = _Identity(gid=gid, last_seen=ts)
-                private = True
-            b = _Binding(gid=gid, last_seen=ts, updates=1, private=private)
-            if sig is not None:
-                b.embeddings = 1
-                self._add_to_gallery(self._identities[gid], sig)
-            self._identities[gid].last_seen = ts
-            bindings[lid] = b
-            result[lid] = gid
+    def observe(self, gid: int, feature: np.ndarray | None, ts: float) -> None:
+        """Record a sighting of ``gid`` (and add ``feature`` to its bank)."""
+        with self._lock:
+            ident = self._ids.get(gid)
+            if ident is None:
+                ident = _Identity(gid=gid)
+                self._ids[gid] = ident
+            ident.last_seen = max(ident.last_seen, ts)
+            if feature is not None:
+                ident.bank.append(feature)
 
-    def _try_merge(
-        self, camera: str, bindings: dict[int, _Binding], b: _Binding, sig: Signature
-    ) -> None:
-        """Fold a young, self-created id into an existing one it matches."""
-        if not self._matching_ready():
+    def feature(self, gid: int) -> np.ndarray | None:
+        """The identity's averaged appearance feature (for staff recognition)."""
+        with self._lock:
+            ident = self._ids.get(gid)
+            if ident is None or not ident.bank:
+                return None
+            return _mean_feature(list(ident.bank))
+
+    def mark_paid(self, gid: int) -> None:
+        with self._lock:
+            if gid in self._ids:
+                self._ids[gid].paid = True
+
+    def is_paid(self, gid: int) -> bool:
+        with self._lock:
+            ident = self._ids.get(gid)
+            return bool(ident and ident.paid)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._ids.clear()
+            self._next = 1
+
+    @staticmethod
+    def _similarity(ident: _Identity, feature: np.ndarray) -> float:
+        bank = np.stack(list(ident.bank))
+        if bank.shape[1] != feature.shape[0]:
+            return -1.0
+        sims = bank @ feature
+        # Mean of the best few, not the single max: one lucky frame of a
+        # similar-looking person shouldn't be enough.
+        k = min(3, len(sims))
+        return float(np.sort(sims)[-k:].mean())
+
+    def _drop_if_unused(self, gid: int) -> None:
+        ident = self._ids.get(gid)
+        if ident is None or len(ident.bank) > 3:
             return
-        own = b.gid
-        shown = sum(1 for cam in self._bindings.values() for x in cam.values() if x.gid == own)
-        if shown > 1:
-            return  # another track already shows this id — not private anymore
-        taken = {x.gid for x in bindings.values()}
-        best_gid, best_s = None, self.cfg.threshold
-        for gid, ident in self._identities.items():
-            if gid == own or gid in taken:
-                continue
-            s = self._similarity(sig, ident)
-            if s >= best_s:
-                best_gid, best_s = gid, s
-        if best_gid is None:
-            return
-        old = self._identities.pop(own)
-        target = self._identities[best_gid]
-        for g in old.gallery:
-            self._add_to_gallery(target, g)
-        b.gid = best_gid
-        b.private = False
+        # Never hand the number out again: per-person state elsewhere (staff
+        # label, paid, timers, visit) is keyed by it and would leak onto a
+        # new person. A gap in the numbering is harmless.
+        del self._ids[gid]
 
-    # -- helpers ---------------------------------------------------------
-
-    def _expire(self, ts: float) -> None:
-        bound = {b.gid for cam in self._bindings.values() for b in cam.values()}
-        for gid in [
-            gid
-            for gid, ident in self._identities.items()
-            if gid not in bound and ts - ident.last_seen > self.cfg.ttl_sec
-        ]:
-            del self._identities[gid]
-
-    def _update_mean(self, deep: np.ndarray) -> None:
-        self._mean_n += 1
-        if self._mean is None or self._mean.shape != deep.shape:
-            self._mean = deep.astype(np.float32).copy()
-            self._mean_n = 1
-            return
-        alpha = max(1.0 / self._mean_n, 0.01)
-        self._mean = (1.0 - alpha) * self._mean + alpha * deep
-
-    def _matching_ready(self) -> bool:
-        # Color-only mode needs no warm-up; deep matching needs a mean.
-        return self._mean is None or self._mean_n >= _MEAN_WARMUP
-
-    def _centered(self, v: np.ndarray) -> np.ndarray:
-        if self._mean is None or self._mean.shape != v.shape:
-            return v
-        c = v - self._mean
-        return c / max(float(np.linalg.norm(c)), 1e-6)
-
-    def _similarity(self, sig: Signature, ident: _Identity) -> float:
-        if not ident.gallery:
-            return 0.0
-        color_s = float(np.max(np.stack([g.color for g in ident.gallery]) @ sig.color))
-        deeps = [g.deep for g in ident.gallery if g.deep is not None]
-        if sig.deep is None or not deeps:
-            return color_s
-        q = self._centered(sig.deep)
-        deep_s = float(np.max(np.stack([self._centered(d) for d in deeps]) @ q))
-        # Centered cosine is in -1..1; clamp so the blend stays in 0..1.
-        return _W_DEEP * max(deep_s, 0.0) + _W_COLOR * color_s
-
-    def _add_to_gallery(self, ident: _Identity, sig: Signature) -> None:
-        for g in ident.gallery:
-            same_color = float(g.color @ sig.color) > _GALLERY_NOVELTY
-            same_deep = (
-                g.deep is None
-                or sig.deep is None
-                or float(g.deep @ sig.deep) > _GALLERY_NOVELTY
-            )
-            if same_color and same_deep:
-                return  # nothing new about this view
-        ident.gallery.append(sig)
-        if len(ident.gallery) > _GALLERY_MAX:
-            ident.gallery.pop(0)
+    def _forget(self, ts: float) -> None:
+        stale = [g for g, i in self._ids.items() if ts - i.last_seen > self.forget_after_sec]
+        for gid in stale:
+            del self._ids[gid]
 
 
-def assign_global_ids(
-    registry: IdentityRegistry,
-    encoder: AppearanceEncoder | None,
-    camera: str,
-    frame: np.ndarray,
-    tracks: list[Track],
-    ts: float,
-) -> list[Track]:
-    """Replace local ByteTrack ids in ``tracks`` with global person ids."""
-    if not tracks:
-        registry.assign(camera, tracks, {}, ts)
-        return tracks
-    need = [t for t in tracks if registry.wants_signature(camera, t.track_id)]
-    signatures: dict[int, Signature] = {}
-    if need and encoder is not None:
-        for t, sig in zip(need, encoder.encode(frame, [t.box for t in need])):
-            if sig is not None:
-                signatures[t.track_id] = sig
-    mapping = registry.assign(camera, tracks, signatures, ts)
-    return [
-        Track(track_id=mapping.get(t.track_id, t.track_id), box=t.box, conf=t.conf)
-        for t in tracks
-    ]
+def histogram_encoder(
+    frame: np.ndarray, boxes: list[tuple[float, float, float, float]]
+) -> list[np.ndarray | None]:
+    """Fallback appearance feature: HSV histograms of upper and lower body."""
+    import cv2
+
+    h, w = frame.shape[:2]
+    out: list[np.ndarray | None] = []
+    for x1, y1, x2, y2 in boxes:
+        xa, ya = max(0, int(x1)), max(0, int(y1))
+        xb, yb = min(w, int(x2)), min(h, int(y2))
+        if xb - xa < 4 or yb - ya < 8:
+            out.append(None)
+            continue
+        crop = cv2.cvtColor(frame[ya:yb, xa:xb], cv2.COLOR_BGR2HSV)
+        mid = (yb - ya) // 2
+        parts = []
+        for part in (crop[:mid], crop[mid:]):
+            hist = cv2.calcHist([part], [0, 1], None, [16, 8], [0, 180, 0, 256])
+            parts.append(hist.reshape(-1))
+        feat = np.sqrt(np.concatenate(parts)).astype(np.float32)
+        n = float(np.linalg.norm(feat))
+        out.append(feat / n if n > 1e-6 else None)
+    return out
+
+
+@dataclass
+class _Local:
+    gid: int
+    samples: list[np.ndarray] = field(default_factory=list)
+    seen: int = 0
+    last_ts: float = 0.0
+
+
+class CameraIdentities:
+    """Rewrite one camera's local track ids to registry-wide global ids."""
+
+    #: Observations during which a new mapping is still re-checked.
+    provisional_frames: int = 4
+    #: Refresh a settled track's appearance every N sightings.
+    refresh_every: int = 8
+    #: Forget a local track this many seconds after it disappears.
+    forget_after_sec: float = 30.0
+
+    def __init__(self, registry: IdentityRegistry, encoder: Encoder | None = None) -> None:
+        self.registry = registry
+        self._encoder = encoder
+        self._threshold = None if encoder is not None else HISTOGRAM_THRESHOLD
+        self._locals: dict[int, _Local] = {}
+
+    def reset(self) -> None:
+        self._locals.clear()
+
+    def update(self, frame: np.ndarray, tracks: list[Track], ts: float) -> list[Track]:
+        """Return ``tracks`` with ``track_id`` replaced by global ids."""
+        if not tracks:
+            self._forget(ts)
+            return []
+
+        need = [
+            i
+            for i, t in enumerate(tracks)
+            if (loc := self._locals.get(t.track_id)) is None
+            or loc.seen < self.provisional_frames
+            or loc.seen % self.refresh_every == 0
+        ]
+        feats: dict[int, np.ndarray | None] = {}
+        if need:
+            got = self._encode(frame, [tracks[i].box for i in need])
+            feats = dict(zip(need, got))
+
+        visible = {
+            loc.gid for t in tracks if (loc := self._locals.get(t.track_id)) is not None
+        }
+        out: list[Track] = []
+        for i, t in enumerate(tracks):
+            feat = feats.get(i)
+            loc = self._locals.get(t.track_id)
+            if loc is None:
+                gid = self.registry.match(feat, ts, exclude=visible, threshold=self._threshold)
+                loc = _Local(gid=gid)
+                self._locals[t.track_id] = loc
+                visible.add(gid)
+            elif loc.seen < self.provisional_frames and feat is not None:
+                mean = _mean_feature([*loc.samples, feat])
+                gid = self.registry.match(
+                    mean, ts, exclude=visible - {loc.gid}, current=loc.gid,
+                    threshold=self._threshold,
+                )
+                if gid != loc.gid:
+                    visible.discard(loc.gid)
+                    visible.add(gid)
+                    loc.gid = gid
+            loc.seen += 1
+            loc.last_ts = ts
+            if feat is not None and loc.seen <= self.provisional_frames:
+                loc.samples.append(feat)
+            self.registry.observe(loc.gid, feat, ts)
+            out.append(Track(track_id=loc.gid, box=t.box, conf=t.conf))
+        self._forget(ts)
+        return out
+
+    def _encode(
+        self, frame: np.ndarray, boxes: list[tuple[float, float, float, float]]
+    ) -> list[np.ndarray | None]:
+        if self._encoder is None:
+            return histogram_encoder(frame, boxes)
+        try:
+            return list(self._encoder(frame, boxes))
+        except Exception:  # noqa: BLE001 — a bad crop must not stop tracking
+            # No histogram fallback here: mixing feature types in one bank
+            # would make the similarities meaningless.
+            return [None] * len(boxes)
+
+    def _forget(self, ts: float) -> None:
+        stale = [k for k, v in self._locals.items() if ts - v.last_ts > self.forget_after_sec]
+        for key in stale:
+            del self._locals[key]
+
+
+def _mean_feature(feats: list[np.ndarray]) -> np.ndarray:
+    m = np.mean(np.stack(feats), axis=0)
+    n = float(np.linalg.norm(m))
+    return m / n if n > 1e-12 else m

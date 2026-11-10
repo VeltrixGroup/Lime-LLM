@@ -462,8 +462,12 @@ onUnmounted(() => {
   <div class="grain"></div>
   <main class="shell">
     <header class="top">
-      <h1 class="brand">storeguard</h1>
-      <p class="tagline">Person detection on your cameras</p>
+      <h1 class="brand">
+        <span style="width: 34px; height: 34px; border-radius: 10px; background: var(--lime); display: inline-flex; align-items: center; justify-content: center">
+          <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0B0E0A" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.5"></circle><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"></path></svg>
+        </span>Лайм AI
+      </h1>
+      <p class="tagline">Детекция людей на камерах · <a v-if="isProxied" href="/cameras" style="color: var(--lime)">в панель управления</a></p>
     </header>
 
     <section class="stage" aria-label="Detection preview">

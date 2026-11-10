@@ -3,6 +3,12 @@
 RTSP sources are opened through FFmpeg over TCP (more reliable than UDP on
 store WiFi) and automatically reconnected after failures.  Video files play
 once and yield ``None`` at end of stream.
+
+With ``latest_only=True`` a live source is decoded on a background thread
+and :meth:`VideoStream.read` returns the newest decoded frame, dropping any
+the caller was too slow for. Without it, a consumer slower than the camera
+(detection on a busy machine) reads from FFmpeg's ever-growing backlog, so
+the picture falls further and further behind real time.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ import numpy as np
 def _open_ffmpeg(source: str) -> cv2.VideoCapture:
     """Open a network source via FFmpeg, with hardware decoding if available.
 
-    A 4MP Hikvision main stream costs a whole CPU core per camera to decode in
+    A 4MP main stream costs a whole CPU core per camera to decode in
     software; ``VIDEO_ACCELERATION_ANY`` lets OpenCV use D3D11 / VAAPI / etc.
     when the build supports it and silently falls back to software otherwise.
     """
@@ -47,12 +53,16 @@ def _open_ffmpeg(source: str) -> cv2.VideoCapture:
 class VideoStream:
     """cv2.VideoCapture wrapper: RTSP (with auto-reconnect) or video file."""
 
-    def __init__(self, source: str, reconnect_sec: float = 5.0) -> None:
+    def __init__(
+        self, source: str, reconnect_sec: float = 5.0, latest_only: bool = False
+    ) -> None:
         """Open ``source`` (RTSP URL or video file path).
 
         For network sources, a failed read releases the capture and a
         reopen is attempted no sooner than ``reconnect_sec`` seconds later;
-        meanwhile :meth:`read` returns ``None``.
+        meanwhile :meth:`read` returns ``None``. ``latest_only`` (ignored for
+        files) decodes on a background thread and always hands out the
+        newest frame — see the module docstring.
         """
         self.source = source
         self.reconnect_sec = reconnect_sec
@@ -61,6 +71,18 @@ class VideoStream:
         self._cap: cv2.VideoCapture | None = None
         self._next_reconnect: float = 0.0  # monotonic deadline for next reopen
         self._open()
+
+        self._grabber: threading.Thread | None = None
+        if latest_only and not self._is_file:
+            self._cond = threading.Condition()
+            self._latest: np.ndarray | None = None
+            self._latest_seq = 0
+            self._taken_seq = 0
+            self._closed = False
+            self._grabber = threading.Thread(
+                target=self._grab_loop, name="video-grab", daemon=True
+            )
+            self._grabber.start()
 
     @property
     def is_file(self) -> bool:
@@ -89,13 +111,45 @@ class VideoStream:
             if not self._is_file:
                 self._next_reconnect = time.monotonic() + self.reconnect_sec
 
-    def read(self) -> np.ndarray | None:
+    def read(self, timeout: float = 0.5) -> np.ndarray | None:
         """Return the next BGR frame, or ``None``.
 
         Files: ``None`` means end of file.  Network sources: ``None`` means
         the stream is currently down; the capture is reopened automatically
         after ``reconnect_sec`` and reads resume once frames flow again.
+        In ``latest_only`` mode this waits up to ``timeout`` seconds for a
+        frame newer than the previous one.
         """
+        if self._grabber is None:
+            return self._read_direct()
+        with self._cond:
+            self._cond.wait_for(
+                lambda: self._closed or self._latest_seq > self._taken_seq, timeout
+            )
+            if self._closed or self._latest_seq <= self._taken_seq:
+                return None
+            self._taken_seq = self._latest_seq
+            return self._latest
+
+    def _grab_loop(self) -> None:
+        while True:
+            with self._cond:
+                if self._closed:
+                    break
+            frame = self._read_direct()
+            if frame is None:
+                time.sleep(0.05)  # stream down: wait for the reconnect deadline
+                continue
+            with self._cond:
+                self._latest = frame
+                self._latest_seq += 1
+                self._cond.notify_all()
+        # The capture belongs to this thread; only it may release it.
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _read_direct(self) -> np.ndarray | None:
         if self._cap is None:
             if self._is_file:
                 return None
@@ -120,68 +174,14 @@ class VideoStream:
 
     def release(self) -> None:
         """Release the underlying capture (safe to call more than once)."""
+        if self._grabber is not None:
+            with self._cond:
+                self._closed = True
+                self._cond.notify_all()
+            # The grabber releases the capture itself once its current
+            # (possibly blocking) network read returns.
+            self._grabber.join(timeout=2.0)
+            return
         if self._cap is not None:
             self._cap.release()
             self._cap = None
-
-
-class LatestFrameReader:
-    """Read a live source on its own thread, keeping only the newest frame.
-
-    Reading a camera synchronously from the detection loop means every frame
-    the camera sends has to be decoded *and* wait its turn behind detection:
-    once detection is slower than the camera, frames queue up in FFmpeg's
-    buffer and the picture lags further and further behind reality (and the
-    HUD fps collapses). This drains the stream as fast as it arrives and
-    hands the consumer only the latest frame, so detection always runs on
-    "now" and simply skips whatever it had no time for.
-    """
-
-    def __init__(self, stream: VideoStream) -> None:
-        """Start draining ``stream`` (a network :class:`VideoStream`); owns it from now on."""
-        self._stream = stream
-        self._cond = threading.Condition()
-        self._frame: np.ndarray | None = None
-        self._seq = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name=f"grab-{id(self):x}", daemon=True
-        )
-        self._thread.start()
-
-    @property
-    def fps(self) -> float:
-        return self._stream.fps
-
-    def _run(self) -> None:
-        try:
-            while not self._stop.is_set():
-                frame = self._stream.read()
-                if frame is None:
-                    # Down / reconnecting — VideoStream handles the backoff.
-                    self._stop.wait(0.05)
-                    continue
-                with self._cond:
-                    self._frame = frame
-                    self._seq += 1
-                    self._cond.notify_all()
-        finally:
-            # Released here, on the thread that reads it: a read blocked on a
-            # dead camera can outlive release()'s join timeout, and freeing
-            # the capture underneath it would crash FFmpeg.
-            self._stream.release()
-
-    def read_latest(self, after_seq: int, timeout: float = 0.5) -> tuple[np.ndarray, int] | None:
-        """Newest frame with sequence number > ``after_seq`` (or ``None`` on timeout)."""
-        with self._cond:
-            if self._seq <= after_seq:
-                self._cond.wait(timeout=timeout)
-            if self._frame is None or self._seq <= after_seq:
-                return None
-            return self._frame, self._seq
-
-    def release(self) -> None:
-        self._stop.set()
-        with self._cond:
-            self._cond.notify_all()
-        self._thread.join(timeout=5.0)

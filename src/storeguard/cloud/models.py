@@ -13,15 +13,95 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from storeguard.cloud.db import Base
 
-#: Membership roles.
+#: Built-in role keys. Every tenant also gets a :class:`Role` row for each of
+#: these (seeded on first use), and can add its own custom roles.
 ROLE_OWNER = "owner"
+ROLE_MANAGER = "manager"
+ROLE_SECURITY = "security"
+ROLE_ANALYST = "analyst"
+#: Legacy role from before custom roles; stored rows were migrated to
+#: ``security`` (same rights: watch cameras and events, nothing else), and the
+#: API still accepts it as an alias.
 ROLE_STAFF = "staff"
-ROLES = (ROLE_OWNER, ROLE_STAFF)
+SYSTEM_ROLES = (ROLE_OWNER, ROLE_MANAGER, ROLE_SECURITY, ROLE_ANALYST)
+ROLES = SYSTEM_ROLES  # kept for older imports
+
+#: Every permission a role can hold, grouped as on the "Доступ и роли" screen.
+PERMISSIONS = (
+    "live",         # Смотреть камеры онлайн
+    "archive",      # Смотреть архив и клипы
+    "cams_edit",    # Добавлять и удалять камеры
+    "tg",           # Получать клипы в Telegram
+    "resolve",      # Подтверждать / отклонять инциденты
+    "download",     # Скачивать клипы
+    "staff_stats",  # Видеть статистику сотрудников
+    "staff_tag",    # Отмечать лица сотрудников
+    "analytics",    # Видеть аналитику
+    "export",       # Экспортировать отчёты
+    "users",        # Управлять пользователями и ролями
+    "settings",     # Настройки магазина и лицензия
+)
+
+#: Default permissions and display data of the built-in roles (owner has all).
+DEFAULT_ROLES: dict[str, dict] = {
+    ROLE_OWNER: {"name": "Владелец", "color": "#B6F24A", "permissions": list(PERMISSIONS)},
+    ROLE_MANAGER: {
+        "name": "Управляющий",
+        "color": "#8AB4FF",
+        "permissions": [
+            "live", "archive", "cams_edit", "tg", "resolve", "download",
+            "staff_stats", "staff_tag", "analytics", "export",
+        ],
+    },
+    ROLE_SECURITY: {
+        "name": "Охрана",
+        "color": "#FF8F5A",
+        "permissions": ["live", "archive", "tg", "resolve", "download"],
+    },
+    ROLE_ANALYST: {
+        "name": "Аналитик",
+        "color": "#FFC53D",
+        "permissions": ["staff_stats", "analytics", "export"],
+    },
+}
+
+#: Incident review states.
+INCIDENT_NEW = "new"
+INCIDENT_CONFIRMED = "confirmed"
+INCIDENT_FALSE = "false"
+INCIDENT_STATUSES = (INCIDENT_NEW, INCIDENT_CONFIRMED, INCIDENT_FALSE)
+
+#: Event ``kind`` -> incident category shown in the UI filter chips.
+KIND_CATEGORY: dict[str, str] = {
+    "exit_no_pay": "theft",
+    "pocket": "theft",
+    "take_cash": "cash",
+    "pos_mismatch": "cash",
+    "refund_no_receipt": "refund",
+    "on_phone": "phone",
+    "idle": "idle",
+    "camera_offline": "offline",
+}
+CATEGORIES = ("theft", "cash", "refund", "phone", "idle", "offline")
+
+
+def category_of(kind: str) -> str:
+    """UI category of an event kind (unknown kinds count as theft)."""
+    return KIND_CATEGORY.get(kind, "theft")
 
 
 def _uuid() -> str:
@@ -40,6 +120,12 @@ class Tenant(Base):
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     slug: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    address: Mapped[str] = mapped_column(String(300), default="", nullable=False)
+    #: Store hours ("HH:MM"); employee control only runs inside them.
+    open_time: Mapped[str] = mapped_column(String(5), default="09:00", nullable=False)
+    close_time: Mapped[str] = mapped_column(String(5), default="21:00", nullable=False)
+    #: Secret for the POS receipt webhook (``POST /api/pos/receipts``).
+    pos_token: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
@@ -69,9 +155,16 @@ class User(Base):
     )
     password_hash: Mapped[str] = mapped_column(String(200), nullable=False)
     full_name: Mapped[str] = mapped_column(String(200), default="", nullable=False)
+    #: Optional; login accepts it instead of the email.
+    phone: Mapped[str | None] = mapped_column(
+        String(32), unique=True, index=True, nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     memberships: Mapped[list["Membership"]] = relationship(
@@ -94,7 +187,8 @@ class Membership(Base):
     tenant_id: Mapped[str] = mapped_column(
         ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    role: Mapped[str] = mapped_column(String(20), default=ROLE_OWNER, nullable=False)
+    #: A :class:`Role` key in this tenant (built-in or custom).
+    role: Mapped[str] = mapped_column(String(40), default=ROLE_OWNER, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
@@ -213,6 +307,29 @@ class Event(Base):
     )
     clip_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     clip_content_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    #: Per-tenant running number shown as "Инцидент #N" (assigned on insert,
+    #: so a late-arriving event never renumbers the others).
+    number: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    #: Review state: new / confirmed / false (false alarm).
+    status: Mapped[str] = mapped_column(
+        String(16), default=INCIDENT_NEW, index=True, nullable=False
+    )
+    reviewed_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Recognised employee the event is about (phone / idle / cash events).
+    employee_id: Mapped[str | None] = mapped_column(
+        ForeignKey("employees.id", ondelete="SET NULL"), index=True, nullable=True
+    )
+    #: How long the behaviour lasted (phone / idle), in seconds.
+    duration_sec: Mapped[float | None] = mapped_column(nullable=True)
+    #: Set once the "not reviewed yet" Telegram reminder went out.
+    reminded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     tenant: Mapped["Tenant"] = relationship(back_populates="events")
 
@@ -252,6 +369,25 @@ class TelegramConfig(Base):
     #: Bot token and target chat; the token is write-only over the API.
     bot_token: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     chat_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    #: Bot @username, filled in by "check connection" (for /start links).
+    bot_username: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    #: What to send: "clip" | "photo" | "text".
+    format: Mapped[str] = mapped_column(String(10), default="clip", nullable=False)
+    buttons: Mapped[bool] = mapped_column(default=True, nullable=False)
+    include_link: Mapped[bool] = mapped_column(default=True, nullable=False)
+    notify_offline: Mapped[bool] = mapped_column(default=True, nullable=False)
+    #: Remind about an unreviewed incident after this many minutes (0 = off).
+    remind_min: Mapped[int] = mapped_column(default=15, nullable=False)
+    quiet_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
+    quiet_from: Mapped[str] = mapped_column(String(5), default="22:00", nullable=False)
+    quiet_to: Mapped[str] = mapped_column(String(5), default="08:00", nullable=False)
+    #: "ru" | "uz" | "en".
+    language: Mapped[str] = mapped_column(String(4), default="ru", nullable=False)
+    last_delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: getUpdates offset of the bot poller.
+    update_offset: Mapped[int] = mapped_column(default=0, nullable=False)
 
 
 class PasswordResetToken(Base):
@@ -297,3 +433,208 @@ class LimeCrmConfig(Base):
     #: write-only over the API, like TelegramConfig.bot_token.
     auth_header: Mapped[str] = mapped_column(String(120), default="", nullable=False)
     auth_token: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+
+
+class Role(Base):
+    """A named permission set inside one tenant (built-in or custom)."""
+
+    __tablename__ = "roles"
+    __table_args__ = (UniqueConstraint("tenant_id", "key", name="uq_role_tenant_key"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    key: Mapped[str] = mapped_column(String(40), nullable=False)
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    color: Mapped[str] = mapped_column(String(9), default="#B9C2B2", nullable=False)
+    #: List of :data:`PERMISSIONS` keys (ignored for the owner: always all).
+    permissions: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    is_system: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class AlertRules(Base):
+    """When the AI raises an incident and records a clip (one row per tenant)."""
+
+    __tablename__ = "alert_rules"
+
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), primary_key=True
+    )
+    phone_min: Mapped[float] = mapped_column(Float, default=5.0, nullable=False)
+    idle_min: Mapped[float] = mapped_column(Float, default=5.0, nullable=False)
+    theft: Mapped[bool] = mapped_column(default=True, nullable=False)
+    cash: Mapped[bool] = mapped_column(default=True, nullable=False)
+    refund: Mapped[bool] = mapped_column(default=True, nullable=False)
+    clip_sec: Mapped[int] = mapped_column(default=20, nullable=False)
+
+
+class Employee(Base):
+    """A store employee the cameras recognise (optionally also a panel user)."""
+
+    __tablename__ = "employees"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    position: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    samples: Mapped[list["EmployeeSample"]] = relationship(
+        back_populates="employee", cascade="all, delete-orphan"
+    )
+
+
+class EmployeeSample(Base):
+    """One appearance sample of an employee: ReID embedding + the crop it came from."""
+
+    __tablename__ = "employee_samples"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    employee_id: Mapped[str] = mapped_column(
+        ForeignKey("employees.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: L2-normalised float32 vector.
+    embedding: Mapped[list] = mapped_column(JSON, nullable=False)
+    crop_jpeg: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+    employee: Mapped["Employee"] = relationship(back_populates="samples")
+
+
+#: Staff candidate states.
+CANDIDATE_PENDING = "pending"
+CANDIDATE_ACCEPTED = "accepted"
+CANDIDATE_REJECTED = "rejected"
+
+
+class StaffCandidate(Base):
+    """An unknown person seen repeatedly in staff zones ("Новые лица")."""
+
+    __tablename__ = "staff_candidates"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: Edge identity id, so repeat sightings bump one candidate.
+    person_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    zone: Mapped[str] = mapped_column(String(120), default="", nullable=False)
+    seen_count: Mapped[int] = mapped_column(default=1, nullable=False)
+    embedding: Mapped[list] = mapped_column(JSON, nullable=False)
+    crop_jpeg: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(12), default=CANDIDATE_PENDING, index=True, nullable=False
+    )
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class VisitorStat(Base):
+    """Hourly visitor counts (one row per tenant + hour), pushed by the edge."""
+
+    __tablename__ = "visitor_stats"
+    __table_args__ = (UniqueConstraint("tenant_id", "hour", name="uq_visitor_hour"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: Start of the hour (UTC).
+    hour: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    entered: Mapped[int] = mapped_column(default=0, nullable=False)
+    shelves: Mapped[int] = mapped_column(default=0, nullable=False)
+    checkout: Mapped[int] = mapped_column(default=0, nullable=False)
+    paid: Mapped[int] = mapped_column(default=0, nullable=False)
+    #: Sum of visit lengths (seconds) of visitors who left in this hour.
+    dwell_sum: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    dwell_count: Mapped[int] = mapped_column(default=0, nullable=False)
+
+
+class EmployeeStat(Base):
+    """Per-employee daily work time split (seconds), pushed by the edge."""
+
+    __tablename__ = "employee_stats"
+    __table_args__ = (
+        UniqueConstraint("employee_id", "day", name="uq_employee_stat_day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    employee_id: Mapped[str] = mapped_column(
+        ForeignKey("employees.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: "YYYY-MM-DD" (store-local day as seen by the edge).
+    day: Mapped[str] = mapped_column(String(10), index=True, nullable=False)
+    on_shift_s: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    phone_s: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    idle_s: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    #: Last place / state reported ("На кассе", "В телефоне", ...).
+    status: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )
+
+
+class PosReceipt(Base):
+    """A receipt printed at a register, reported by the POS webhook."""
+
+    __tablename__ = "pos_receipts"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    register: Mapped[str] = mapped_column(String(60), default="", nullable=False)
+    #: "sale" | "refund".
+    kind: Mapped[str] = mapped_column(String(10), default="sale", nullable=False)
+    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, index=True, nullable=False
+    )
+
+
+class TelegramRecipient(Base):
+    """A panel user who gets incident messages from the tenant's bot."""
+
+    __tablename__ = "telegram_recipients"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "user_id", name="uq_tg_recipient_user"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: Filled in when the user presses /start in the bot.
+    chat_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    #: One-time code inside the t.me/<bot>?start=<code> link.
+    link_token: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
+    #: Incident categories this person gets (see :data:`CATEGORIES`).
+    categories: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, nullable=False
+    )

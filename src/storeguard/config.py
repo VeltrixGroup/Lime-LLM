@@ -20,58 +20,46 @@ class ZoneCfg(BaseModel):
     points: list[tuple[float, float]] = Field(min_length=3)
 
 
-#: Model / input size picked by ``model: auto`` / ``imgsz: 0``. Overhead
-#: store cameras are wide-angle, so shoppers far from the lens are only a few
-#: dozen pixels tall — the nano model at 640px misses most of them. A GPU has
-#: headroom for a bigger model at a higher input resolution; a CPU doesn't.
-_AUTO_MODEL = {"cuda": "yolo11m.pt", "mps": "yolo11s.pt", "cpu": "yolo11s.pt"}
-_AUTO_IMGSZ = {"cuda": 1280, "mps": 960, "cpu": 800}
-
-
 class DetectorCfg(BaseModel):
-    """Settings for the YOLO11 person detector + ByteTrack tracker."""
+    """Settings for the YOLO person detector, ByteTrack and cross-camera ReID."""
 
-    model: str = "auto"  # "auto" or a weights path, e.g. "yolo11m.pt"
-    # Score needed to keep a person track matched. Lower-score detections
-    # still reach ByteTrack's second pass (see detector._TRACK_LOW_THRESH).
-    conf: float = 0.25
-    imgsz: int = 0  # 0 = auto (by device)
-    device: str = "auto"  # "auto" | "cpu" | "cuda" | "mps"
-
-    def resolved(self) -> "DetectorCfg":
-        """Return a copy with ``auto`` device / model / imgsz made concrete."""
-        device = pick_device(self.device)
-        kind = device.split(":", 1)[0]
-        return self.model_copy(
-            update={
-                "device": device,
-                "model": _AUTO_MODEL.get(kind, "yolo11s.pt")
-                if self.model == "auto"
-                else self.model,
-                "imgsz": _AUTO_IMGSZ.get(kind, 800) if self.imgsz <= 0 else self.imgsz,
-            }
-        )
-
-
-class ReidCfg(BaseModel):
-    """Cross-camera person re-identification (one global id per person).
-
-    Every tracked person gets an appearance embedding; a registry shared by
-    all cameras matches it against people seen recently, so someone who was
-    ``id 1`` on the hall camera is still ``id 1`` on the checkout camera.
-    """
-
-    enabled: bool = True
-    # "auto" = ImageNet ResNet (resnet50 on GPU, resnet18 on CPU), or a path
-    # to a TorchScript person-ReID model (e.g. an exported OSNet) that takes
-    # a (N, 3, 256, 128) ImageNet-normalized batch and returns (N, D).
+    #: YOLO weights. ``"auto"`` picks by device: ``yolo26m.pt`` on CUDA,
+    #: ``yolo26s.pt`` on Apple MPS, ``yolo26n.pt`` on CPU — the nano model
+    #: is fast but mistakes shelf clutter (bottles, bags) for people far more
+    #: often than the larger ones.
     model: str = "auto"
-    # Combined appearance similarity (0..1) needed to reuse an existing id.
-    # Raise it if different people get merged, lower it if the same person
-    # keeps getting new ids across cameras.
-    threshold: float = 0.6
-    # Forget a person that no camera has seen for this long.
-    ttl_sec: float = 1800.0
+    #: Detections at or above this score are matched to tracks first
+    #: (ByteTrack's "high" threshold). Lower-score boxes are only used to keep
+    #: an existing track alive through partial occlusion, never shown alone.
+    conf: float = 0.45
+    #: A detection must score at least this much to *start* a new track —
+    #: the main knob against false people on shelves.
+    new_track_conf: float = 0.6
+    #: Consecutive processed frames a new track must survive before it is
+    #: reported (filters one-frame flickers on clutter).
+    min_hits: int = 3
+    #: Processed frames a lost track is kept for re-association.
+    track_buffer: int = 60
+    #: A track that barely moves for this many seconds with a mediocre mean
+    #: score is treated as a static object (e.g. a detergent bottle) and
+    #: hidden. 0 disables the filter.
+    static_suppress_sec: float = 20.0
+    imgsz: int = 640
+    device: str = "auto"  # "auto" | "cpu" | "cuda" | "mps"
+    #: ``"auto"``: on an NVIDIA GPU with TensorRT installed, build (once, in
+    #: the background) and use a TensorRT FP16 engine. ``"off"``: always the
+    #: PyTorch model. See :mod:`storeguard.optimize`.
+    optimize: str = "auto"
+    #: Appearance model used to give one person the same id on every camera.
+    #: Any ultralytics ReID asset (``yolo26{n,s,m,l,x}-reid.onnx``) or a
+    #: path; empty string disables deep ReID (a colour-histogram fallback
+    #: is used instead).
+    reid_model: str = "yolo26n-reid.onnx"
+    #: Cosine similarity at or above which a new track is recognised as an
+    #: already-seen person (same id); below it the person gets a new id.
+    reid_threshold: float = 0.6
+    #: Seconds an identity stays matchable after it was last seen anywhere.
+    reid_forget_sec: float = 900.0
 
 
 class ActionCfg(BaseModel):
@@ -126,7 +114,6 @@ class AppCfg(BaseModel):
 
     cameras: list[CameraCfg]
     detector: DetectorCfg = DetectorCfg()
-    reid: ReidCfg = ReidCfg()
     action: ActionCfg = ActionCfg()
     telegram: TelegramCfg = TelegramCfg()
     notify: NotifyCfg = NotifyCfg()
@@ -173,10 +160,9 @@ def _cuda_usable() -> bool:
     """True if CUDA is available *and* can actually run a kernel.
 
     ``torch.cuda.is_available()`` only says a driver answered. A torch built
-    for a newer CUDA than the GPU supports (e.g. CUDA 13 on a GTX 10xx) still
-    reports True and then fails every kernel with "no kernel image is
-    available" — which used to kill the camera thread instead of falling
-    back to the CPU. Checked once per process.
+    for a newer CUDA than the GPU supports still reports True and then fails
+    every kernel with "no kernel image is available" — which used to kill
+    the camera thread instead of falling back to the CPU. Checked once.
     """
     global _cuda_ok
     if _cuda_ok is None:
@@ -201,8 +187,7 @@ def pick_device(pref: str = "auto") -> str:
     """Resolve a device preference to a concrete torch device string.
 
     ``"auto"`` picks ``"cuda"`` if available, else ``"mps"`` if available,
-    else ``"cpu"``.  An explicit preference is returned unchanged, except
-    ``cuda`` on a torch build without CUDA, which falls back to ``"cpu"``.  torch is
+    else ``"cpu"``.  Any explicit preference is returned unchanged.  torch is
     imported lazily so importing this module never pulls it in.
     """
     import torch  # lazy: keep config import light
@@ -216,7 +201,7 @@ def pick_device(pref: str = "auto") -> str:
             Console().print(
                 f"[red]device=cuda requested, but CUDA is not usable with torch "
                 f"{torch.__version__} (CUDA build: {torch.version.cuda or 'none'}). "
-                "Falling back to cpu. Run `storeguard gpu-check` to see why.[/red]"
+                f"Falling back to cpu. {cuda_help()}[/red]"
             )
             return "cpu"
         return pref
@@ -226,3 +211,50 @@ def pick_device(pref: str = "auto") -> str:
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def nvidia_gpu_present() -> bool:
+    """True if an NVIDIA driver is installed (``nvidia-smi`` lists a GPU)."""
+    import shutil
+    import subprocess
+
+    exe = shutil.which("nvidia-smi")
+    if exe is None:
+        return False
+    try:
+        out = subprocess.run(
+            [exe, "-L"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and "GPU" in out.stdout
+
+
+def cuda_help() -> str:
+    """Explain the usual reason CUDA is unavailable and how to fix it."""
+    import torch
+
+    if torch.version.cuda is None:
+        return (
+            "The installed torch is the CPU-only build. Re-install the CUDA build: "
+            "`uv sync --reinstall-package torch --reinstall-package torchvision` "
+            "(on Windows pyproject.toml pulls torch from the PyTorch CUDA index; "
+            "`.\\make.ps1 gpu-check` does this for you), "
+            "then check `uv run python -c \"import torch; print(torch.cuda.is_available())\"`."
+        )
+    return (
+        f"torch is built for CUDA {torch.version.cuda}, but no usable GPU was found — "
+        "update the NVIDIA driver (it must support this CUDA version - for CUDA 12.8 "
+        "that is driver 570 or newer; `nvidia-smi` shows yours)."
+    )
+
+
+def resolve_model(model: str, device: str) -> str:
+    """Resolve ``DetectorCfg.model == "auto"`` to concrete weights for ``device``."""
+    if model != "auto":
+        return model
+    if device.startswith("cuda"):
+        return "yolo26m.pt"
+    if device == "mps":
+        return "yolo26s.pt"
+    return "yolo26n.pt"

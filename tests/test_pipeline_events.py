@@ -14,10 +14,9 @@ import time
 import numpy as np
 
 import storeguard.dashboard.pipeline as pipeline
-from storeguard.config import DetectorCfg, ReidCfg
+from storeguard.config import DetectorCfg
 from storeguard.dashboard.pipeline import DetectionSession
 from storeguard.geometry import Zone
-from storeguard.reid import IdentityRegistry
 from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
 from storeguard.types import Track
 
@@ -47,10 +46,6 @@ class _ScriptedStream:
     def read(self):
         if self._remaining <= 0:
             return None  # "stream down" — DetectionSession waits, doesn't end
-        # Paced like a real camera: live sources are drained on a reader
-        # thread that keeps only the newest frame, so an instant burst would
-        # (correctly) be collapsed into its last frame.
-        time.sleep(0.05)
         self._remaining -= 1
         return np.zeros((100, 100, 3), dtype=np.uint8)
 
@@ -105,7 +100,7 @@ def test_detection_session_dispatches_exit_no_pay_event(monkeypatch) -> None:
     session = _session(alert_queue=alert_queue, camera_id="cam-42")
     session.start()
     try:
-        event, frames, fps, camera_id = alert_queue.get(timeout=5.0)
+        event, frames, fps, camera_id, _port = alert_queue.get(timeout=5.0)
     finally:
         session.stop()
 
@@ -117,26 +112,6 @@ def test_detection_session_dispatches_exit_no_pay_event(monkeypatch) -> None:
     assert len(frames) == 3
     assert all(isinstance(f, np.ndarray) for f in frames)
     assert fps is not None and fps > 0
-
-
-def test_event_carries_store_wide_person_id(monkeypatch) -> None:
-    """With the shared id registry, events are tagged with a cross-run person id."""
-    monkeypatch.setattr(pipeline, "VideoStream", _ScriptedStream)
-    monkeypatch.setattr(pipeline, "PersonTracker", _WalkingTracker)
-    monkeypatch.setattr(pipeline, "ExitNoPayScenario", _InstantExitNoPay)
-    monkeypatch.setattr(pipeline, "get_encoder", lambda cfg, device: None)
-
-    registry = IdentityRegistry(ReidCfg())
-    alert_queue: queue.Queue = queue.Queue()
-    session = _session(alert_queue=alert_queue, identities=registry)
-    session.start()
-    try:
-        event, _frames, _fps, _cam = alert_queue.get(timeout=5.0)
-    finally:
-        session.stop()
-
-    assert event.track_id == 1  # global id
-    assert event.extra["person_id"] == f"{registry.run_id}-1"
 
 
 def test_detection_session_without_alert_queue_does_not_crash(monkeypatch) -> None:

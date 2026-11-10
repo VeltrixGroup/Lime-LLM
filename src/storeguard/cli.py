@@ -4,7 +4,6 @@ Subcommands:
 
 * ``run`` — run the detection pipeline from a YAML config.
 * ``dashboard`` — local web UI to upload a video and watch person detection.
-* ``gpu-check`` — diagnose why detection isn't using the NVIDIA GPU.
 * ``draw-zones`` — interactively draw polygon zones over a camera frame.
 * ``annotate`` — keyboard labeler producing a labels CSV from raw videos.
 * ``make-dataset`` — cut labeled segments into per-class training clips.
@@ -40,24 +39,24 @@ def _cmd_run(args: argparse.Namespace) -> None:
     run(cfg, show=args.show)
 
 
-def _cmd_dashboard(args: argparse.Namespace) -> None:
-    """Handler for ``storeguard dashboard``."""
+def _dashboard_kwargs(args: argparse.Namespace, url: str) -> dict:
+    """Detector/zones/agent settings shared by ``dashboard`` and ``cloud --with-dashboard``."""
     import os
 
-    from .config import ActionCfg, DetectorCfg, ReidCfg, ZoneCfg, load_config
+    from .config import DetectorCfg, ZoneCfg, load_config
     from .geometry import zones_from_cfg
 
     agent_server = args.agent_server or os.environ.get("STOREGUARD_AGENT_SERVER", "")
     agent_key = args.agent_key or os.environ.get("STOREGUARD_AGENT_KEY", "")
 
+    from .config import ActionCfg
+
     detector = DetectorCfg(device=args.device)
-    reid = ReidCfg()
     action = ActionCfg()
     zones = []
     if args.config:
         cfg = load_config(args.config)
         detector = cfg.detector
-        reid = cfg.reid
         action = cfg.action
         if args.device != "auto":
             detector = detector.model_copy(update={"device": args.device})
@@ -77,7 +76,6 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
         )
 
     data_dir = args.data
-    url = f"http://{args.host}:{args.port}"
     console.print(
         f"[bold]storeguard dashboard[/bold] — open [cyan]{url}[/cyan] "
         f"(device={detector.device}, data={data_dir})"
@@ -106,30 +104,22 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
             "STOREGUARD_AGENT_KEY (create a key in the cabinet's Devices "
             "page).[/yellow]"
         )
-    if Path(action.weights).is_file():
-        console.print(
-            f"[dim]Action model: {action.weights} — 'pocket' on cameras with shelf* "
-            "zones (or no zones), 'take_cash' on cameras with register* zones.[/dim]"
-        )
-    else:
-        console.print(
-            f"[yellow]No action model at '{action.weights}' — only exit-without-"
-            "paying is detected; 'pocket' / 'take_cash' need a trained model "
-            "(storeguard train).[/yellow]"
-        )
+    return {
+        "detector": detector,
+        "data_dir": data_dir,
+        "zones": zones,
+        "agent_server": agent_server or None,
+        "agent_key": agent_key or None,
+        "action": action,
+    }
+
+
+def _cmd_dashboard(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard dashboard`` (standalone, its own port)."""
     from .dashboard.app import serve
 
-    serve(
-        host=args.host,
-        port=args.port,
-        detector=detector,
-        data_dir=data_dir,
-        zones=zones,
-        agent_server=agent_server or None,
-        agent_key=agent_key or None,
-        reid=reid,
-        action=action,
-    )
+    kwargs = _dashboard_kwargs(args, f"http://{args.host}:{args.port}")
+    serve(host=args.host, port=args.port, **kwargs)
 
 
 def _cmd_gpu_check(args: argparse.Namespace) -> None:
@@ -138,6 +128,8 @@ def _cmd_gpu_check(args: argparse.Namespace) -> None:
     import subprocess
 
     import torch
+
+    from .config import cuda_help
 
     console.print(f"torch {torch.__version__}, CUDA build: {torch.version.cuda or 'none (CPU-only)'}")
     smi = shutil.which("nvidia-smi")
@@ -151,7 +143,7 @@ def _cmd_gpu_check(args: argparse.Namespace) -> None:
             driver = out.stdout.strip() or out.stderr.strip()
         except Exception as exc:  # noqa: BLE001
             driver = f"nvidia-smi failed: {exc}"
-    console.print(f"nvidia-smi: {driver or 'not found (no GPU passed through?)'}")
+    console.print(f"nvidia-smi: {driver or 'not found (no NVIDIA GPU / driver)'}")
 
     ok = False
     try:
@@ -165,31 +157,12 @@ def _cmd_gpu_check(args: argparse.Namespace) -> None:
     except Exception as exc:  # noqa: BLE001
         ok = False
         console.print(f"[red]CUDA error: {exc}[/red]")
-
     if ok:
         return
-    if not torch.version.cuda:
-        console.print(
-            "[red]This torch build has no CUDA.[/red] Natively on Windows: run "
-            "`uv sync` again (pyproject pulls the CUDA build). In Docker: rebuild "
-            "the image (`docker compose build --no-cache dashboard`)."
-        )
-    elif not smi:
-        console.print(
-            "[red]No GPU visible.[/red] In Docker check GPU passthrough: "
-            "`docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 "
-            "nvidia-smi` must list your GPU (Docker Desktop -> WSL2 backend, "
-            "NVIDIA driver installed on Windows)."
-        )
-    else:
-        console.print(
-            f"[red]GPU is visible but torch (CUDA {torch.version.cuda}) can't use "
-            "it[/red] — the driver is too old for this CUDA version, or the GPU "
-            "is too old for it. CUDA 13 needs driver >= 580, CUDA 12.8 >= 570, "
-            "CUDA 12.6 >= 560. Update the NVIDIA driver, or in Docker rebuild "
-            "with an older CUDA: `TORCH_CUDA=cu126 docker compose build "
-            "dashboard`."
-        )
+    if not smi:
+        console.print("[yellow]No NVIDIA GPU found — detection runs on the CPU.[/yellow]")
+        raise SystemExit(1)
+    console.print(f"[red]{cuda_help()}[/red]")
     raise SystemExit(1)
 
 
@@ -285,6 +258,46 @@ def _cmd_train(args: argparse.Namespace) -> None:
         console.print("Final metrics: " + ", ".join(parts))
 
 
+def _cmd_optimize(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard optimize``: build the TensorRT engine and compare speed."""
+    from rich.table import Table
+
+    from . import optimize as opt
+    from .config import pick_device, resolve_model
+
+    device = pick_device(args.device)
+    weights = resolve_model(args.model, device)
+    fmt = opt.target_format(device)
+    if fmt is None:
+        if device.startswith("cuda"):
+            console.print(
+                "[yellow]TensorRT is not installed — install it with "
+                "[bold]uv sync --extra tensorrt[/bold] (needs an NVIDIA driver 570+).[/yellow]"
+            )
+        else:
+            console.print(
+                f"[yellow]Device is {device}: TensorRT needs an NVIDIA GPU, so detection "
+                "keeps the PyTorch model (already the fastest option measured here).[/yellow]"
+            )
+        path = None
+    else:
+        path = opt.build(weights, device, args.imgsz, force=args.force)
+        if path is None:
+            raise SystemExit("TensorRT engine could not be built (see the message above).")
+    if not args.benchmark:
+        return
+    table = Table(title=f"{weights} on {device}, imgsz {args.imgsz}")
+    table.add_column("runtime")
+    for b in (1, 4, 8):
+        table.add_column(f"{b} camera{'s' if b > 1 else ''}, fps", justify="right")
+    rows = [("PyTorch" + (" FP16" if device.startswith("cuda") else ""), weights)]
+    if path is not None:
+        rows.append(("TensorRT FP16", str(path)))
+    for name, w in rows:
+        table.add_row(name, *(f"{opt.benchmark(w, device, args.imgsz, batch=b):.0f}" for b in (1, 4, 8)))
+    console.print(table)
+
+
 def _cmd_cloud(args: argparse.Namespace) -> None:
     """Handler for ``storeguard cloud`` (the multi-tenant control plane)."""
     from .cloud.app import serve_cloud
@@ -299,7 +312,36 @@ def _cmd_cloud(args: argparse.Namespace) -> None:
             "[dim]Expecting an up-to-date schema — run "
             "[bold]alembic upgrade head[/bold] first (or pass --dev).[/dim]"
         )
-    serve_cloud(host=args.host, port=args.port, create_tables=args.dev)
+    live_app = None
+    if args.with_dashboard:
+        from pathlib import Path as _Path
+
+        from .dashboard.app import create_app
+
+        # Same process, so alerts go straight to this server unless told otherwise.
+        import os
+
+        # Cameras started from the cabinet talk to this process directly
+        # (port_factory below); an HTTP agent client to ourselves would be
+        # checked before the server listens and always fail.
+        if not os.environ.get("STOREGUARD_AGENT_SERVER"):
+            args.agent_server = None
+        kwargs = _dashboard_kwargs(args, f"http://{args.host}:{args.port}/live/")
+        kwargs["data_dir"] = _Path(kwargs["data_dir"])
+        # Same process: the dashboard talks to the cloud directly, as the
+        # store of whoever is logged in — no agent key needed.
+        holder: dict = {}
+        kwargs["port_factory"] = lambda tenant_id: holder["make"](tenant_id)
+        live_app = create_app(**kwargs)
+    serve_cloud(
+        host=args.host,
+        port=args.port,
+        create_tables=args.dev,
+        live_app=live_app,
+        on_app=(lambda app: holder.__setitem__("make", app.state.direct_port))
+        if live_app is not None
+        else None,
+    )
 
 
 def _cmd_agent(args: argparse.Namespace) -> None:
@@ -344,40 +386,8 @@ def _cmd_agent(args: argparse.Namespace) -> None:
             console.print(f"[cyan]Uploaded clip[/cyan] has_clip={up['has_clip']}")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Create the top-level ``storeguard`` argument parser."""
-    parser = argparse.ArgumentParser(
-        prog="storeguard",
-        description=(
-            "Retail theft-detection video analytics: person tracking, zone "
-            "control and action recognition on RTSP cameras or video files."
-        ),
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"%(prog)s {__version__}"
-    )
-    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
-
-    p = sub.add_parser("run", help="run the detection pipeline from a YAML config")
-    p.add_argument(
-        "--config",
-        required=True,
-        help="path to the app config YAML (see configs/example.yaml)",
-    )
-    p.add_argument(
-        "--show",
-        action="store_true",
-        help="open per-camera preview windows with overlays (local testing "
-        "with video files)",
-    )
-    p.set_defaults(func=_cmd_run)
-
-    p = sub.add_parser(
-        "dashboard",
-        help="open a local web UI to upload a video and watch person detection",
-    )
-    p.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
-    p.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
+def _add_dashboard_args(p: argparse.ArgumentParser) -> None:
+    """Detection options shared by ``dashboard`` and ``cloud --with-dashboard``."""
     p.add_argument(
         "--device",
         default="auto",
@@ -412,6 +422,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="agent token for --agent-server, created in the cabinet's "
         "Devices page (or set STOREGUARD_AGENT_KEY)",
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the top-level ``storeguard`` argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="storeguard",
+        description=(
+            "Retail theft-detection video analytics: person tracking, zone "
+            "control and action recognition on RTSP cameras or video files."
+        ),
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="command")
+
+    p = sub.add_parser("run", help="run the detection pipeline from a YAML config")
+    p.add_argument(
+        "--config",
+        required=True,
+        help="path to the app config YAML (see configs/example.yaml)",
+    )
+    p.add_argument(
+        "--show",
+        action="store_true",
+        help="open per-camera preview windows with overlays (local testing "
+        "with video files)",
+    )
+    p.set_defaults(func=_cmd_run)
+
+    p = sub.add_parser(
+        "dashboard",
+        help="open a local web UI to upload a video and watch person detection",
+    )
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
+    _add_dashboard_args(p)
     p.set_defaults(func=_cmd_dashboard)
 
     p = sub.add_parser(
@@ -508,6 +555,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_train)
 
     p = sub.add_parser(
+        "optimize",
+        help="build a TensorRT engine for the detector (NVIDIA) and compare speed",
+    )
+    p.add_argument("--model", default="auto", help="YOLO weights (default: auto for the device)")
+    p.add_argument("--device", default="auto", help='"auto" | "cuda" | "mps" | "cpu"')
+    p.add_argument("--imgsz", type=int, default=640, help="input size (default: 640)")
+    p.add_argument("--force", action="store_true", help="rebuild even if cached")
+    p.add_argument("--benchmark", action="store_true", help="print frames/second before and after")
+    p.set_defaults(func=_cmd_optimize)
+
+    p = sub.add_parser(
         "cloud",
         help="run the multi-tenant cloud control plane (accounts, tenants, API)",
     )
@@ -518,6 +576,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="create tables directly instead of via Alembic (local dev only)",
     )
+    p.add_argument(
+        "--with-dashboard",
+        action="store_true",
+        help="also run live detection in this same process, served at /live/ "
+        "on the same port (for a store PC that runs everything locally)",
+    )
+    _add_dashboard_args(p)
     p.set_defaults(func=_cmd_cloud)
 
     p = sub.add_parser(

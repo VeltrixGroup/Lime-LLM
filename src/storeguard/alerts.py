@@ -8,6 +8,7 @@ delivery can never crash the video pipeline.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from datetime import datetime
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
 
 _console = Console(stderr=True)
 
-_TELEGRAM_API = "https://api.telegram.org"
+_TELEGRAM_API = "https://api.telegram.org"  # override with TELEGRAM_API_BASE
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -67,6 +68,26 @@ def event_payload(event: Event, clip_path: Path | None = None) -> dict:
     return payload
 
 
+#: Tried in order. H.264 ("avc1") plays in every browser and in Telegram's
+#: inline player; "mp4v" (MPEG-4 part 2) is the always-available fallback,
+#: but browsers can't play it (the panel then offers a download instead).
+_FOURCCS = ("avc1", "mp4v")
+_working_fourcc: str | None = None
+
+
+def _open_writer(path: Path, fps: float, size: tuple[int, int]):
+    """A VideoWriter using the first codec this OpenCV build can encode."""
+    global _working_fourcc
+    codecs = (_working_fourcc,) if _working_fourcc else _FOURCCS
+    for code in codecs:
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*code), fps, size)
+        if writer.isOpened():
+            _working_fourcc = code
+            return writer
+        writer.release()
+    return None
+
+
 def write_mp4_clip(
     path: Path,
     frames: list["np.ndarray"],
@@ -83,11 +104,12 @@ def write_mp4_clip(
         return False
     try:
         height, width = frames[0].shape[:2]
+        # H.264 encoders want even dimensions.
+        width -= width % 2
+        height -= height % 2
         out_fps = fps if fps is not None and fps > 0 else fallback_fps
-        writer = cv2.VideoWriter(
-            str(path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height)
-        )
-        if not writer.isOpened():
+        writer = _open_writer(path, out_fps, (width, height))
+        if writer is None:
             _console.log(f"[red]write_mp4_clip: could not open VideoWriter for {path}[/red]")
             return False
         try:
@@ -232,7 +254,8 @@ class AlertSink:
 
     def _send_telegram(self, event: Event, clip_path: Path | None) -> None:
         """Send the event message and, if available, the saved clip."""
-        base = f"{_TELEGRAM_API}/bot{self._telegram.bot_token}"
+        api = (os.environ.get("TELEGRAM_API_BASE") or _TELEGRAM_API).rstrip("/")
+        base = f"{api}/bot{self._telegram.bot_token}"
         try:
             resp = requests.post(
                 f"{base}/sendMessage",

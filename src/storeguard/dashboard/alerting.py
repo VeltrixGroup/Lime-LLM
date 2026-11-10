@@ -5,8 +5,7 @@ still needs to be caught even when nobody is watching the screen. Every
 :class:`~storeguard.dashboard.pipeline.DetectionSession` that raises a
 scenario event hands it to :class:`DashboardAlertSink`, which:
 
-* always saves a short local evidence clip and a line in ``events.jsonl``
-  on this computer, and
+* always saves a short local evidence clip on this computer, and
 * if the dashboard was started with cloud agent credentials, also pushes the
   event and that same clip to the cloud via the same agent API the headless
   edge agent uses — so the tenant's existing Telegram / Lime CRM
@@ -46,11 +45,9 @@ def _safe_name(name: str) -> str:
 class DashboardAlertSink:
     """Save an evidence clip locally and, if configured, push it to the cloud.
 
-    Every delivered event is also appended to ``events.jsonl`` (see
-    :meth:`_append_log`). Applies a per-``(camera, kind, person)`` minimum gap
-    of :attr:`min_gap_sec` on top of each scenario's own per-track cooldown
-    (see :func:`storeguard.alerts.dedup_key`), so one person can't spam
-    clips/notifications but a second person is never dropped. Thread-safe: meant to
+    Applies a per-``(camera, kind)`` minimum gap of :attr:`min_gap_sec` on top
+    of each scenario's own per-track cooldown, so a burst of near-simultaneous
+    events on one camera can't spam clips/notifications. Thread-safe: meant to
     be driven by one shared :func:`delivery_loop` thread on behalf of every
     camera session.
     """
@@ -93,6 +90,7 @@ class DashboardAlertSink:
         frames: list["np.ndarray"],
         fps: float | None = None,
         camera_id: str | None = None,
+        port=None,
     ) -> None:
         """Save an evidence clip for ``event`` and deliver it.
 
@@ -105,18 +103,22 @@ class DashboardAlertSink:
                 :attr:`clip_fps` when omitted or invalid.
             camera_id: The cloud's id for this camera, if known (lets the
                 cloud attribute the event to the right camera).
+            port: Where to deliver (the session's store context port). Falls
+                back to the sink's own cloud client.
         """
         with self._lock:
+            # Per person: a second shoplifter right after the first must still alert.
             key = dedup_key(event)
             last = self._last_sent.get(key)
             if last is not None and event.ts - last < self.min_gap_sec:
                 return
             self._last_sent[key] = event.ts
 
+        target = port if port is not None else self._client
         clip_path = self._write_clip(event, frames, fps)
         cloud_event_id = None
-        if self._client is not None:
-            cloud_event_id = self._push_to_cloud(event, clip_path, camera_id)
+        if target is not None:
+            cloud_event_id = self._push_to_cloud(event, clip_path, camera_id, target)
         self._append_log(event, clip_path, camera_id, cloud_event_id)
 
     def _append_log(
@@ -138,7 +140,7 @@ class DashboardAlertSink:
         record["cloud_event_id"] = cloud_event_id
         try:
             self._events_log.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps(record, ensure_ascii=False)
+            line = json.dumps(record, ensure_ascii=False, default=str)
             with self._lock, open(self._events_log, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
@@ -163,34 +165,38 @@ class DashboardAlertSink:
         return None
 
     def _push_to_cloud(
-        self, event: "Event", clip_path: Path | None, camera_id: str | None
+        self, event: "Event", clip_path: Path | None, camera_id: str | None, client=None
     ) -> str | None:
-        """Push the event (+ clip); return the cloud's event id, or None on failure."""
-        assert self._client is not None
+        """Push the event (and clip); the cloud's event id, or ``None``."""
+        client = client if client is not None else self._client
+        assert client is not None
         iso = datetime.fromtimestamp(event.ts, tz=timezone.utc).isoformat()
+        extra = event.extra or {}
+        kwargs = {}
+        for key in ("person_id", "employee_id", "duration_sec"):
+            if extra.get(key) is not None:
+                kwargs[key] = extra[key]
         try:
-            created = self._client.send_event(
+            created = client.send_event(
                 event.kind,
                 message=event.message,
                 camera_id=camera_id,
-                # Store-wide person id (same on every camera), so the cabinet
-                # can group every camera that saw this person.
-                person_id=(event.extra or {}).get("person_id"),
                 track_id=event.track_id,
                 score=event.score,
                 ts=iso,
+                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: send_event failed: {exc}[/red]")
             return None
-        event_id = created.get("id") if isinstance(created, dict) else None
-        if clip_path is None or event_id is None:
-            return event_id
-        try:
-            self._client.upload_clip(event_id, clip_path)
-        except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
-            _console.log(f"[red]DashboardAlertSink: upload_clip failed: {exc}[/red]")
-        return event_id
+        if not created:
+            return None  # the store turned this incident type off
+        if clip_path is not None:
+            try:
+                client.upload_clip(created["id"], clip_path)
+            except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
+                _console.log(f"[red]DashboardAlertSink: upload_clip failed: {exc}[/red]")
+        return created.get("id")
 
 
 def delivery_loop(sink: DashboardAlertSink, alert_queue: "queue.Queue") -> None:
@@ -204,9 +210,10 @@ def delivery_loop(sink: DashboardAlertSink, alert_queue: "queue.Queue") -> None:
         item = alert_queue.get()
         if item is None:
             return
-        event, frames, fps, camera_id = item
+        event, frames, fps, camera_id, *rest = item
+        port = rest[0] if rest else None
         try:
-            sink.handle(event, frames, fps=fps, camera_id=camera_id)
+            sink.handle(event, frames, fps=fps, camera_id=camera_id, port=port)
         except Exception:  # noqa: BLE001 - delivery must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: delivery error for {event.kind}[/red]")
 

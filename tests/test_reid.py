@@ -1,121 +1,128 @@
-"""Cross-camera person ids: IdentityRegistry + color signatures.
+"""Cross-camera identities: one person keeps one global id on every camera.
 
-No deep model here (it would need downloaded weights) — the registry runs in
-its color-only mode, which exercises the same matching / binding logic.
+Uses a fake encoder that returns a fixed feature per "person" (keyed by the
+box's x position), so the registry logic is tested without any model.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from storeguard.config import ReidCfg
-from storeguard.reid import IdentityRegistry, Signature, _color_signature, assign_global_ids
+from storeguard.reid import CameraIdentities, IdentityRegistry
 from storeguard.types import Track
 
-_BOX = (10.0, 10.0, 50.0, 110.0)
+_FRAME = np.zeros((100, 100, 3), dtype=np.uint8)
 
 
-def _person(top_bgr: tuple[int, int, int], bottom_bgr: tuple[int, int, int]) -> np.ndarray:
-    crop = np.zeros((100, 40, 3), dtype=np.uint8)
-    crop[:55] = top_bgr
-    crop[55:] = bottom_bgr
-    return crop
+def _unit(*v: float) -> np.ndarray:
+    a = np.asarray(v, dtype=np.float32)
+    return a / np.linalg.norm(a)
 
 
-RED_BLUE = _person((0, 0, 220), (200, 60, 0))
-GREEN_GREY = _person((0, 200, 0), (120, 120, 120))
+#: Appearance of each person, keyed by the box's x1.
+_LOOKS = {
+    10.0: _unit(1, 0, 0, 0),  # person A
+    50.0: _unit(0, 1, 0, 0),  # person B
+    70.0: _unit(0, 0, 1, 0),  # person C
+}
 
 
-def _sig(crop: np.ndarray) -> Signature:
-    return Signature(deep=None, color=_color_signature(crop))
+def _encoder(frame, boxes):
+    return [_LOOKS[b[0]] for b in boxes]
 
 
-def _track(tid: int) -> Track:
-    return Track(track_id=tid, box=_BOX, conf=0.9)
+def _track(local_id: int, x1: float) -> Track:
+    return Track(track_id=local_id, box=(x1, 10.0, x1 + 20.0, 90.0), conf=0.9)
 
 
-def test_color_signature_separates_clothes() -> None:
-    a, b = _color_signature(RED_BLUE), _color_signature(GREEN_GREY)
-    assert abs(float(a @ a) - 1.0) < 1e-5
-    assert float(a @ b) < 0.3
+def test_same_person_gets_same_id_on_another_camera() -> None:
+    reg = IdentityRegistry(threshold=0.6)
+    cam1 = CameraIdentities(reg, _encoder)
+    cam2 = CameraIdentities(reg, _encoder)
+
+    ids1 = [t.track_id for t in cam1.update(_FRAME, [_track(7, 10.0), _track(8, 50.0)], 1.0)]
+    assert ids1 == [1, 2]
+    # Different local ids on camera 2, same people.
+    ids2 = [t.track_id for t in cam2.update(_FRAME, [_track(3, 50.0), _track(4, 10.0)], 2.0)]
+    assert ids2 == [2, 1]
 
 
-def test_same_person_keeps_id_on_another_camera() -> None:
-    reg = IdentityRegistry(ReidCfg())
-    ids = reg.assign("cam1", [_track(1), _track(2)], {1: _sig(RED_BLUE), 2: _sig(GREEN_GREY)}, 0.0)
-    assert ids == {1: 1, 2: 2}
-
-    # Camera 2 has its own ByteTrack numbering; the person in red/blue must
-    # come out as global id 1 there as well, not as a new id 3.
-    ids2 = reg.assign("cam2", [_track(1)], {1: _sig(RED_BLUE)}, 1.0)
-    assert ids2 == {1: 1}
-    ids2 = reg.assign("cam2", [_track(1), _track(5)], {5: _sig(GREEN_GREY)}, 2.0)
-    assert ids2 == {1: 1, 5: 2}
+def test_new_person_gets_new_id() -> None:
+    reg = IdentityRegistry(threshold=0.6)
+    cam1 = CameraIdentities(reg, _encoder)
+    cam2 = CameraIdentities(reg, _encoder)
+    cam1.update(_FRAME, [_track(1, 10.0)], 1.0)
+    out = cam2.update(_FRAME, [_track(1, 70.0)], 2.0)
+    assert [t.track_id for t in out] == [2]
 
 
-def test_new_look_gets_new_id() -> None:
-    reg = IdentityRegistry(ReidCfg())
-    reg.assign("cam1", [_track(1)], {1: _sig(RED_BLUE)}, 0.0)
-    ids = reg.assign("cam2", [_track(3)], {3: _sig(GREEN_GREY)}, 1.0)
-    assert ids == {3: 2}
+def test_track_split_on_same_camera_rejoins_old_id() -> None:
+    """ByteTrack starting a new local id after an occlusion keeps the global id."""
+    reg = IdentityRegistry(threshold=0.6)
+    cam = CameraIdentities(reg, _encoder)
+    for i in range(5):
+        cam.update(_FRAME, [_track(1, 10.0)], float(i))
+    out = cam.update(_FRAME, [_track(9, 10.0)], 6.0)
+    assert [t.track_id for t in out] == [1]
 
 
-def test_two_people_in_one_camera_never_share_an_id() -> None:
-    reg = IdentityRegistry(ReidCfg())
-    ids = reg.assign("cam1", [_track(1), _track(2)], {1: _sig(RED_BLUE), 2: _sig(RED_BLUE)}, 0.0)
-    assert ids[1] != ids[2]
+def test_two_visible_people_on_one_camera_never_share_an_id() -> None:
+    reg = IdentityRegistry(threshold=0.6)
+    cam = CameraIdentities(reg, _encoder)
+    cam.update(_FRAME, [_track(1, 10.0)], 1.0)
+    # A second track that looks exactly like the visible person A.
+    looks_like_a = dict(_LOOKS)
+    looks_like_a[50.0] = _LOOKS[10.0]
+    cam._encoder = lambda f, boxes: [looks_like_a[b[0]] for b in boxes]
+    out = cam.update(_FRAME, [_track(1, 10.0), _track(2, 50.0)], 2.0)
+    ids = [t.track_id for t in out]
+    assert ids[0] == 1 and ids[1] != 1
 
 
-def test_track_id_switch_on_same_camera_keeps_global_id() -> None:
-    reg = IdentityRegistry(ReidCfg())
-    assert reg.assign("cam1", [_track(1)], {1: _sig(RED_BLUE)}, 0.0) == {1: 1}
-    # ByteTrack lost the person behind a shelf and re-found them as local 7.
-    assert reg.assign("cam1", [_track(7)], {7: _sig(RED_BLUE)}, 10.0) == {7: 1}
+def test_provisional_id_is_corrected_and_never_reused() -> None:
+    """A bad first frame gives a new id; later frames fix it without a gap."""
+    reg = IdentityRegistry(threshold=0.6)
+    cam1 = CameraIdentities(reg, _encoder)
+    for i in range(5):
+        cam1.update(_FRAME, [_track(1, 10.0)], float(i))
+    cam1.update(_FRAME, [], 5.0)
+
+    frames = iter([_unit(0, 0, 0, 1), _LOOKS[10.0], _LOOKS[10.0], _LOOKS[10.0]])
+    cam2 = CameraIdentities(reg, lambda f, boxes: [next(frames)])
+    first = cam2.update(_FRAME, [_track(5, 10.0)], 6.0)
+    assert [t.track_id for t in first] == [2]  # unrecognisable first crop
+    fixed = cam2.update(_FRAME, [_track(5, 10.0)], 7.0)
+    assert [t.track_id for t in fixed] == [1]
+    # The dropped provisional id 2 is never handed out again: per-person state
+    # elsewhere is keyed by it and would leak onto the next new person.
+    cam3 = CameraIdentities(reg, _encoder)
+    assert [t.track_id for t in cam3.update(_FRAME, [_track(1, 70.0)], 8.0)] == [3]
 
 
-def test_identity_is_stable_while_track_lives() -> None:
-    reg = IdentityRegistry(ReidCfg())
-    for i in range(10):
-        sig = {1: _sig(RED_BLUE)} if reg.wants_signature("cam1", 1) else {}
-        assert reg.assign("cam1", [_track(1)], sig, float(i)) == {1: 1}
+def test_paid_is_shared_between_cameras() -> None:
+    reg = IdentityRegistry(threshold=0.6)
+    cam1 = CameraIdentities(reg, _encoder)
+    cam2 = CameraIdentities(reg, _encoder)
+    gid = cam1.update(_FRAME, [_track(1, 10.0)], 1.0)[0].track_id
+    reg.mark_paid(gid)
+    other = cam2.update(_FRAME, [_track(4, 10.0)], 2.0)[0].track_id
+    assert other == gid and reg.is_paid(other)
 
 
-def test_expired_identities_are_not_reused() -> None:
-    reg = IdentityRegistry(ReidCfg(ttl_sec=60.0))
-    reg.assign("cam1", [_track(1)], {1: _sig(RED_BLUE)}, 0.0)
-    reg.assign("cam1", [], {}, 10.0)  # track gone
-    assert reg.assign("cam2", [_track(1)], {1: _sig(RED_BLUE)}, 500.0) == {1: 2}
+def test_forgotten_identity_is_not_matched() -> None:
+    reg = IdentityRegistry(threshold=0.6, forget_after_sec=10.0)
+    cam = CameraIdentities(reg, _encoder)
+    cam.update(_FRAME, [_track(1, 10.0)], 0.0)
+    out = CameraIdentities(reg, _encoder).update(_FRAME, [_track(2, 10.0)], 100.0)
+    assert out[0].track_id == 2
 
 
-def test_deep_matching_waits_for_mean_warmup() -> None:
+def test_histogram_fallback_matches_same_crop() -> None:
     rng = np.random.default_rng(0)
-    reg = IdentityRegistry(ReidCfg())
-
-    def deep_sig(v: np.ndarray, crop: np.ndarray) -> Signature:
-        return Signature(deep=v / np.linalg.norm(v), color=_color_signature(crop))
-
-    person = rng.random(64).astype(np.float32)
-    # Before the running mean is warmed up nobody is matched...
-    reg.assign("cam1", [_track(1)], {1: deep_sig(person, RED_BLUE)}, 0.0)
-    assert reg.assign("cam2", [_track(1)], {1: deep_sig(person, RED_BLUE)}, 1.0) == {1: 2}
-    # ...but a young self-created id is folded into the match once it is.
-    for i in range(40):
-        reg.assign(
-            "cam3", [_track(100 + i)], {100 + i: deep_sig(rng.random(64).astype(np.float32), GREEN_GREY)}, 2.0
-        )
-    ids = reg.assign("cam2", [_track(1)], {1: deep_sig(person, RED_BLUE)}, 3.0)
-    assert ids == {1: 1}
-
-
-def test_assign_global_ids_rewrites_track_ids() -> None:
-    class _ColorEncoder:
-        def encode(self, frame, boxes):
-            return [_sig(RED_BLUE) for _ in boxes]
-
-    reg = IdentityRegistry(ReidCfg())
-    frame = np.zeros((120, 60, 3), dtype=np.uint8)
-    out = assign_global_ids(reg, _ColorEncoder(), "cam1", frame, [_track(42)], 0.0)
-    assert [t.track_id for t in out] == [1]
-    assert out[0].box == _BOX
-    out = assign_global_ids(reg, _ColorEncoder(), "cam2", frame, [_track(9)], 1.0)
-    assert [t.track_id for t in out] == [1]
+    frame = rng.integers(0, 255, (100, 100, 3), dtype=np.uint8)
+    reg = IdentityRegistry(threshold=0.6)
+    cam1 = CameraIdentities(reg)  # no encoder: colour histograms
+    cam2 = CameraIdentities(reg)
+    a = cam1.update(frame, [_track(1, 10.0)], 1.0)[0].track_id
+    b = cam2.update(frame, [_track(1, 10.0)], 2.0)[0].track_id
+    assert a == b
