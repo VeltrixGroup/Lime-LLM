@@ -49,6 +49,7 @@ class PocketScenario:
         buf: "ClipBuffer",
         threshold: float = 0.75,
         zones: list["Zone"] | None = None,
+        classify_every: int = 1,
     ) -> None:
         """Create the scenario for one camera.
 
@@ -60,11 +61,16 @@ class PocketScenario:
             threshold: Minimum probability of :attr:`target_class` to alert.
             zones: Optional camera zones; only zones whose name starts with
                 :attr:`zone_prefix` are used for filtering.
+            classify_every: Classify a ready track on every Nth update only.
+                Consecutive clips overlap almost entirely, so this saves most
+                of the 3D-CNN cost with many people in view (1 = every update).
         """
         self.camera = camera
         self._model = model
         self._buf = buf
         self._threshold = float(threshold)
+        self._classify_every = max(1, int(classify_every))
+        self._ready_updates: dict[int, int] = {}
         self._zones: list["Zone"] = [
             z for z in (zones or []) if z.name.startswith(self.zone_prefix)
         ]
@@ -98,6 +104,10 @@ class PocketScenario:
             last = self._last_alert.get(tid)
             if last is not None and ts - last < self.cooldown_sec:
                 continue
+            n = self._ready_updates.get(tid, 0)
+            self._ready_updates[tid] = n + 1
+            if n % self._classify_every:
+                continue
             probs = self._model.predict(self._buf.get_clip(tid))
             score = float(probs.get(self.target_class, 0.0))
             if score < self._threshold:
@@ -117,7 +127,10 @@ class PocketScenario:
                 )
             )
 
-        self._buf.drop_missing({t.track_id for t in tracks})
+        active = {t.track_id for t in tracks}
+        self._buf.drop_missing(active)
+        for tid in [t for t in self._ready_updates if t not in active]:
+            del self._ready_updates[tid]
         self._prune_cooldowns(ts)
         return events
 

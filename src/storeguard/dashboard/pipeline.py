@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from storeguard.config import DetectorCfg
+from storeguard.actions.shared import get_action_model
+from storeguard.config import ActionCfg, DetectorCfg
 from storeguard.dashboard.context import (
     COLOR_ALERT,
     COLOR_STAFF,
@@ -68,6 +69,68 @@ def _scale_tracks(tracks: list[Track], scale: float) -> list[Track]:
         Track(track_id=t.track_id, box=tuple(v * scale for v in t.box), conf=t.conf)  # type: ignore[arg-type]
         for t in tracks
     ]
+
+
+#: Ready tracks are re-classified on every Nth processed frame only (their
+#: 16-frame clips barely change between neighbouring frames).
+_ACTION_CLASSIFY_EVERY = 4
+
+
+def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | None) -> list:
+    """``pocket`` / ``take_cash`` scenarios for one live camera, if a model exists.
+
+    Live-view cameras come from the cabinet with zones but no scenario list,
+    so which detections apply is decided from the zones:
+
+    * ``pocket`` (hide an item in a pocket / bag) — on cameras with a
+      ``shelf*`` zone (only people there are checked), or with no zones at all
+      (everyone is checked);
+    * ``take_cash`` (cash out of the register) — only on cameras with a
+      ``register*`` zone, so ordinary shoppers are never classified as that.
+
+    Returns ``[]`` when ``models/action.pt`` (``action.weights``) is missing;
+    the model itself is loaded once per process and shared by all cameras.
+    """
+    if action is None:
+        return []
+    has_shelf = any(z.name.startswith("shelf") for z in zones)
+    has_register = any(z.name.startswith("register") for z in zones)
+    want_pocket = has_shelf or not zones
+    if not (want_pocket or has_register):
+        return []
+    model = get_action_model(action.weights)
+    if model is None:
+        return []
+
+    from storeguard.actions.clipbuffer import ClipBuffer
+    from storeguard.scenarios.cashier import CashierScenario
+    from storeguard.scenarios.pocket import PocketScenario
+
+    def buf() -> ClipBuffer:
+        # One buffer per scenario: a shared one would be fed twice per frame
+        # and its stride would silently halve.
+        return ClipBuffer(clip_len=action.clip_len, stride=action.stride, size=action.size)
+
+    scenarios: list = []
+    if want_pocket:
+        scenarios.append(
+            PocketScenario(
+                camera, model, buf(),
+                threshold=action.thresholds.get("pocket", 0.75),
+                zones=zones or None,
+                classify_every=_ACTION_CLASSIFY_EVERY,
+            )
+        )
+    if has_register:
+        scenarios.append(
+            CashierScenario(
+                camera, model, buf(),
+                threshold=action.thresholds.get("take_cash", 0.80),
+                zones=zones,
+                classify_every=_ACTION_CLASSIFY_EVERY,
+            )
+        )
+    return scenarios
 
 
 #: Serializes YOLO model construction the *first* time a given weights path
@@ -231,6 +294,7 @@ class DetectionSession:
         camera_id: str | None = None,
         identities: IdentityRegistry | None = None,
         context: StoreContext | None = None,
+        action: ActionCfg | None = None,
     ) -> None:
         self.id = session_id
         self.source = source
@@ -279,6 +343,8 @@ class DetectionSession:
         self._announced: set[tuple[str, int]] = set()
         self._crop_at: dict[int, float] = {}
         self._offline_reported = False
+        self._action_cfg = action
+        self._action_scenarios: list = []
         self._last_raw: np.ndarray | None = None
         self._seen_at: dict[int, float] = {}
         self._identities: CameraIdentities | None = None
@@ -590,6 +656,9 @@ class DetectionSession:
             self._identities = CameraIdentities(
                 self._registry, encoder.encode if encoder is not None else None
             )
+            self._action_scenarios = build_action_scenarios(
+                self.filename, self._zones, self._action_cfg
+            )
             detect_phones = getattr(self._tracker, "detect_phones", None)
             if detect_phones is not None:
                 self._phone = PhoneScenario(self.filename, detect_phones)
@@ -723,6 +792,12 @@ class DetectionSession:
                         elif self._registry.is_paid(gid):
                             statuses[gid] = "paid"
                     new_events = self._exit_scenario.update(frame, tracks, ts)
+                    for sc in self._action_scenarios:
+                        try:
+                            new_events.extend(sc.update(frame, tracks, ts))
+                        except Exception as exc:  # noqa: BLE001 — never kill the camera
+                            with self._lock:
+                                self._stats.error = f"{sc.kind} detection failed: {exc}"
                     new_events += self._analyse(frame, tracks, statuses, ts)
                     # Evidence ring: preview-size frames (full 1080p frames
                     # would cost ~3 GB per camera); keep the newest raw frame

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, model_validator
 from starlette.websockets import WebSocketDisconnect
 
 from storeguard.cloud.agent_client import CloudClient
-from storeguard.config import DetectorCfg
+from storeguard.config import ActionCfg, DetectorCfg
 from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
 from storeguard.dashboard.context import StoreContext
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
@@ -218,6 +218,7 @@ def create_app(
     agent_server: str | None = None,
     agent_key: str | None = None,
     port_factory: "Callable[[str], object] | None" = None,
+    action: ActionCfg | None = None,
 ) -> FastAPI:
     """Build the dashboard FastAPI application.
 
@@ -286,6 +287,8 @@ def create_app(
     # dashboard was given cloud agent credentials.
     app.state.cloud_client = build_cloud_client(agent_server, agent_key)
     app.state.port_factory = port_factory
+    # Trained pocket / take_cash classifier (used only if models/action.pt exists).
+    app.state.action = action or ActionCfg()
     app.state.alert_sink = DashboardAlertSink(
         videos_root / "events" / "clips", app.state.cloud_client
     )
@@ -324,6 +327,7 @@ def create_app(
             camera_id=camera_id,
             identities=identities,
             context=context,
+            action=app.state.action,
         )
 
     def _new_context(tenant_id: str | None = None, port=None) -> StoreContext:
@@ -838,6 +842,7 @@ def serve(
     checkout_dwell_sec: float = 2.0,
     agent_server: str | None = None,
     agent_key: str | None = None,
+    action: ActionCfg | None = None,
 ) -> None:
     """Run the dashboard with uvicorn (blocking)."""
     import uvicorn
@@ -849,5 +854,6 @@ def serve(
         checkout_dwell_sec=checkout_dwell_sec,
         agent_server=agent_server,
         agent_key=agent_key,
+        action=action,
     )
     uvicorn.run(app, host=host, port=port, log_level="info")

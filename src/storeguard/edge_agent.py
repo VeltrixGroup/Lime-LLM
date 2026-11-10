@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from rich.console import Console
 
-from storeguard.alerts import write_mp4_clip
+from storeguard.alerts import dedup_key, write_mp4_clip
 from storeguard.cloud.agent_client import CloudClient
 from storeguard.config import AppCfg, CameraCfg, DetectorCfg, ZoneCfg
 from storeguard.runner import run
@@ -36,7 +36,7 @@ class CloudAlertSink:
 
     Duck-typed to :class:`storeguard.alerts.AlertSink`: the runner's delivery
     thread calls ``handle(event, frames, fps)``. Applies the same per-
-    ``(camera, kind)`` min-gap as the local sink so a burst can't spam the
+    ``(camera, kind, person)`` min-gap as the local sink so a burst can't spam the
     cloud, then sends the event metadata and uploads a short clip.
     """
 
@@ -51,7 +51,7 @@ class CloudAlertSink:
     ) -> None:
         self._client = client
         self._camera_ids = camera_ids  # camera name -> cloud camera id
-        self._last_sent: dict[tuple[str, str], float] = {}
+        self._last_sent: dict[tuple, float] = {}
         self._lock = threading.Lock()
         self._clip_dir = Path(clip_dir or tempfile.mkdtemp(prefix="storeguard-agent-"))
 
@@ -59,7 +59,7 @@ class CloudAlertSink:
         self, event: "Event", frames: list["np.ndarray"], fps: float | None = None
     ) -> None:
         with self._lock:
-            key = (event.camera, event.kind)
+            key = dedup_key(event)
             last = self._last_sent.get(key)
             if last is not None and event.ts - last < self.min_gap_sec:
                 return

@@ -33,6 +33,7 @@ class _FakeSession:
         camera_id=None,
         identities=None,
         context=None,
+        action=None,
     ) -> None:
         self.id = session_id
         self.context = context

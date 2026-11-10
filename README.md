@@ -8,14 +8,14 @@ theft-related actions.
 
 | # | Detection | How it works | Needs training? |
 |---|-----------|--------------|-----------------|
-| 1 | **People** — every person in the frame is detected and gets a track id | YOLO11 + ByteTrack | No |
+| 1 | **People** — every person in the frame is detected and gets an id that is the same on every camera (cross-camera re-identification) | YOLO26 + ByteTrack + appearance ReID | No |
 | 2 | **`pocket`** — a shopper takes a product from the shelf and hides it in a pocket / clothes / bag | Action classifier (3D CNN) on person crops | **Yes** |
 | 3 | **`exit_no_pay`** — a person spends time at the shelves and then goes to the exit **without** passing the checkout | Pure zone logic (shelf / checkout / exit polygons) | No |
 | 4 | **`take_cash`** — an employee takes money out of the register drawer and carries it away | Action classifier (3D CNN) on person crops | **Yes** |
 
 ### Two-stage architecture (short)
 
-- **Stage 1 — works out of the box.** YOLO11 detects people, ByteTrack gives
+- **Stage 1 — works out of the box.** YOLO26 detects people, ByteTrack gives
   each person a stable id, and polygon zones that you draw on the frame
   ("shelf…", "checkout", "exit", "register…") drive the `exit_no_pay` logic.
   No training needed.
@@ -30,6 +30,20 @@ Every alert produces three things:
 1. A **Telegram message** to your chat (if enabled).
 2. A saved **mp4 clip** of the moment: `events/clips/<camera>_<kind>_<time>.mp4`.
 3. A line in the **event log**: `events/events.jsonl`.
+
+In the live dashboard (`storeguard dashboard` / the cabinet's Live view) the
+same lands under `data/events/`: `clips/*.mp4` plus `events.jsonl`, whose
+lines also carry `camera_id`, the store-wide `person_id` (the same person on
+every camera) and the cabinet's `cloud_event_id` when the push succeeded.
+Repeat alerts are suppressed for 10 s per person, not per camera, so two
+different people are never merged into one alert.
+
+The live dashboard also runs `pocket` and `take_cash` as soon as a trained
+`models/action.pt` exists. Cabinet cameras
+carry zones but no scenario list, so the zones decide: `pocket` on cameras
+with a `shelf*` zone (or no zones at all), `take_cash` only on cameras with a
+`register*` zone. The dashboard log says at startup whether the model was
+found.
 
 ## How the whole workflow looks
 
@@ -259,6 +273,9 @@ detector:
   new_track_conf: 0.6   # score needed to start a new person (fewer false people)
   imgsz: 640
   device: auto          # auto -> cuda if available, else mps, else cpu
+reid:                   # same person id on every camera
+  enabled: true
+  threshold: 0.6        # raise if different people share an id
 action:
   weights: models/action.pt
   clip_len: 16

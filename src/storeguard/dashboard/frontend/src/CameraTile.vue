@@ -30,7 +30,20 @@ const emit = defineEmits(["toggle-expand", "close"]);
         }}
       </span>
     </figcaption>
+    <!-- In the expanded view the corner button minimizes back to the grid;
+         disconnecting is only offered from the grid, where it can't be
+         mistaken for "close this big view". -->
     <button
+      v-if="expanded"
+      type="button"
+      class="tile-close"
+      title="Back to all cameras (Esc)"
+      @click.stop="emit('toggle-expand')"
+    >
+      ⤡
+    </button>
+    <button
+      v-else
       type="button"
       class="tile-close"
       title="Disconnect this camera"

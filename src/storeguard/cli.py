@@ -49,11 +49,15 @@ def _dashboard_kwargs(args: argparse.Namespace, url: str) -> dict:
     agent_server = args.agent_server or os.environ.get("STOREGUARD_AGENT_SERVER", "")
     agent_key = args.agent_key or os.environ.get("STOREGUARD_AGENT_KEY", "")
 
+    from .config import ActionCfg
+
     detector = DetectorCfg(device=args.device)
+    action = ActionCfg()
     zones = []
     if args.config:
         cfg = load_config(args.config)
         detector = cfg.detector
+        action = cfg.action
         if args.device != "auto":
             detector = detector.model_copy(update={"device": args.device})
         # Prefer the first camera that has zones (paid / not-paid needs checkout).
@@ -106,6 +110,7 @@ def _dashboard_kwargs(args: argparse.Namespace, url: str) -> dict:
         "zones": zones,
         "agent_server": agent_server or None,
         "agent_key": agent_key or None,
+        "action": action,
     }
 
 
@@ -115,6 +120,50 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
 
     kwargs = _dashboard_kwargs(args, f"http://{args.host}:{args.port}")
     serve(host=args.host, port=args.port, **kwargs)
+
+
+def _cmd_gpu_check(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard gpu-check``: why is detection on the CPU?"""
+    import shutil
+    import subprocess
+
+    import torch
+
+    from .config import cuda_help
+
+    console.print(f"torch {torch.__version__}, CUDA build: {torch.version.cuda or 'none (CPU-only)'}")
+    smi = shutil.which("nvidia-smi")
+    driver = None
+    if smi:
+        try:
+            out = subprocess.run(
+                [smi, "--query-gpu=name,driver_version", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=15,
+            )
+            driver = out.stdout.strip() or out.stderr.strip()
+        except Exception as exc:  # noqa: BLE001
+            driver = f"nvidia-smi failed: {exc}"
+    console.print(f"nvidia-smi: {driver or 'not found (no NVIDIA GPU / driver)'}")
+
+    ok = False
+    try:
+        ok = torch.cuda.is_available()
+        if ok:
+            name = torch.cuda.get_device_name(0)
+            cap = ".".join(map(str, torch.cuda.get_device_capability(0)))
+            x = torch.ones(1024, 1024, device="cuda")
+            float((x @ x).sum())  # a real kernel: catches "no kernel image" errors
+            console.print(f"[green]CUDA OK: {name} (compute {cap})[/green]")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        console.print(f"[red]CUDA error: {exc}[/red]")
+    if ok:
+        return
+    if not smi:
+        console.print("[yellow]No NVIDIA GPU found — detection runs on the CPU.[/yellow]")
+        raise SystemExit(1)
+    console.print(f"[red]{cuda_help()}[/red]")
+    raise SystemExit(1)
 
 
 def _cmd_draw_zones(args: argparse.Namespace) -> None:
@@ -411,6 +460,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
     _add_dashboard_args(p)
     p.set_defaults(func=_cmd_dashboard)
+
+    p = sub.add_parser(
+        "gpu-check",
+        help="diagnose whether detection can use the NVIDIA GPU (CUDA)",
+    )
+    p.set_defaults(func=_cmd_gpu_check)
 
     p = sub.add_parser(
         "draw-zones",

@@ -25,6 +25,31 @@ import cv2
 import numpy as np
 
 
+def _open_ffmpeg(source: str) -> cv2.VideoCapture:
+    """Open a network source via FFmpeg, with hardware decoding if available.
+
+    A 4MP main stream costs a whole CPU core per camera to decode in
+    software; ``VIDEO_ACCELERATION_ANY`` lets OpenCV use D3D11 / VAAPI / etc.
+    when the build supports it and silently falls back to software otherwise.
+    """
+    params: list[int] = []
+    if hasattr(cv2, "CAP_PROP_HW_ACCELERATION") and hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
+        params = [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY]
+    try:
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, params) if params else None
+    except (cv2.error, TypeError):
+        cap = None
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except cv2.error:
+        pass
+    return cap
+
+
 class VideoStream:
     """cv2.VideoCapture wrapper: RTSP (with auto-reconnect) or video file."""
 
@@ -77,7 +102,7 @@ class VideoStream:
     def _open(self) -> None:
         """(Re)open the underlying capture."""
         if self._is_rtsp:
-            self._cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            self._cap = _open_ffmpeg(self.source)
         else:
             self._cap = cv2.VideoCapture(self.source)
         if not self._cap.isOpened():
