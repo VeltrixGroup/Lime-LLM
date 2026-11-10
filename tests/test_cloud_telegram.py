@@ -42,6 +42,14 @@ def _staff(app, owner: TestClient) -> TestClient:
     return c
 
 
+def _wait(cond, timeout: float = 5.0) -> None:
+    import time
+
+    end = time.monotonic() + timeout
+    while not cond() and time.monotonic() < end:
+        time.sleep(0.05)
+
+
 def _agent_pushes_clip(app, owner: TestClient) -> None:
     cam_id = owner.post(
         "/api/cameras", json={"name": "Entrance", "source": "rtsp://a/1"}
@@ -60,7 +68,8 @@ def _agent_pushes_clip(app, owner: TestClient) -> None:
 
 
 def test_telegram_config_roundtrip_hides_token(owner: TestClient) -> None:
-    assert owner.get("/api/settings/telegram").json() == {
+    initial = owner.get("/api/settings/telegram").json()
+    assert {k: initial[k] for k in ("enabled", "chat_id", "token_set")} == {
         "enabled": False,
         "chat_id": "",
         "token_set": False,
@@ -69,7 +78,11 @@ def test_telegram_config_roundtrip_hides_token(owner: TestClient) -> None:
         "/api/settings/telegram",
         json={"enabled": True, "bot_token": "SECRET-TOKEN", "chat_id": "42"},
     ).json()
-    assert saved == {"enabled": True, "chat_id": "42", "token_set": True}
+    assert {k: saved[k] for k in ("enabled", "chat_id", "token_set")} == {
+        "enabled": True,
+        "chat_id": "42",
+        "token_set": True,
+    }
     assert "SECRET-TOKEN" not in str(saved)  # token never returned
 
 
@@ -112,22 +125,44 @@ def test_test_endpoint_sends(owner: TestClient, monkeypatch) -> None:
 def test_clip_upload_delivers_to_telegram(app, owner: TestClient, monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(
-        telegram_mod, "deliver_clip", lambda *a, **k: calls.append(a)
+        telegram_mod, "send", lambda *a, **k: calls.append((a, k)) or True
     )
     owner.put(
         "/api/settings/telegram",
         json={"enabled": True, "bot_token": "BOT", "chat_id": "123"},
     )
     _agent_pushes_clip(app, owner)
+    _wait(lambda: calls)  # delivered by a background thread once the clip is in
     assert len(calls) == 1
-    bot_token, chat_id, _clip_path, caption = calls[0]
+    (bot_token, chat_id, text), kwargs = calls[0]
     assert bot_token == "BOT" and chat_id == "123"
-    assert "theft" in caption and "Entrance" in caption
+    assert "grab" in text and "Entrance" in text
+    assert kwargs["video"] is not None  # format "clip" sends the video
+    assert "ok:" in kwargs["reply_markup"]  # Подтвердить / Ложная тревога buttons
 
 
 def test_no_delivery_when_telegram_disabled(app, owner: TestClient, monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(telegram_mod, "deliver_clip", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(telegram_mod, "send", lambda *a, **k: calls.append(a) or True)
     # telegram left unconfigured (disabled)
     _agent_pushes_clip(app, owner)
     assert calls == []
+
+
+def test_api_base_defaults_to_telegram(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_API_BASE", raising=False)
+    assert telegram_mod.api_base() == "https://api.telegram.org"
+
+
+def test_api_base_uses_proxy_override(monkeypatch):
+    calls = []
+
+    class _Resp:
+        ok = True
+        status_code = 200
+        text = "{}"
+
+    monkeypatch.setenv("TELEGRAM_API_BASE", "https://tg.example.test/secret/")
+    monkeypatch.setattr(telegram_mod.requests, "post", lambda url, **kw: calls.append(url) or _Resp())
+    assert telegram_mod.send_message("123:abc", "42", "hi")
+    assert calls == ["https://tg.example.test/secret/bot123:abc/sendMessage"]

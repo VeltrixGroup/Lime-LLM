@@ -100,7 +100,7 @@ def test_detection_session_dispatches_exit_no_pay_event(monkeypatch) -> None:
     session = _session(alert_queue=alert_queue, camera_id="cam-42")
     session.start()
     try:
-        event, frames, fps, camera_id = alert_queue.get(timeout=5.0)
+        event, frames, fps, camera_id, _port = alert_queue.get(timeout=5.0)
     finally:
         session.stop()
 

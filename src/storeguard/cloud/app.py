@@ -9,6 +9,7 @@ later phases; nothing here touches the GPU pipeline.
 from __future__ import annotations
 
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -21,25 +22,34 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 from starlette.middleware.sessions import SessionMiddleware
 
-from storeguard.cloud import lime_crm, mailer, telegram
-from storeguard.cloud.live_proxy import build_live_proxy_router
+from storeguard.cloud import lime_crm, mailer, services, telegram
+from storeguard.cloud.live_proxy import LoginRequired, build_live_proxy_router
 from storeguard.cloud.auth import (
     current_agent,
     current_membership,
     current_user,
     login_session,
+    ensure_system_roles,
     logout_session,
-    require_owner,
+    permissions_of,
+    require_perm,
 )
-from storeguard.cloud.db import Base, build_engine, build_session_factory, get_db
+from storeguard.cloud.db import (
+    Base,
+    add_missing_columns,
+    build_engine,
+    build_session_factory,
+    get_db,
+)
 from storeguard.cloud.models import (
     ROLE_OWNER,
+    category_of,
     AgentKey,
     Camera,
     CameraDefaults,
@@ -88,6 +98,7 @@ from storeguard.cloud.schemas import (
     build_camera_source,
     camera_label,
     normalize_email,
+    normalize_phone,
 )
 from storeguard.cloud.security import (
     generate_agent_token,
@@ -165,18 +176,50 @@ def _unique_slug(db: Session, name: str) -> str:
     return slug
 
 
-def _me_payload(user: User, tenant: Tenant, role: str) -> MeOut:
+def _me_payload(db: Session, user: User, tenant: Tenant, membership: Membership) -> MeOut:
+    roles = ensure_system_roles(db, tenant.id)
+    role = roles.get(membership.role)
     return MeOut(
-        user=UserOut(id=user.id, email=user.email, full_name=user.full_name),
-        tenant=TenantOut(id=tenant.id, name=tenant.name, slug=tenant.slug, role=role),
+        user=UserOut(
+            id=user.id, email=user.email, full_name=user.full_name, phone=user.phone
+        ),
+        tenant=TenantOut(
+            id=tenant.id,
+            name=tenant.name,
+            slug=tenant.slug,
+            role=membership.role,
+            role_name=role.name if role else membership.role,
+            permissions=sorted(permissions_of(db, membership)),
+        ),
     )
 
 
-def _camera_out(cam: Camera) -> CameraOut:
+def _check_role_assignable(db: Session, tenant_id: str, role: str, actor: Membership) -> None:
+    """404 for a role that doesn't exist here; only an owner may hand out "owner"."""
+    roles = ensure_system_roles(db, tenant_id)
+    if role not in roles:
+        raise HTTPException(status_code=400, detail=f"unknown role {role!r}")
+    if role == ROLE_OWNER and actor.role != ROLE_OWNER:
+        raise HTTPException(status_code=403, detail="only an owner can make owners")
+
+
+def _member_out(m: Membership) -> MemberOut:
+    return MemberOut(
+        id=m.user.id,
+        email=m.user.email,
+        full_name=m.user.full_name,
+        role=m.role,
+        phone=m.user.phone,
+        last_login_at=m.user.last_login_at,
+    )
+
+
+def _camera_out(cam: Camera, with_source: bool = True) -> CameraOut:
+    """``with_source=False`` hides the RTSP URL (it embeds the camera password)."""
     return CameraOut(
         id=cam.id,
         name=cam.name,
-        source=cam.source,
+        source=cam.source if with_source else camera_label(cam.source),
         label=camera_label(cam.source),
         process_every=cam.process_every,
         enabled=cam.enabled,
@@ -207,7 +250,7 @@ def _agent_key_out(k: AgentKey) -> AgentKeyOut:
     )
 
 
-def _event_out(e: Event) -> EventOut:
+def _event_out(e: Event, employee_name: str | None = None) -> EventOut:
     return EventOut(
         id=e.id,
         kind=e.kind,
@@ -220,6 +263,11 @@ def _event_out(e: Event) -> EventOut:
         ts=e.ts,
         created_at=e.created_at,
         has_clip=bool(e.clip_path),
+        status=e.status or "new",
+        category=category_of(e.kind),
+        employee_id=e.employee_id,
+        employee_name=employee_name,
+        duration_sec=e.duration_sec,
     )
 
 
@@ -230,6 +278,8 @@ def create_cloud_app(
     create_tables: bool = False,
     secure_cookies: bool | None = None,
     events_dir: str | None = None,
+    live_app: FastAPI | None = None,
+    start_bot: bool = False,
 ) -> FastAPI:
     """Build the control-plane FastAPI app.
 
@@ -239,6 +289,13 @@ def create_cloud_app(
         create_tables: If True, ``create_all`` the schema on startup — handy for
             tests and first-run dev.  Production uses Alembic migrations instead.
         secure_cookies: Force the Secure cookie flag; defaults to settings.
+        live_app: The detection dashboard app, run in this same process and
+            served under ``/live/`` (one port for everything, when cameras
+            and control panel are on the same PC). Without it, ``/live/`` is
+            proxied to a separate ``storeguard dashboard`` process at
+            ``settings.dashboard_upstream_url``.
+        start_bot: Run the Telegram bot loop (/start linking, review buttons,
+            reminders) in the background. Off by default so tests stay offline.
     """
     settings = get_settings()
     database_url = database_url or settings.database_url
@@ -249,9 +306,37 @@ def create_cloud_app(
     session_factory = build_session_factory(engine)
     if create_tables:
         Base.metadata.create_all(engine)
+        added = add_missing_columns(engine)
+        if added:
+            from rich.console import Console
+
+            Console(stderr=True).print(
+                f"[yellow]--dev: added {len(added)} new column(s) to the existing "
+                f"database: {', '.join(added)}[/yellow]"
+            )
 
     events_root = Path(events_dir or settings.events_dir)
     events_root.mkdir(parents=True, exist_ok=True)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        poller = None
+        if start_bot:
+            from storeguard.cloud.tgbot import BotPoller
+
+            poller = BotPoller(session_factory, settings.public_base_url)
+            poller.start()
+        try:
+            # A mounted sub-app's own lifespan never runs on its own; run it
+            # here so the dashboard still stops its camera threads on shutdown.
+            if live_app is None:
+                yield
+            else:
+                async with live_app.router.lifespan_context(live_app):
+                    yield
+        finally:
+            if poller is not None:
+                poller.stop()
 
     app = FastAPI(
         title="storeguard cloud",
@@ -259,6 +344,7 @@ def create_cloud_app(
         openapi_url="/api/openapi.json",
         docs_url="/api/docs",
         redoc_url=None,
+        lifespan=lifespan,
     )
     app.add_middleware(
         SessionMiddleware,
@@ -273,6 +359,20 @@ def create_cloud_app(
     app.state.events_root = events_root
     app.state.agent_clip_max_mb = settings.agent_clip_max_mb
 
+    def direct_port(tenant_id: str):
+        """In-process agent for the embedded dashboard (one-port mode)."""
+        from storeguard.cloud.direct import DirectCloud
+
+        return DirectCloud(session_factory, tenant_id, settings.public_base_url)
+
+    app.state.direct_port = direct_port
+
+    from storeguard.cloud.agent_api import build_agent_router
+    from storeguard.cloud.panel_api import build_panel_router
+
+    app.include_router(build_panel_router(settings.public_base_url))
+    app.include_router(build_agent_router(session_factory, settings.public_base_url))
+
     @app.get("/api/health")
     def health() -> dict:
         return {"status": "ok", "service": "storeguard-cloud"}
@@ -285,29 +385,41 @@ def create_cloud_app(
         email = normalize_email(body.email)
         if db.scalar(select(User.id).where(User.email == email)) is not None:
             raise HTTPException(status_code=409, detail="email already registered")
+        if body.phone and db.scalar(select(User.id).where(User.phone == body.phone)):
+            raise HTTPException(status_code=409, detail="phone already registered")
 
-        tenant = Tenant(name=body.org_name.strip(), slug=_unique_slug(db, body.org_name))
+        tenant = Tenant(
+            name=body.org_name.strip(),
+            slug=_unique_slug(db, body.org_name),
+            address=body.address.strip(),
+        )
         user = User(
             email=email,
             password_hash=hash_password(body.password),
             full_name=body.full_name.strip(),
+            phone=body.phone or None,
+            last_login_at=datetime.now(timezone.utc),
         )
         db.add(tenant)
         db.add(user)
         db.flush()  # assign ids before creating the membership
-        db.add(Membership(user_id=user.id, tenant_id=tenant.id, role=ROLE_OWNER))
+        membership = Membership(user_id=user.id, tenant_id=tenant.id, role=ROLE_OWNER)
+        db.add(membership)
+        ensure_system_roles(db, tenant.id)
         db.commit()
 
         login_session(request, user.id, tenant.id)
-        return _me_payload(user, tenant, ROLE_OWNER)
+        return _me_payload(db, user, tenant, membership)
 
     @app.post("/api/auth/login", response_model=MeOut)
     def login(
         body: LoginRequest, request: Request, db: Session = Depends(get_db)
     ) -> MeOut:
         """Authenticate and start a session on the user's first tenant."""
-        email = normalize_email(body.email)
-        user = db.scalar(select(User).where(User.email == email))
+        if "@" in body.email:
+            user = db.scalar(select(User).where(User.email == normalize_email(body.email)))
+        else:
+            user = db.scalar(select(User).where(User.phone == body.email))
         # Verify even when the user is missing would let attackers time the
         # difference; a constant-ish path is fine here since bcrypt dominates.
         if user is None or not verify_password(body.password, user.password_hash):
@@ -324,8 +436,10 @@ def create_cloud_app(
             raise HTTPException(status_code=403, detail="no organization for this user")
 
         tenant = db.get(Tenant, membership.tenant_id)
+        user.last_login_at = datetime.now(timezone.utc)
+        db.commit()
         login_session(request, user.id, tenant.id)
-        return _me_payload(user, tenant, membership.role)
+        return _me_payload(db, user, tenant, membership)
 
     @app.post("/api/auth/logout")
     def logout(request: Request) -> dict:
@@ -337,7 +451,9 @@ def create_cloud_app(
         db: Session = Depends(get_db),
         membership: Membership = Depends(current_membership),
     ) -> MeOut:
-        return _me_payload(membership.user, membership.tenant, membership.role)
+        payload = _me_payload(db, membership.user, membership.tenant, membership)
+        db.commit()  # system roles may have just been seeded
+        return payload
 
     @app.get("/api/org/members", response_model=MembersOut)
     def org_members(
@@ -354,17 +470,7 @@ def create_cloud_app(
             )
             .all()
         )
-        return MembersOut(
-            members=[
-                MemberOut(
-                    id=m.user.id,
-                    email=m.user.email,
-                    full_name=m.user.full_name,
-                    role=m.role,
-                )
-                for m in rows
-            ]
-        )
+        return MembersOut(members=[_member_out(m) for m in rows])
 
     def _count_owners(db: Session, tenant_id: str) -> int:
         return (
@@ -383,9 +489,13 @@ def create_cloud_app(
     def add_member(
         body: AddMemberRequest,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("users")),
     ) -> MemberOut:
-        """Owner-only: create a new user and add them to this tenant."""
+        """Create a new user and add them to this tenant ("users" permission)."""
+        _check_role_assignable(db, owner.tenant_id, body.role, owner)
+        phone = normalize_phone(body.phone) if body.phone.strip() else None
+        if phone and db.scalar(select(User.id).where(User.phone == phone)):
+            raise HTTPException(status_code=409, detail="a user with this phone exists")
         email = normalize_email(body.email)
         if db.scalar(select(User.id).where(User.email == email)) is not None:
             # Cross-org invites (adding an existing account to another tenant)
@@ -398,25 +508,25 @@ def create_cloud_app(
             email=email,
             password_hash=hash_password(body.password),
             full_name=body.full_name.strip(),
+            phone=phone,
         )
         db.add(user)
         db.flush()
-        db.add(
-            Membership(user_id=user.id, tenant_id=owner.tenant_id, role=body.role)
-        )
+        membership = Membership(user_id=user.id, tenant_id=owner.tenant_id, role=body.role)
+        db.add(membership)
         db.commit()
-        return MemberOut(
-            id=user.id, email=user.email, full_name=user.full_name, role=body.role
-        )
+        db.refresh(membership)
+        return _member_out(membership)
 
     @app.patch("/api/org/members/{user_id}", response_model=MemberOut)
     def update_member(
         user_id: str,
         body: UpdateMemberRequest,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("users")),
     ) -> MemberOut:
-        """Owner-only: change a member's role (can't demote the last owner)."""
+        """Change a member's role (can't demote the last owner)."""
+        _check_role_assignable(db, owner.tenant_id, body.role, owner)
         membership = db.scalar(
             select(Membership).where(
                 Membership.user_id == user_id,
@@ -431,21 +541,17 @@ def create_cloud_app(
             and _count_owners(db, owner.tenant_id) <= 1
         ):
             raise HTTPException(status_code=409, detail="cannot demote the last owner")
+        if membership.role == ROLE_OWNER and owner.role != ROLE_OWNER:
+            raise HTTPException(status_code=403, detail="only an owner can change owners")
         membership.role = body.role
         db.commit()
-        user = db.get(User, user_id)
-        return MemberOut(
-            id=user.id,
-            email=user.email,
-            full_name=user.full_name,
-            role=membership.role,
-        )
+        return _member_out(membership)
 
     @app.delete("/api/org/members/{user_id}")
     def remove_member(
         user_id: str,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("users")),
     ) -> dict:
         """Owner-only: remove a member from this tenant (not the last owner)."""
         membership = db.scalar(
@@ -458,6 +564,8 @@ def create_cloud_app(
             raise HTTPException(status_code=404, detail="member not found")
         if membership.role == ROLE_OWNER and _count_owners(db, owner.tenant_id) <= 1:
             raise HTTPException(status_code=409, detail="cannot remove the last owner")
+        if membership.role == ROLE_OWNER and owner.role != ROLE_OWNER:
+            raise HTTPException(status_code=403, detail="only an owner can remove owners")
         db.delete(membership)
         db.commit()
         return {"removed": True, "user_id": user_id}
@@ -543,6 +651,7 @@ def create_cloud_app(
         db: Session = Depends(get_db),
         membership: Membership = Depends(current_membership),
     ) -> CamerasOut:
+        can_edit = "cams_edit" in permissions_of(db, membership)
         cams = (
             db.scalars(
                 select(Camera)
@@ -552,13 +661,13 @@ def create_cloud_app(
             )
             .all()
         )
-        return CamerasOut(cameras=[_camera_out(c) for c in cams])
+        return CamerasOut(cameras=[_camera_out(c, with_source=can_edit) for c in cams])
 
     @app.post("/api/cameras", response_model=CameraOut, status_code=201)
     def create_camera(
         body: CameraIn,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> CameraOut:
         if body.source:
             source = body.source
@@ -600,14 +709,15 @@ def create_cloud_app(
         db: Session = Depends(get_db),
         membership: Membership = Depends(current_membership),
     ) -> CameraOut:
-        return _camera_out(_get_camera(db, membership.tenant_id, camera_id))
+        can_edit = "cams_edit" in permissions_of(db, membership)
+        return _camera_out(_get_camera(db, membership.tenant_id, camera_id), with_source=can_edit)
 
     @app.patch("/api/cameras/{camera_id}", response_model=CameraOut)
     def update_camera(
         camera_id: str,
         body: CameraUpdate,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> CameraOut:
         cam = _get_camera(db, owner.tenant_id, camera_id)
         if body.name is not None:
@@ -637,7 +747,7 @@ def create_cloud_app(
     def delete_camera(
         camera_id: str,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> dict:
         cam = _get_camera(db, owner.tenant_id, camera_id)
         db.delete(cam)
@@ -649,7 +759,7 @@ def create_cloud_app(
         camera_id: str,
         body: ZonesIn,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> CameraOut:
         """Replace a camera's entire zone set (owner only)."""
         cam = _get_camera(db, owner.tenant_id, camera_id)
@@ -665,7 +775,7 @@ def create_cloud_app(
     def test_camera(
         camera_id: str,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> dict:
         """Try to open the camera's stream and grab one frame (owner only)."""
         cam = _get_camera(db, owner.tenant_id, camera_id)
@@ -694,7 +804,7 @@ def create_cloud_app(
     @app.get("/api/settings/camera-defaults", response_model=CameraDefaultsOut)
     def get_camera_defaults(
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> CameraDefaultsOut:
         return _camera_defaults_out(db.get(CameraDefaults, owner.tenant_id))
 
@@ -702,7 +812,7 @@ def create_cloud_app(
     def set_camera_defaults(
         body: CameraDefaultsIn,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("cams_edit")),
     ) -> CameraDefaultsOut:
         cfg = db.get(CameraDefaults, owner.tenant_id)
         if cfg is None:
@@ -738,7 +848,7 @@ def create_cloud_app(
     def create_agent_key(
         body: AgentKeyCreateRequest,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> AgentKeyCreated:
         """Mint a new edge-agent token (owner only). Plaintext shown once."""
         token = generate_agent_token()
@@ -758,7 +868,7 @@ def create_cloud_app(
     def revoke_agent_key(
         key_id: str,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> dict:
         key = db.scalar(
             select(AgentKey).where(
@@ -778,7 +888,7 @@ def create_cloud_app(
         limit: int = 200,
         person_id: str | None = None,
         db: Session = Depends(get_db),
-        membership: Membership = Depends(current_membership),
+        membership: Membership = Depends(require_perm("archive")),
     ) -> EventsOut:
         """Recent events for the tenant.
 
@@ -798,7 +908,7 @@ def create_cloud_app(
     def get_event_clip(
         event_id: str,
         db: Session = Depends(get_db),
-        membership: Membership = Depends(current_membership),
+        membership: Membership = Depends(require_perm("archive")),
     ) -> FileResponse:
         ev = db.scalar(
             select(Event).where(
@@ -820,13 +930,26 @@ def create_cloud_app(
         if cfg is None:
             return TelegramConfigOut(enabled=False, chat_id="", token_set=False)
         return TelegramConfigOut(
-            enabled=cfg.enabled, chat_id=cfg.chat_id, token_set=bool(cfg.bot_token)
+            enabled=cfg.enabled,
+            chat_id=cfg.chat_id,
+            token_set=bool(cfg.bot_token),
+            bot_username=cfg.bot_username,
+            format=cfg.format,
+            buttons=cfg.buttons,
+            include_link=cfg.include_link,
+            notify_offline=cfg.notify_offline,
+            remind_min=cfg.remind_min,
+            quiet_enabled=cfg.quiet_enabled,
+            quiet_from=cfg.quiet_from,
+            quiet_to=cfg.quiet_to,
+            language=cfg.language,
+            last_delivered_at=cfg.last_delivered_at,
         )
 
     @app.get("/api/settings/telegram", response_model=TelegramConfigOut)
     def get_telegram_settings(
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> TelegramConfigOut:
         return _telegram_out(db.get(TelegramConfig, owner.tenant_id))
 
@@ -834,7 +957,7 @@ def create_cloud_app(
     def set_telegram_settings(
         body: TelegramConfigIn,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> TelegramConfigOut:
         cfg = db.get(TelegramConfig, owner.tenant_id)
         if cfg is None:
@@ -844,21 +967,32 @@ def create_cloud_app(
         cfg.chat_id = body.chat_id.strip()
         token = body.bot_token.strip()
         if token:  # an empty token in the request keeps the stored one
+            if token != cfg.bot_token:
+                cfg.bot_username = ""
+                cfg.update_offset = 0
             cfg.bot_token = token
+        for field in (
+            "format", "buttons", "include_link", "notify_offline", "remind_min",
+            "quiet_enabled", "quiet_from", "quiet_to", "language",
+        ):
+            setattr(cfg, field, getattr(body, field))
         db.commit()
         return _telegram_out(cfg)
 
     @app.post("/api/settings/telegram/test")
     def test_telegram_settings(
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> dict:
         cfg = db.get(TelegramConfig, owner.tenant_id)
         if cfg is None or not cfg.bot_token or not cfg.chat_id:
             raise HTTPException(
                 status_code=400, detail="set a bot token and chat id first"
             )
-        ok = telegram.send_message(cfg.bot_token, cfg.chat_id, "storeguard: test alert ✅")
+        ok = telegram.send_message(cfg.bot_token, cfg.chat_id, services.tg_text(cfg, "test"))
+        if ok:
+            cfg.last_delivered_at = services.utcnow()
+            db.commit()
         return {"sent": ok}
 
     # ---- lime crm / generic webhook settings (cabinet side, owner-only) ----
@@ -878,7 +1012,7 @@ def create_cloud_app(
     @app.get("/api/settings/lime-crm", response_model=LimeCrmConfigOut)
     def get_lime_crm_settings(
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> LimeCrmConfigOut:
         return _lime_crm_out(db.get(LimeCrmConfig, owner.tenant_id))
 
@@ -886,7 +1020,7 @@ def create_cloud_app(
     def set_lime_crm_settings(
         body: LimeCrmConfigIn,
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> LimeCrmConfigOut:
         cfg = db.get(LimeCrmConfig, owner.tenant_id)
         if cfg is None:
@@ -904,7 +1038,7 @@ def create_cloud_app(
     @app.post("/api/settings/lime-crm/test")
     def test_lime_crm_settings(
         db: Session = Depends(get_db),
-        owner: Membership = Depends(require_owner),
+        owner: Membership = Depends(require_perm("settings")),
     ) -> dict:
         cfg = db.get(LimeCrmConfig, owner.tenant_id)
         if cfg is None or not cfg.webhook_url:
@@ -943,6 +1077,7 @@ def create_cloud_app(
             tenant_id=tenant.id,
             tenant_name=tenant.name,
             cameras=[_camera_out(c) for c in cams],
+            **services.agent_config_extras(db, agent.tenant_id),
         )
 
     @app.post("/api/agent/heartbeat")
@@ -957,34 +1092,25 @@ def create_cloud_app(
         db: Session = Depends(get_db),
         agent: AgentKey = Depends(current_agent),
     ) -> EventOut:
-        camera_id = None
-        camera_name = ""
-        if body.camera_id is not None:
-            cam = db.scalar(
-                select(Camera).where(
-                    Camera.id == body.camera_id,
-                    Camera.tenant_id == agent.tenant_id,
-                )
+        try:
+            ev = services.record_event(
+                db,
+                agent.tenant_id,
+                kind=body.kind,
+                message=body.message,
+                camera_id=body.camera_id,
+                person_id=body.person_id,
+                track_id=body.track_id,
+                score=body.score,
+                ts=body.ts,
+                employee_id=body.employee_id,
+                duration_sec=body.duration_sec,
             )
-            if cam is None:
-                raise HTTPException(
-                    status_code=400, detail="camera_id is not in this tenant"
-                )
-            camera_id = cam.id
-            camera_name = cam.name
-        ev = Event(
-            tenant_id=agent.tenant_id,
-            camera_id=camera_id,
-            camera_name=camera_name,
-            person_id=body.person_id,
-            kind=body.kind,
-            message=body.message,
-            track_id=body.track_id,
-            score=body.score,
-            ts=body.ts or datetime.now(timezone.utc),
-        )
-        db.add(ev)
-        db.commit()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if ev is None:
+            # Category switched off in the store's alert rules.
+            raise HTTPException(status_code=409, detail="this incident type is turned off")
 
         # Every detection, not just ones that end up with a clip — off the
         # request path so a slow/down receiver can't delay the agent's push.
@@ -995,19 +1121,11 @@ def create_cloud_app(
                 crm.webhook_url,
                 crm.auth_header,
                 crm.auth_token,
-                {
-                    "id": ev.id,
-                    "tenant_id": ev.tenant_id,
-                    "kind": ev.kind,
-                    "message": ev.message,
-                    "camera_id": ev.camera_id,
-                    "camera_name": ev.camera_name,
-                    "person_id": ev.person_id,
-                    "track_id": ev.track_id,
-                    "score": ev.score,
-                    "ts": ev.ts.isoformat(),
-                },
+                services.webhook_payload(ev),
             )
+        # Delivered once the clip arrives, or without it after a short wait
+        # (camera offline, no frames, failed upload).
+        services.schedule_delivery(db, session_factory, ev, settings.public_base_url)
         return _event_out(ev)
 
     @app.post("/api/agent/events/{event_id}/clip", response_model=EventOut)
@@ -1063,16 +1181,8 @@ def create_cloud_app(
         ev.clip_content_type = clip.content_type or "application/octet-stream"
         db.commit()
 
-        # Deliver to the tenant's Telegram bot off the request path so the
-        # agent's upload returns promptly (Telegram I/O can take seconds).
-        tg = db.get(TelegramConfig, agent.tenant_id)
-        if tg and tg.enabled and tg.bot_token and tg.chat_id:
-            caption = (
-                f"{ev.camera_name or 'camera'} · {ev.kind}: {ev.message}".strip()[:1024]
-            )
-            background.add_task(
-                telegram.deliver_clip, tg.bot_token, tg.chat_id, ev.clip_path, caption
-            )
+        # Telegram delivery was scheduled when the event was pushed; it picks
+        # this clip up as soon as it is attached.
         return _event_out(ev)
 
     @app.get("/")
@@ -1082,7 +1192,15 @@ def create_cloud_app(
             raise HTTPException(status_code=500, detail="cloud UI missing")
         return FileResponse(index_path)
 
-    app.include_router(build_live_proxy_router(settings.dashboard_upstream_url))
+    if live_app is not None:
+        @app.get("/live")
+        def live_redirect() -> RedirectResponse:
+            # ./assets/... in the dashboard's HTML only resolves under "/live/".
+            return RedirectResponse("/live/")
+
+        app.mount("/live", LoginRequired(live_app, session_factory), name="live")
+    else:
+        app.include_router(build_live_proxy_router(settings.dashboard_upstream_url, session_factory))
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
@@ -1110,7 +1228,11 @@ def create_cloud_app(
 
 
 def serve_cloud(
-    host: str = "127.0.0.1", port: int = 8000, create_tables: bool = False
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    create_tables: bool = False,
+    live_app: FastAPI | None = None,
+    on_app=None,
 ) -> None:
     """Run the control plane with uvicorn (blocking).
 
@@ -1128,9 +1250,16 @@ def serve_cloud(
             "[yellow]WARNING: using the insecure default STOREGUARD_SECRET_KEY — "
             "set a real one before exposing this service.[/yellow]"
         )
-    app = create_cloud_app(create_tables=create_tables)
+    app = create_cloud_app(create_tables=create_tables, live_app=live_app, start_bot=True)
+    if on_app is not None:
+        on_app(app)
     console.print(
         f"[bold]storeguard cloud[/bold] — http://{host}:{port} "
         f"(db={settings.database_url})"
     )
+    if live_app is not None:
+        console.print(
+            f"[bold]Live detection[/bold] — http://{host}:{port}/live/ "
+            "(same port, after login)"
+        )
     uvicorn.run(app, host=host, port=port, log_level="info")

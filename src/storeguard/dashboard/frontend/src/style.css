@@ -1,14 +1,15 @@
 :root {
-  --bg: #0e1110;
-  --bg-elev: #161a18;
-  --ink: #e8efe6;
-  --muted: #8a9686;
+  /* Лайм AI palette (same as the control panel). */
+  --bg: #0b0e0a;
+  --bg-elev: #131810;
+  --ink: #eef2ea;
+  --muted: #8e978a;
   --lime: #b6f24a;
-  --lime-dim: #6f9a2a;
-  --line: #2a312c;
-  --danger: #ff6b5a;
-  --font-display: "Syne", sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --lime-dim: #6f8a5a;
+  --line: #2c3528;
+  --danger: #ff8f5a;
+  --font-display: Manrope, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
 
 *,
@@ -62,10 +63,13 @@ body {
   margin: 0;
   font-family: var(--font-display);
   font-weight: 800;
-  font-size: clamp(2.4rem, 6vw, 4rem);
-  letter-spacing: -0.03em;
-  line-height: 0.95;
-  color: var(--lime);
+  font-size: clamp(1.6rem, 3.5vw, 2.2rem);
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .tagline {

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, ClassVar
 from storeguard.types import Event
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import numpy as np
 
     from storeguard.geometry import Zone
@@ -56,6 +58,7 @@ class ExitNoPayScenario:
         zones: list["Zone"],
         shelf_dwell_sec: float = 1.5,
         checkout_dwell_sec: float = 2.0,
+        is_paid: "Callable[[int], bool] | None" = None,
     ) -> None:
         """Create the scenario for one camera.
 
@@ -67,6 +70,9 @@ class ExitNoPayScenario:
                 count as "took goods".
             checkout_dwell_sec: Checkout dwell at (or above) which a track is
                 considered to have paid.
+            is_paid: Optional ``track_id -> bool`` lookup of payment seen
+                elsewhere (e.g. at a checkout on another camera, with
+                cross-camera ids); a track it reports as paid never alerts.
         """
         self.camera = camera
         self._shelf_zones = [z for z in zones if z.name.startswith("shelf")]
@@ -74,6 +80,7 @@ class ExitNoPayScenario:
         self._exit_zones = [z for z in zones if z.name.startswith("exit")]
         self._shelf_dwell_sec = float(shelf_dwell_sec)
         self._checkout_dwell_sec = float(checkout_dwell_sec)
+        self._is_paid = is_paid
         self._state: dict[int, _TrackState] = {}
 
     def reset(self) -> None:
@@ -110,6 +117,8 @@ class ExitNoPayScenario:
             state.last_seen = ts
 
             if state.checkout_dwell >= self._checkout_dwell_sec:
+                state.paid = True
+            elif self._is_paid is not None and self._is_paid(tid):
                 state.paid = True
 
             if (

@@ -54,6 +54,8 @@ class CloudClient:
         track_id: int | None = None,
         score: float | None = None,
         ts: str | None = None,
+        employee_id: str | None = None,
+        duration_sec: float | None = None,
     ) -> dict[str, Any]:
         """Push one detection event (metadata); returns the created event.
 
@@ -67,6 +69,8 @@ class CloudClient:
             "person_id": person_id,
             "track_id": track_id,
             "score": score,
+            "employee_id": employee_id,
+            "duration_sec": duration_sec,
         }
         if ts is not None:
             body["ts"] = ts
@@ -85,5 +89,23 @@ class CloudClient:
                 files={"clip": (p.name, fh)},
                 timeout=max(self.timeout, 60.0),
             )
+        r.raise_for_status()
+        return r.json()
+
+    def push_stats(self, payload: dict[str, Any]) -> None:
+        """Visitor / employee stat deltas plus camera status (``/api/agent/stats``)."""
+        r = self.session.post(f"{self.base}/api/agent/stats", json=payload, timeout=self.timeout)
+        r.raise_for_status()
+
+    def push_candidate(self, payload: dict[str, Any]) -> None:
+        """A possible new employee seen in staff zones (``/api/agent/candidates``)."""
+        r = self.session.post(
+            f"{self.base}/api/agent/candidates", json=payload, timeout=self.timeout
+        )
+        r.raise_for_status()
+
+    def checkout(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Report a served customer for the POS receipt cross-check."""
+        r = self.session.post(f"{self.base}/api/agent/checkout", json=payload, timeout=self.timeout)
         r.raise_for_status()
         return r.json()

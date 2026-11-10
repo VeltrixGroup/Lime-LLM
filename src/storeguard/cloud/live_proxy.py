@@ -19,10 +19,28 @@ import asyncio
 import httpx
 import websockets
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from starlette.websockets import WebSocketDisconnect
 
-from storeguard.cloud.auth import current_membership
+from storeguard.cloud.auth import permissions_of, require_perm
+from storeguard.cloud.models import Membership, User
+
+
+def live_access(session_factory, session: dict) -> tuple[bool, str | None]:
+    """(allowed, tenant_id): an active user, a member of the session's store,
+    whose role holds "live". Checked on every request / socket, so a removed
+    or disabled user loses the live view immediately, not when the cookie ends."""
+    user_id, tenant_id = session.get("user_id"), session.get("tenant_id")
+    if not user_id or not tenant_id or session_factory is None:
+        return False, None
+    with session_factory() as db:
+        user = db.get(User, user_id)
+        if user is None or not user.is_active:
+            return False, None
+        m = db.query(Membership).filter_by(user_id=user_id, tenant_id=tenant_id).one_or_none()
+        if m is None or "live" not in permissions_of(db, m):
+            return False, None
+    return True, tenant_id
 
 # Headers that are per-hop, not per-resource — forwarding them verbatim would
 # either be meaningless (Host) or break the proxied response (Content-Length
@@ -41,11 +59,54 @@ _HOP_BY_HOP = {
 }
 
 
+class LoginRequired:
+    """ASGI wrapper: only logged-in cabinet users reach the wrapped app.
+
+    Used when the detection dashboard runs inside the cloud process (mounted
+    at ``/live``) instead of behind the proxy below. The cabinet's
+    SessionMiddleware wraps the whole app, so ``scope["session"]`` is already
+    decoded here. Built JS/CSS under ``assets/`` stays public, like
+    ``/static/*``.
+    """
+
+    def __init__(self, app, session_factory=None) -> None:
+        self.app = app
+        self.session_factory = session_factory
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        if "/assets/" in path:
+            await self.app(scope, receive, send)
+            return
+        import anyio
+
+        allowed, tenant_id = await anyio.to_thread.run_sync(
+            live_access, self.session_factory, dict(scope.get("session", {}))
+        )
+        if allowed:
+            # The dashboard runs cameras for *this* store (one-port mode).
+            scope.setdefault("state", {})["cabinet_tenant_id"] = tenant_id
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4403})
+            return
+        if path.rstrip("/").endswith("/live"):
+            # The page itself: back to the cabinet, which shows its login form.
+            response = RedirectResponse("/")
+        else:
+            response = JSONResponse({"detail": "not logged in"}, status_code=401)
+        await response(scope, receive, send)
+
+
 def _clean_headers(headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
 
 
-def build_live_proxy_router(upstream_base: str) -> APIRouter:
+def build_live_proxy_router(upstream_base: str, session_factory=None) -> APIRouter:
     """Build the ``/live/*`` proxy router forwarding to ``upstream_base``."""
     upstream_base = upstream_base.rstrip("/")
     ws_base = "ws" + upstream_base[len("http") :]  # http(s):// -> ws(s)://
@@ -88,7 +149,7 @@ def build_live_proxy_router(upstream_base: str) -> APIRouter:
     @router.get("/live/")
     async def live_index(
         request: Request,
-        _membership=Depends(current_membership),
+        _membership=Depends(require_perm("live")),
     ) -> Response:
         return await _proxy_http(request, "/")
 
@@ -105,7 +166,7 @@ def build_live_proxy_router(upstream_base: str) -> APIRouter:
     async def live_api(
         path: str,
         request: Request,
-        _membership=Depends(current_membership),
+        _membership=Depends(require_perm("live")),
     ) -> Response:
         return await _proxy_http(request, f"/api/{path}")
 
@@ -114,8 +175,13 @@ def build_live_proxy_router(upstream_base: str) -> APIRouter:
         # WebSocket shares the same signed session cookie as the HTTP routes
         # (SessionMiddleware covers both scope types) — no DB round trip here,
         # just "is someone logged in", since this proxy is single-tenant.
-        if not websocket.session.get("user_id"):
-            await websocket.close(code=4401)
+        import anyio
+
+        allowed, _ = await anyio.to_thread.run_sync(
+            live_access, session_factory, dict(websocket.session)
+        )
+        if not allowed:
+            await websocket.close(code=4403)
             return
 
         await websocket.accept()

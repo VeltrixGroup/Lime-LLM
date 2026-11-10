@@ -65,11 +65,28 @@ def test_phone_resets_when_phone_disappears() -> None:
     )
     sc.update(_FRAME, [_PERSON], 0.0)
     state["on"] = False
-    assert sc.update(_FRAME, [_PERSON], 1.0) == []  # phone gone → timer resets
+    # Phone gone for longer than the grace period -> the timer resets.
+    assert sc.update(_FRAME, [_PERSON], 1.0) == []
+    assert sc.update(_FRAME, [_PERSON], 5.5) == []
     state["on"] = True
-    sc.update(_FRAME, [_PERSON], 2.0)  # timer restarts at 2.0
-    assert sc.update(_FRAME, [_PERSON], 3.9) == []
-    assert len(sc.update(_FRAME, [_PERSON], 4.0)) == 1
+    sc.update(_FRAME, [_PERSON], 6.0)  # timer restarts at 6.0
+    assert sc.update(_FRAME, [_PERSON], 7.9) == []
+    assert len(sc.update(_FRAME, [_PERSON], 8.0)) == 1
+
+
+def test_phone_survives_a_missed_detection() -> None:
+    """One frame without a phone box (hand turned) must not restart the timer."""
+    state = {"on": True}
+    sc = PhoneScenario(
+        "cam",
+        lambda _f: [(12.0, 12.0, 16.0, 18.0)] if state["on"] else [],
+        phone_sec=2.0,
+    )
+    sc.update(_FRAME, [_PERSON], 0.0)
+    state["on"] = False
+    assert sc.update(_FRAME, [_PERSON], 1.0) == []  # missed for 1 s (< grace)
+    state["on"] = True
+    assert len(sc.update(_FRAME, [_PERSON], 2.0)) == 1  # still counted from 0.0
 
 
 def test_phone_ignored_when_not_held() -> None:

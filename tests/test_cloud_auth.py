@@ -204,7 +204,7 @@ def _login(app, email: str, password: str) -> TestClient:
 def test_index_html_served(client: TestClient) -> None:
     res = client.get("/")
     assert res.status_code == 200
-    assert "storeguard" in res.text.lower()
+    assert "Лайм AI" in res.text
 
 
 def test_member_management_requires_auth(client: TestClient) -> None:
@@ -219,7 +219,8 @@ def test_owner_can_add_member(client: TestClient) -> None:
     assert _signup(client).status_code == 201  # owner@store.com
     res = _add_member(client)
     assert res.status_code == 201, res.text
-    assert res.json()["role"] == "staff"
+    # The legacy "staff" role is stored as its successor, "security" (Охрана).
+    assert res.json()["role"] == "security"
 
     emails = {m["email"] for m in client.get("/api/org/members").json()["members"]}
     assert emails == {"owner@store.com", "staff@store.com"}
@@ -231,7 +232,7 @@ def test_added_member_can_log_in(client: TestClient, app) -> None:
     staff = _login(app, "staff@store.com", "staffpass1")
     me = staff.get("/api/me")
     assert me.status_code == 200
-    assert me.json()["tenant"]["role"] == "staff"
+    assert me.json()["tenant"]["role"] == "security"
 
 
 def test_staff_cannot_add_member(client: TestClient, app) -> None:
@@ -257,7 +258,12 @@ def test_add_member_invalid_role_rejected(client: TestClient) -> None:
         "/api/org/members",
         json={"email": "z@store.com", "password": "zzzzzzzz", "role": "admin"},
     )
-    assert res.status_code == 422
+    assert res.status_code == 400  # well-formed key, but no such role in this store
+    bad = client.post(
+        "/api/org/members",
+        json={"email": "z@store.com", "password": "zzzzzzzz", "role": "Not A Role!"},
+    )
+    assert bad.status_code == 422
 
 
 def test_owner_can_promote_and_demote(client: TestClient) -> None:
@@ -270,7 +276,7 @@ def test_owner_can_promote_and_demote(client: TestClient) -> None:
 
     demoted = client.patch(f"/api/org/members/{staff_id}", json={"role": "staff"})
     assert demoted.status_code == 200
-    assert demoted.json()["role"] == "staff"
+    assert demoted.json()["role"] == "security"
 
 
 def test_cannot_demote_last_owner(client: TestClient) -> None:

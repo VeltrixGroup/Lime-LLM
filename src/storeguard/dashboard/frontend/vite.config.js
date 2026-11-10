@@ -15,9 +15,14 @@ export default defineConfig({
     outDir: "../static",
     emptyOutDir: true,
   },
+  // `npm run dev` -> http://localhost:5174 (5173 is the control panel's).
+  // Talks to the standalone `storeguard dashboard` on 8765; ws: true is
+  // needed for the live video WebSocket.
   server: {
+    port: 5174,
+    strictPort: true,
     proxy: {
-      "/api": "http://127.0.0.1:8765",
+      "/api": { target: "http://127.0.0.1:8765", ws: true },
     },
   },
 });

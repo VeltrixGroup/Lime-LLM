@@ -31,8 +31,11 @@ class _FakeSession:
         kind="",
         alert_queue=None,
         camera_id=None,
+        identities=None,
+        context=None,
     ) -> None:
         self.id = session_id
+        self.context = context
         self.source = source
         self.filename = filename
         self.kind = kind

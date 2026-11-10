@@ -49,6 +49,11 @@ class IdleScenario:
         self.move_frac = move_frac
         self._state: dict[int, _IdleState] = {}
 
+    def still_for(self, track_id: int, ts: float) -> float | None:
+        """Seconds this track has stood still, or ``None`` if unknown."""
+        st = self._state.get(track_id)
+        return None if st is None else ts - st.still_since
+
     def update(
         self, frame: "np.ndarray", tracks: list["Track"], ts: float
     ) -> list[Event]:

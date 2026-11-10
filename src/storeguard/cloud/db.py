@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 from fastapi import Request
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -37,10 +37,20 @@ def build_engine(database_url: str) -> Engine:
     if database_url.startswith("sqlite"):
         connect_args = {"check_same_thread": False}
         if _is_memory_sqlite(database_url):
-            return create_engine(
+            engine = create_engine(
                 database_url, connect_args=connect_args, poolclass=StaticPool
             )
-        return create_engine(database_url, connect_args=connect_args)
+        else:
+            engine = create_engine(database_url, connect_args=connect_args)
+
+        # SQLite ignores FOREIGN KEY / ON DELETE unless asked, per connection.
+        @event.listens_for(engine, "connect")
+        def _fk_on(dbapi_conn, _record) -> None:
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
+
+        return engine
     return create_engine(database_url, pool_pre_ping=True)
 
 
@@ -66,3 +76,44 @@ def get_db(request: Request) -> Iterator[Session]:
         yield db
     finally:
         db.close()
+
+
+def add_missing_columns(engine: Engine) -> list[str]:
+    """Dev-only: ``ALTER TABLE ... ADD COLUMN`` for model columns a table lacks.
+
+    ``create_all`` (the ``--dev`` path) creates missing *tables* but never
+    touches existing ones, so a dev database made before a model change would
+    break on the new columns. Production uses Alembic instead. Returns the
+    ``table.column`` names it added. Constraints/indexes on new columns are not
+    added — fine for a throwaway dev database.
+    """
+    from sqlalchemy import inspect, text
+
+    added: list[str] = []
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            have = {c["name"] for c in insp.get_columns(table.name)}
+            for col in table.columns:
+                if col.name in have:
+                    continue
+                ddl = f"ALTER TABLE {table.name} ADD COLUMN {col.name} "
+                ddl += col.type.compile(dialect=engine.dialect)
+                default = col.default.arg if col.default is not None else None
+                if callable(default):
+                    default = None
+                if isinstance(default, bool):
+                    ddl += f" DEFAULT {'TRUE' if default else 'FALSE'}"
+                elif isinstance(default, (int, float)):
+                    ddl += f" DEFAULT {default}"
+                elif isinstance(default, str):
+                    ddl += " DEFAULT '" + default.replace("'", "''") + "'"
+                elif not col.nullable:
+                    # NOT NULL without a usable default: keep it nullable here.
+                    pass
+                conn.execute(text(ddl))
+                added.append(f"{table.name}.{col.name}")
+    return added

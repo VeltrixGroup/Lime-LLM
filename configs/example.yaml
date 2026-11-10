@@ -1,6 +1,7 @@
 detector:
-  model: yolo11n.pt
-  conf: 0.35
+  model: auto          # yolo26m on CUDA, yolo26s on MPS, yolo26n on CPU
+  conf: 0.45
+  new_track_conf: 0.6
   imgsz: 640
   device: auto
 action:

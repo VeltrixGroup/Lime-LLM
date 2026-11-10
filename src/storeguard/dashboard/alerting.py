@@ -79,6 +79,7 @@ class DashboardAlertSink:
         frames: list["np.ndarray"],
         fps: float | None = None,
         camera_id: str | None = None,
+        port=None,
     ) -> None:
         """Save an evidence clip for ``event`` and deliver it.
 
@@ -91,17 +92,21 @@ class DashboardAlertSink:
                 :attr:`clip_fps` when omitted or invalid.
             camera_id: The cloud's id for this camera, if known (lets the
                 cloud attribute the event to the right camera).
+            port: Where to deliver (the session's store context port). Falls
+                back to the sink's own cloud client.
         """
         with self._lock:
-            key = (event.camera, event.kind)
+            # Per person: a second shoplifter right after the first must still alert.
+            key = (event.camera, event.kind, event.track_id)
             last = self._last_sent.get(key)
             if last is not None and event.ts - last < self.min_gap_sec:
                 return
             self._last_sent[key] = event.ts
 
+        target = port if port is not None else self._client
         clip_path = self._write_clip(event, frames, fps)
-        if self._client is not None:
-            self._push_to_cloud(event, clip_path, camera_id)
+        if target is not None:
+            self._push_to_cloud(event, clip_path, camera_id, target)
 
     def _write_clip(
         self, event: "Event", frames: list["np.ndarray"], fps: float | None
@@ -122,26 +127,33 @@ class DashboardAlertSink:
         return None
 
     def _push_to_cloud(
-        self, event: "Event", clip_path: Path | None, camera_id: str | None
+        self, event: "Event", clip_path: Path | None, camera_id: str | None, client=None
     ) -> None:
-        assert self._client is not None
+        client = client if client is not None else self._client
+        assert client is not None
         iso = datetime.fromtimestamp(event.ts, tz=timezone.utc).isoformat()
+        extra = event.extra or {}
+        kwargs = {}
+        for key in ("person_id", "employee_id", "duration_sec"):
+            if extra.get(key) is not None:
+                kwargs[key] = extra[key]
         try:
-            created = self._client.send_event(
+            created = client.send_event(
                 event.kind,
                 message=event.message,
                 camera_id=camera_id,
                 track_id=event.track_id,
                 score=event.score,
                 ts=iso,
+                **kwargs,
             )
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: send_event failed: {exc}[/red]")
             return
-        if clip_path is None:
-            return
+        if clip_path is None or not created:
+            return  # no clip, or the store turned this incident type off
         try:
-            self._client.upload_clip(created["id"], clip_path)
+            client.upload_clip(created["id"], clip_path)
         except Exception as exc:  # noqa: BLE001 - alerts must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: upload_clip failed: {exc}[/red]")
 
@@ -157,9 +169,10 @@ def delivery_loop(sink: DashboardAlertSink, alert_queue: "queue.Queue") -> None:
         item = alert_queue.get()
         if item is None:
             return
-        event, frames, fps, camera_id = item
+        event, frames, fps, camera_id, *rest = item
+        port = rest[0] if rest else None
         try:
-            sink.handle(event, frames, fps=fps, camera_id=camera_id)
+            sink.handle(event, frames, fps=fps, camera_id=camera_id, port=port)
         except Exception:  # noqa: BLE001 - delivery must never crash the pipeline
             _console.log(f"[red]DashboardAlertSink: delivery error for {event.kind}[/red]")
 

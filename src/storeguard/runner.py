@@ -32,6 +32,7 @@ from rich.console import Console
 from .alerts import AlertSink
 from .config import AppCfg, CameraCfg
 from .detector import PersonTracker
+from .reid import CameraIdentities, IdentityRegistry
 from .geometry import Zone, zones_from_cfg
 from .stream import VideoStream
 from .types import Event, Track
@@ -252,6 +253,7 @@ def _camera_worker(
     alert_q: queue.Queue,
     stop: threading.Event,
     display: _DisplayHub | None,
+    registry: IdentityRegistry | None = None,
 ) -> None:
     """Process one camera until EOF, stop signal or an unrecoverable error.
 
@@ -260,8 +262,12 @@ def _camera_worker(
     submitted to it for the main thread to show — this loop never touches
     cv2 windows or blocking alert I/O itself.
     """
-    stream = VideoStream(cam.source)
+    stream = VideoStream(cam.source, latest_only=not Path(cam.source).is_file())
     tracker = PersonTracker(app.detector)
+    if registry is None:
+        registry = IdentityRegistry(app.detector.reid_threshold, app.detector.reid_forget_sec)
+    encoder = tracker.appearance_encoder()
+    identities = CameraIdentities(registry, encoder.encode if encoder is not None else None)
     scenarios = build_scenarios(cam, app, tracker=tracker)
     zones = zones_from_cfg(cam.zones)
     ring: deque[np.ndarray] = deque(maxlen=_RING_LEN)
@@ -299,7 +305,7 @@ def _camera_worker(
             ts = t0 + (frame_idx - 1) / fps if is_file else time.time()
 
             try:
-                tracks = tracker.update(frame)
+                tracks = identities.update(frame, tracker.update(frame), ts)
                 events: list[Event] = []
                 for sc in scenarios:
                     events.extend(sc.update(frame, tracks, ts))
@@ -451,10 +457,12 @@ def run(cfg: AppCfg, show: bool = False, sink: AlertSink | None = None) -> None:
     display = _DisplayHub() if show else None
     stop = threading.Event()
     threads: list[threading.Thread] = []
+    # One registry for all cameras: a person keeps one id across all of them.
+    registry = IdentityRegistry(cfg.detector.reid_threshold, cfg.detector.reid_forget_sec)
     for cam in cfg.cameras:
         thread = threading.Thread(
             target=_camera_worker,
-            args=(cam, cfg, alert_q, stop, display),
+            args=(cam, cfg, alert_q, stop, display, registry),
             name=f"camera-{cam.name}",
             daemon=True,
         )

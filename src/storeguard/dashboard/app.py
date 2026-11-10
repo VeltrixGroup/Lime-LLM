@@ -11,7 +11,12 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+import json
+import struct
+from collections.abc import Callable
+
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
+from fastapi.responses import Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,8 +26,10 @@ from starlette.websockets import WebSocketDisconnect
 from storeguard.cloud.agent_client import CloudClient
 from storeguard.config import DetectorCfg
 from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
+from storeguard.dashboard.context import StoreContext
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
+from storeguard.reid import IdentityRegistry
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VIDEO_EXTS = {".mp4", ".avi", ".mkv", ".mov", ".webm", ".m4v"}
@@ -172,8 +179,10 @@ class CamerasSessionRequest(BaseModel):
 class CloudSessionRequest(BaseModel):
     """Pull this tenant's enabled cameras from the cloud and connect all of them."""
 
-    server: str = Field(..., min_length=1, description="Cloud base URL, e.g. http://127.0.0.1:8000")
-    token: str = Field(..., min_length=1, description="Agent token from the cabinet's Edge devices")
+    #: Cloud base URL + agent token. Not needed when this dashboard runs inside
+    #: the cloud process (one-port mode): the logged-in store is used instead.
+    server: str = Field(default="", description="Cloud base URL, e.g. http://127.0.0.1:8000")
+    token: str = Field(default="", description="Agent token from the cabinet's Edge devices")
     process_every: int = 1
 
 
@@ -196,6 +205,7 @@ def _stats_payload(session: DetectionSession) -> dict:
         "not_paid": s.not_paid,
         "running": s.running,
         "error": s.error,
+        "camera_id": getattr(session, "camera_id", None),
     }
 
 
@@ -207,6 +217,7 @@ def create_app(
     checkout_dwell_sec: float = 2.0,
     agent_server: str | None = None,
     agent_key: str | None = None,
+    port_factory: "Callable[[str], object] | None" = None,
 ) -> FastAPI:
     """Build the dashboard FastAPI application.
 
@@ -222,6 +233,9 @@ def create_app(
             (enables Telegram / Lime CRM notifications). Optional — clips are
             always saved locally regardless.
         agent_key: Agent token for ``agent_server``.
+        port_factory: One-port mode only: ``tenant_id -> port`` that talks to
+            the cloud in-process. The tenant comes from the cabinet session
+            (set on the request by the cloud's ``/live`` login gate).
     """
     cfg = detector or DetectorCfg()
     own_upload_dir = upload_dir is None
@@ -270,8 +284,10 @@ def create_app(
     # under data/events/clips on this computer; the cloud push (and the
     # Telegram / Lime CRM notifications it triggers) only happens when this
     # dashboard was given cloud agent credentials.
+    app.state.cloud_client = build_cloud_client(agent_server, agent_key)
+    app.state.port_factory = port_factory
     app.state.alert_sink = DashboardAlertSink(
-        videos_root / "events" / "clips", build_cloud_client(agent_server, agent_key)
+        videos_root / "events" / "clips", app.state.cloud_client
     )
     app.state.alert_queue = queue.Queue(maxsize=32)
     app.state.alert_thread = threading.Thread(
@@ -291,6 +307,8 @@ def create_app(
         kind: str,
         zones: list[Zone] | None = None,
         camera_id: str | None = None,
+        identities: IdentityRegistry | None = None,
+        context: StoreContext | None = None,
     ) -> DetectionSession:
         return DetectionSession(
             session_id=session_id,
@@ -304,7 +322,35 @@ def create_app(
             kind=kind,
             alert_queue=app.state.alert_queue,
             camera_id=camera_id,
+            identities=identities,
+            context=context,
         )
+
+    def _new_context(tenant_id: str | None = None, port=None) -> StoreContext:
+        """Shared state for one batch of cameras, connected to the cloud if we can."""
+        if port is None:
+            if tenant_id and app.state.port_factory is not None:
+                port = app.state.port_factory(tenant_id)
+            else:
+                port = app.state.cloud_client
+        ctx = StoreContext(_new_registry(), port=port, tenant_id=tenant_id)
+        if port is not None:
+            try:
+                ctx.apply_config(port.get_config())
+            except Exception:  # noqa: BLE001 - detection works without cloud config
+                pass
+            ctx.start()
+        return ctx
+
+    def _request_tenant(request: Request | None) -> str | None:
+        if request is None:
+            return None
+        return request.scope.get("state", {}).get("cabinet_tenant_id")
+
+    def _new_registry() -> IdentityRegistry:
+        """Global person ids for one batch of cameras connected together."""
+        det: DetectorCfg = app.state.detector
+        return IdentityRegistry(det.reid_threshold, det.reid_forget_sec)
 
     def _stop_sessions(sessions: list[DetectionSession]) -> None:
         """Stop many sessions in parallel: signal all, then join each."""
@@ -329,6 +375,10 @@ def create_app(
                 for session in new:
                     session.start()
         _stop_sessions(old)
+        keep = {id(s.context) for s in new}
+        for ctx in {id(s.context): s.context for s in old}.values():
+            if ctx is not None and id(ctx) not in keep:
+                ctx.stop()
 
     @app.get("/")
     def index() -> FileResponse:
@@ -391,7 +441,7 @@ def create_app(
         )
 
     @app.post("/api/session/cameras")
-    def create_camera_sessions(body: CamerasSessionRequest) -> JSONResponse:
+    def create_camera_sessions(body: CamerasSessionRequest, request: Request) -> JSONResponse:
         """Connect up to ``MAX_CAMERAS`` cameras at once.
 
         Replaces all current sessions and starts detection on every camera
@@ -421,6 +471,7 @@ def create_app(
                 status_code=400,
                 detail=f"at most {MAX_CAMERAS} cameras are supported",
             )
+        ctx = _new_context(_request_tenant(request))
         sessions = [
             _make_session(
                 session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
@@ -431,6 +482,7 @@ def create_app(
                 kind="camera",
                 zones=[Zone(z.name, z.points) for z in entry.zones] or None,
                 camera_id=entry.camera_id,
+                context=ctx,
             )
             for entry in cleaned
         ]
@@ -446,7 +498,7 @@ def create_app(
         )
 
     @app.post("/api/session/cloud")
-    def create_cloud_sessions(body: CloudSessionRequest) -> JSONResponse:
+    def create_cloud_sessions(body: CloudSessionRequest, request: Request) -> JSONResponse:
         """Pull this tenant's enabled cameras from the cloud and connect all of them.
 
         Same replace-all-and-start behavior as ``/api/session/cameras``, but
@@ -454,9 +506,17 @@ def create_app(
         camera's name come straight from the cabinet instead of being
         retyped as raw URLs.
         """
+        tenant_id = _request_tenant(request)
         try:
-            client = CloudClient(body.server.strip(), body.token.strip())
+            if tenant_id and app.state.port_factory is not None:
+                client = app.state.port_factory(tenant_id)
+            elif body.server.strip() and body.token.strip():
+                client = CloudClient(body.server.strip(), body.token.strip())
+            else:
+                raise HTTPException(status_code=400, detail="server and token are required")
             cfg = client.get_config()
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001 — surface any failure as a clean 400
             raise HTTPException(
                 status_code=400, detail=f"could not reach the cloud: {exc}"
@@ -469,6 +529,7 @@ def create_app(
             )
         total = len(cams)
         cams = cams[:MAX_CAMERAS]
+        ctx = _new_context(tenant_id, port=client)
         sessions = [
             _make_session(
                 session_id=uuid.uuid4().hex[:_SESSION_ID_LEN],
@@ -479,6 +540,7 @@ def create_app(
                 kind="camera",
                 zones=_zones_from_cloud(c.get("zones", [])),
                 camera_id=c.get("id"),
+                context=ctx,
             )
             for c in cams
         ]
@@ -489,11 +551,36 @@ def create_app(
                 "total_enabled": total,
                 "tenant_name": cfg.get("tenant_name", ""),
                 "sessions": [
-                    {"id": s.id, "filename": s.filename, "source": "camera"}
+                    {"id": s.id, "filename": s.filename, "source": "camera", "camera_id": s.camera_id}
                     for s in sessions
                 ],
             }
         )
+
+    @app.get("/api/session/{session_id}/snapshot.jpg")
+    def session_snapshot(session_id: str) -> Response:
+        """The newest raw frame (the "Снимок" button)."""
+        jpeg = _require_session(session_id).snapshot()
+        if jpeg is None:
+            raise HTTPException(status_code=404, detail="no frame yet")
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={"Content-Disposition": f'attachment; filename="snapshot-{session_id}.jpg"'},
+        )
+
+    @app.get("/api/session/{session_id}/clip.mp4")
+    def session_clip(session_id: str) -> FileResponse:
+        """The last ~15 s as an mp4 (the "Записать клип" button)."""
+        from storeguard.alerts import write_mp4_clip
+
+        frames, fps = _require_session(session_id).recent_frames()
+        if not frames:
+            raise HTTPException(status_code=404, detail="no frames yet")
+        out = app.state.upload_root / f"clip-{session_id}-{uuid.uuid4().hex[:6]}.mp4"
+        if not write_mp4_clip(out, frames, fps, fallback_fps=10.0):
+            raise HTTPException(status_code=500, detail="could not encode the clip")
+        return FileResponse(out, media_type="video/mp4", filename=f"clip-{session_id}.mp4")
 
     @app.post("/api/session/camera")
     def create_camera_session(body: CameraSessionRequest) -> JSONResponse:
@@ -603,6 +690,11 @@ def create_app(
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
         session.stop()
+        ctx = getattr(session, "context", None)
+        with app.state.session_lock:
+            still_used = any(s.context is ctx for s in app.state.sessions.values())
+        if ctx is not None and not still_used:
+            ctx.stop()  # last camera of its batch: flush and end its sync thread
         return JSONResponse({"id": session_id, "removed": True})
 
     @app.get("/api/session/{session_id}/stats")
@@ -654,6 +746,11 @@ def create_app(
         """
         await ws.accept()
         last_sent: dict[str, int] = {}
+        # ?mode=meta: raw frames + overlay metadata (the cabinet draws boxes
+        # itself), plus the live event feed as text messages.
+        meta_mode = ws.query_params.get("mode") == "meta"
+        counted: set = set()
+        feed_seq: dict[str, int] = {}
 
         async def _watch_disconnect() -> None:
             # Reading is the only way to observe a client close while no frames
@@ -674,7 +771,34 @@ def create_app(
                     if known not in live_ids:
                         del last_sent[known]
                 sent_any = False
+                if meta_mode:
+                    for session in sessions:
+                        if session not in counted:
+                            counted.add(session)
+                            session.meta_viewers += 1
+                    for session in list(counted):
+                        if session.id not in live_ids:
+                            counted.discard(session)
+                            session.meta_viewers = max(0, session.meta_viewers - 1)
+                    contexts = {id(x.context): x.context for x in sessions if x.context is not None}
+                    for ctx in contexts.values():
+                        items = ctx.feed_since(feed_seq.get(ctx.uid, 0))
+                        if items:
+                            feed_seq[ctx.uid] = items[-1]["seq"]
+                            await ws.send_text(json.dumps({"type": "feed", "items": items}))
                 for session in sessions:
+                    if meta_mode:
+                        res = session.peek_meta(last_sent.get(session.id, 0))
+                        if res is None:
+                            continue
+                        jpeg, meta, seq = res
+                        last_sent[session.id] = seq
+                        blob = json.dumps(meta).encode("utf-8")
+                        await ws.send_bytes(
+                            session.id.encode("ascii") + struct.pack(">I", len(blob)) + blob + jpeg
+                        )
+                        sent_any = True
+                        continue
                     result = session.peek_jpeg(last_sent.get(session.id, 0))
                     if result is None:
                         continue
@@ -689,6 +813,8 @@ def create_app(
             return
         finally:
             recv_task.cancel()
+            for session in counted:
+                session.meta_viewers = max(0, session.meta_viewers - 1)
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

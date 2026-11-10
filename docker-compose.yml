@@ -1,105 +1,34 @@
-# Local/single-machine setup: both services on one box, talking to each
-# other over the Compose network - this is what "docker compose up" gives
-# you, matching how this has been run and tested so far (cloud on :8000,
-# dashboard proxied through it at /live/).
+# Postgres for the Лайм AI control panel. The app itself runs directly on the
+# machine (`make serve` / `make dev`, or `.\make.ps1 serve` on Windows) so
+# detection can use the GPU without Docker; only the database lives here.
 #
-# A real store deployment usually splits these: the cloud cabinet on a
-# server somewhere (it never touches video, so it doesn't need a GPU or LAN
-# access to the cameras), and the dashboard/agent on the store PC, on the
-# same LAN as the cameras. In that case run this file's `cloud` service on
-# the server on its own, and `dashboard` (or `agent`, see below) on the
-# store PC on its own - and point STOREGUARD_DASHBOARD_UPSTREAM_URL / the
-# `--server` flag at wherever the other half actually lives instead of the
-# service-name URLs used below.
+#   make db-up      # start (data is kept in the `pgdata` volume)
+#   make db-down    # stop (data stays)
 #
-# GPU passthrough (dashboard/agent) needs Docker Desktop's WSL2 backend with
-# a driver that supports CUDA-on-WSL. Sanity-check that GPU access works at
-# all before troubleshooting anything in this repo:
-#   docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
-# If that doesn't show your GPU, the problem is Docker/WSL2/driver setup,
-# not this compose file.
+# The app connects with STOREGUARD_DATABASE_URL, default
+#   postgresql+psycopg://storeguard:storeguard@127.0.0.1:5432/storeguard
+# Change the password/port in .env (STOREGUARD_DB_PASSWORD / STOREGUARD_DB_PORT)
+# and update STOREGUARD_DATABASE_URL to match.
 
 services:
-  cloud:
-    build:
-      context: .
-      dockerfile: docker/cloud.Dockerfile
-    ports:
-      - "8000:8000"
+  db:
+    image: postgres:17-alpine
+    container_name: storeguard-db
     environment:
-      STOREGUARD_DATABASE_URL: sqlite:////data/storeguard_cloud.db
-      STOREGUARD_EVENTS_DIR: /data/events
-      # Compose's built-in DNS resolves other services by name - only valid
-      # while cloud and dashboard run in this same compose project.
-      STOREGUARD_DASHBOARD_UPSTREAM_URL: http://dashboard:8765
-    env_file:
-      - .env # STOREGUARD_SECRET_KEY, SMTP settings, etc. - not committed
+      POSTGRES_USER: storeguard
+      POSTGRES_PASSWORD: ${STOREGUARD_DB_PASSWORD:-storeguard}
+      POSTGRES_DB: storeguard
+    ports:
+      # Only reachable from this computer.
+      - "127.0.0.1:${STOREGUARD_DB_PORT:-5432}:5432"
     volumes:
-      - ./docker-data/cloud:/data
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storeguard -d storeguard"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     restart: unless-stopped
 
-  dashboard:
-    build:
-      context: .
-      dockerfile: docker/edge.Dockerfile
-    ports:
-      - "8765:8765"
-    environment:
-      # Optional: lets the live view also push confirmed exit-without-paying
-      # events + a short clip to the cloud, so its Telegram / Lime CRM
-      # notifications fire. Evidence clips are saved locally either way -
-      # this only adds the cloud push. Create the key in the cabinet's
-      # Devices page; left empty (the default), only local saving happens.
-      # Left optional (":?") would break plain `docker compose down`/`build`/
-      # `up` for everyone, same reasoning as the `agent` service below.
-      STOREGUARD_AGENT_SERVER: http://cloud:8000
-      STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:-}
-    volumes:
-      - ./configs:/app/configs:ro
-      - ./models:/app/models:ro # optional: a trained action.pt, if you have one
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-
-  # Alternative to `dashboard`: a headless worker that pulls this tenant's
-  # cameras from the cloud and pushes events/clips instead of serving a
-  # browser UI. Don't run both against the same cameras at once - pick one.
-  # Enable with: docker compose --profile agent up agent
-  agent:
-    build:
-      context: .
-      dockerfile: docker/edge.Dockerfile
-    profiles: ["agent"]
-    # Compose interpolates every service's environment block up front, even
-    # ones gated behind a profile that isn't active - a required (":?") var
-    # here would break plain `docker compose down`/`build`/`up` for
-    # everyone, not just `agent` users. Leave it optional here; the CLI
-    # itself already errors clearly ("provide --key or set
-    # STOREGUARD_AGENT_KEY") if this is empty when the agent actually starts.
-    environment:
-      STOREGUARD_AGENT_KEY: ${STOREGUARD_AGENT_KEY:-}
-    command:
-      [
-        "storeguard",
-        "agent",
-        "--server",
-        "http://cloud:8000",
-        "--run",
-        "--device",
-        "auto",
-      ]
-    volumes:
-      - ./models:/app/models:ro
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
+volumes:
+  pgdata:
