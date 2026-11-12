@@ -328,24 +328,58 @@ If alerts arrive in Telegram — run it headless (no `--show`):
 uv run storeguard run --config configs/storeguard.yaml
 ```
 
-### 4.6 Autostart on Windows (Task Scheduler)
+### 4.6 Run in the background and start with Windows
 
-1. Create `C:\storeguard\run_storeguard.bat`:
-   ```bat
-   @echo off
-   cd /d C:\storeguard
-   uv run storeguard run --config configs\storeguard.yaml >> storeguard.log 2>&1
-   ```
-2. Press `Win + R`, type `taskschd.msc`, press Enter.
-3. Right panel → **Create Task…**
-4. **General** tab: Name `StoreGuard`; select **"Run whether user is logged
-   on or not"**.
-5. **Triggers** tab: **New…** → Begin the task: **"At startup"** → OK.
-6. **Actions** tab: **New…** → Program/script:
-   `C:\storeguard\run_storeguard.bat` → OK.
-7. **Settings** tab: check **"If the task fails, restart every: 1 minute"**,
-   attempts: 3 (or more). Uncheck "Stop the task if it runs longer than…".
-8. OK → enter the Windows user password. Reboot the PC to verify it starts.
+One command sets everything up (run it in PowerShell in the project folder,
+with Docker Desktop installed):
+
+```powershell
+.\make.ps1 autostart-install
+```
+
+From then on, every time Windows signs in, a hidden background task:
+
+1. starts **Docker Desktop** if it isn't running and waits for it,
+2. starts the **Postgres** container,
+3. applies database migrations,
+4. runs the **control panel + live detection** on http://127.0.0.1:8000,
+   and restarts it within 10 s if it ever stops.
+
+No window stays open. Logs go to `logs\` (`storeguard-<date>.log` for the
+start-up steps, `app-<date>.log` for the app; 14 days are kept). The install
+step also runs `uv sync` once and writes a random `STOREGUARD_SECRET_KEY` to
+`.env` if there isn't one.
+
+| Command | What |
+|---|---|
+| `.\make.ps1 bg-status` | is the task running / does the app answer |
+| `.\make.ps1 bg-logs` | follow the app log |
+| `.\make.ps1 bg-stop` / `bg-start` | stop / start it now (it still starts at the next sign-in) |
+| `.\make.ps1 autostart-remove` | stop it and remove the autostart |
+
+**Open the panel from other PCs in the store:** install with
+`.\make.ps1 autostart-install -BindHost 0.0.0.0`, then allow port 8000 in
+Windows Firewall (`New-NetFirewallRule -DisplayName "StoreGuard" -Direction Inbound -LocalPort 8000 -Protocol TCP -Action Allow`,
+as administrator).
+
+**Start when the PC is switched on, without anyone signing in:** Docker
+Desktop only runs inside a signed-in Windows session, so let this PC sign in
+automatically:
+
+1. Download **Autologon** from Microsoft Sysinternals
+   (<https://learn.microsoft.com/sysinternals/downloads/autologon>), run it,
+   enter this Windows user's password and press **Enable**. The password is
+   stored encrypted (better than the `netplwiz` checkbox).
+2. Lock the screen after sign-in so nobody can use the PC:
+   **Settings → Accounts → Sign-in options**, or press `Win + L` once; the
+   app keeps running while locked.
+3. Stop the PC from sleeping: **Settings → System → Power → Screen and
+   sleep → Never** (sleep would pause the cameras).
+4. In the BIOS / UEFI, set **"Restore on AC power loss" → Power On**, so the
+   PC turns itself back on after a power cut.
+
+Reboot to check: after sign-in, http://127.0.0.1:8000 should open within
+1-2 minutes.
 
 ### 4.7 Autostart on Linux (systemd)
 
