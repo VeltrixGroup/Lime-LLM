@@ -44,3 +44,5 @@ src/storeguard/cloud/frontend/node_modules/
 src/storeguard/cloud/frontend/.vite/
 src/storeguard/dashboard/frontend/node_modules/
 src/storeguard/dashboard/frontend/.vite/
+# Background service logs (scripts/windows)
+logs/

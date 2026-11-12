@@ -52,6 +52,10 @@ function Show-Help {
     Write-Host "  .\make.ps1 run                       run pipeline (Config=$Config)"
     Write-Host "  .\make.ps1 run-show                  run pipeline with preview windows"
     Write-Host "  .\make.ps1 gpu-check                 check (and fix) that detection runs on the NVIDIA GPU"
+    Write-Host "  .\make.ps1 autostart-install         run everything in the background and start it at every sign-in"
+    Write-Host "  .\make.ps1 autostart-remove          remove that autostart"
+    Write-Host "  .\make.ps1 bg-start / bg-stop        start / stop the background app"
+    Write-Host "  .\make.ps1 bg-status / bg-logs       is it running? / follow its log"
     Write-Host "  .\make.ps1 db-up                     start Postgres in Docker (data kept in a volume)"
     Write-Host "  .\make.ps1 db-down                   stop Postgres (data stays)"
     Write-Host "  .\make.ps1 migrate                   apply database migrations"
@@ -214,6 +218,19 @@ switch ($Target) {
     "run" { Invoke-Run }
     "run-show" { Invoke-RunShow }
     "gpu-check" { Invoke-Install; Invoke-GpuCheck }
+    "autostart-install" { & "$PSScriptRoot\scripts\windows\install-autostart.ps1" -BindHost $BindHost -Port $CloudPort -Device $Device }
+    "autostart-remove" { & "$PSScriptRoot\scripts\windows\uninstall-autostart.ps1" }
+    "bg-start" {
+        Remove-Item "$PSScriptRoot\logs\STOP" -ErrorAction SilentlyContinue
+        Start-ScheduledTask -TaskName StoreGuard
+        Write-Host "-> starting in the background: http://${BindHost}:${CloudPort} (logs in logs\)"
+    }
+    "bg-stop" { & "$PSScriptRoot\scripts\windows\stop.ps1" }
+    "bg-status" {
+        Get-ScheduledTask -TaskName StoreGuard -ErrorAction SilentlyContinue | Select-Object TaskName, State | Format-Table
+        try { Invoke-WebRequest "http://127.0.0.1:${CloudPort}/api/health" -UseBasicParsing -TimeoutSec 3 | Select-Object -ExpandProperty Content } catch { Write-Host "app is not answering on port ${CloudPort}" -ForegroundColor Yellow }
+    }
+    "bg-logs" { Get-Content (Get-ChildItem "$PSScriptRoot\logs\app-*.log" | Sort-Object LastWriteTime | Select-Object -Last 1).FullName -Tail 50 -Wait }
     "db-up" { Invoke-DbUp }
     "db-down" { docker compose down }
     "db-logs" { docker compose logs -f db }
