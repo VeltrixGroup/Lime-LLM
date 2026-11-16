@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -63,6 +63,33 @@ def _validate_ip(value: str) -> str:
     return value
 
 
+#: Stream path used when the tenant never saved one (common NVR/IP-camera main stream).
+DEFAULT_STREAM_PATH = "/ch1/main/av_stream"
+
+
+def normalize_stream_path(value: str) -> str:
+    """Keep only the path part: ``rtsp://1.2.3.4:554/ch1/main/av_stream`` → ``/ch1/main/av_stream``.
+
+    Owners often paste a whole RTSP URL (copied from the NVR) into the path
+    field; the host and port there are an example, not this camera's.
+    """
+    value = value.strip()
+    if "://" in value:
+        parts = urlsplit(value)
+        value = parts.path + (f"?{parts.query}" if parts.query else "")
+    if not value:
+        return DEFAULT_STREAM_PATH
+    return value if value.startswith("/") else "/" + value
+
+
+def camera_ip(source: str) -> str:
+    """The host of an RTSP source (credentials and port stripped), or ``""``."""
+    try:
+        return urlsplit(source).hostname or ""
+    except ValueError:
+        return ""
+
+
 def build_camera_source(ip: str, defaults: CameraDefaults | None) -> str:
     """Build an RTSP URL for a bare ``ip`` using a tenant's saved camera defaults.
 
@@ -72,13 +99,12 @@ def build_camera_source(ip: str, defaults: CameraDefaults | None) -> str:
     any) instead of being retyped into a full URL every time.
     """
     port = defaults.port if defaults else 554
-    path = (defaults.stream_path.strip() if defaults else "") or "/Streaming/Channels/101"
-    if not path.startswith("/"):
-        path = "/" + path
+    path = normalize_stream_path(defaults.stream_path if defaults else "")
     username = defaults.username.strip() if defaults else ""
     password = defaults.password.strip() if defaults else ""
     auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
-    return f"rtsp://{auth}{ip}:{port}{path}"
+    host = f"[{ip}]" if ":" in ip else ip  # IPv6 needs brackets in a URL
+    return f"rtsp://{auth}{host}:{port}{path}"
 
 
 def _validate_points(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -270,6 +296,8 @@ class CameraUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
     source: str | None = Field(default=None, max_length=1024)
+    #: Change the camera's IP; the RTSP URL is rebuilt from the saved defaults.
+    ip: str | None = Field(default=None, max_length=64)
     process_every: int | None = Field(default=None, ge=1, le=100)
     enabled: bool | None = None
 
@@ -277,6 +305,11 @@ class CameraUpdate(BaseModel):
     @classmethod
     def _src(cls, value: str | None) -> str | None:
         return _validate_source(value) if value is not None else value
+
+    @field_validator("ip")
+    @classmethod
+    def _ip(cls, value: str | None) -> str | None:
+        return _validate_ip(value) if value else None
 
 
 class ZonesIn(BaseModel):
@@ -290,6 +323,8 @@ class CameraOut(BaseModel):
     name: str
     source: str
     label: str
+    #: Camera IP/host parsed from the source ("" if it has none).
+    ip: str = ""
     process_every: int
     enabled: bool
     zones: list[ZoneOut]
@@ -305,7 +340,12 @@ class CameraDefaultsIn(BaseModel):
     username: str = Field(default="", max_length=120)
     password: str = Field(default="", max_length=200)
     port: int = Field(default=554, ge=1, le=65535)
-    stream_path: str = Field(default="/Streaming/Channels/101", max_length=200)
+    stream_path: str = Field(default=DEFAULT_STREAM_PATH, max_length=200)
+
+    @field_validator("stream_path")
+    @classmethod
+    def _path(cls, value: str) -> str:
+        return normalize_stream_path(value)
 
 
 class CameraDefaultsOut(BaseModel):

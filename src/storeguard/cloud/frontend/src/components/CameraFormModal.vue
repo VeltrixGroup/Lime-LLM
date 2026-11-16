@@ -10,13 +10,10 @@ const emit = defineEmits(["close", "saved"]);
 const isNew = !props.camera;
 const form = reactive({
   name: props.camera?.name || "",
-  mode: "ip",
-  ip: "",
-  source: props.camera?.source || "",
+  ip: props.camera?.ip || "",
   process_every: props.camera?.process_every || 1,
   enabled: props.camera ? props.camera.enabled : true,
 });
-if (!isNew) form.mode = "url";
 
 // Zone roles go by the name's first word (what the detector understands).
 const KINDS = [
@@ -57,12 +54,9 @@ async function save() {
     const base = { name: form.name, process_every: Number(form.process_every) || 1, enabled: form.enabled };
     let cam;
     if (isNew) {
-      const body = { ...base, zones: zones.value };
-      if (form.mode === "ip") body.ip = form.ip;
-      else body.source = form.source;
-      cam = await api("/api/cameras", { method: "POST", body });
+      cam = await api("/api/cameras", { method: "POST", body: { ...base, ip: form.ip, zones: zones.value } });
     } else {
-      cam = await api(`/api/cameras/${props.camera.id}`, { method: "PATCH", body: { ...base, source: form.source } });
+      cam = await api(`/api/cameras/${props.camera.id}`, { method: "PATCH", body: { ...base, ip: form.ip } });
       await api(`/api/cameras/${props.camera.id}/zones`, { method: "PUT", body: { zones: zones.value } });
     }
     setStatus(isNew ? "Камера добавлена" : "Камера сохранена");
@@ -108,15 +102,9 @@ async function remove() {
 
     <form v-if="tab === 'main'" class="form" @submit.prevent="save">
       <label class="field light">Название<input v-model.trim="form.name" type="text" maxlength="120" placeholder="Например, Касса 1–2" /></label>
-      <div v-if="isNew" class="seg">
-        <button type="button" :class="{ on: form.mode === 'ip' }" @click="form.mode = 'ip'">По IP-адресу</button>
-        <button type="button" :class="{ on: form.mode === 'url' }" @click="form.mode = 'url'">RTSP-ссылка</button>
-      </div>
-      <label v-if="form.mode === 'ip'" class="field light">IP-адрес камеры
-        <input v-model.trim="form.ip" type="text" placeholder="192.168.1.64" required />
-        <span class="hint">Логин, пароль и путь потока берутся из «Доступ к камерам».</span></label>
-      <label v-else class="field light">RTSP-ссылка
-        <input v-model.trim="form.source" type="text" placeholder="rtsp://user:pass@192.168.1.64:554/Streaming/Channels/101" required /></label>
+      <label class="field light">IP-адрес камеры
+        <input v-model.trim="form.ip" type="text" inputmode="decimal" placeholder="192.168.1.64" required />
+        <span class="hint">Логин, пароль, порт и путь потока — общие для всех камер, задаются в «Доступ к камерам».</span></label>
       <div class="grid2">
         <label class="field light">Анализировать каждый N-й кадр
           <input v-model.number="form.process_every" type="number" min="1" max="100" /></label>
