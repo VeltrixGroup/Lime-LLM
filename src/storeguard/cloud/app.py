@@ -8,6 +8,7 @@ later phases; nothing here touches the GPU pipeline.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -95,7 +96,9 @@ from storeguard.cloud.schemas import (
     UserOut,
     ZoneOut,
     ZonesIn,
+    DEFAULT_STREAM_PATH,
     build_camera_source,
+    camera_ip,
     camera_label,
     normalize_email,
     normalize_phone,
@@ -214,6 +217,14 @@ def _member_out(m: Membership) -> MemberOut:
     )
 
 
+def _is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
 def _camera_out(cam: Camera, with_source: bool = True) -> CameraOut:
     """``with_source=False`` hides the RTSP URL (it embeds the camera password)."""
     return CameraOut(
@@ -221,6 +232,7 @@ def _camera_out(cam: Camera, with_source: bool = True) -> CameraOut:
         name=cam.name,
         source=cam.source if with_source else camera_label(cam.source),
         label=camera_label(cam.source),
+        ip=camera_ip(cam.source),
         process_every=cam.process_every,
         enabled=cam.enabled,
         zones=[ZoneOut(id=z.id, name=z.name, points=z.points) for z in cam.zones],
@@ -734,7 +746,12 @@ def create_cloud_app(
                     status_code=409, detail="a camera with this name already exists"
                 )
             cam.name = new_name
-        if body.source is not None:
+        if body.ip:
+            # IP edit: rebuild the URL with the tenant's shared login/port/path.
+            cam.source = build_camera_source(
+                body.ip, db.get(CameraDefaults, owner.tenant_id)
+            )
+        elif body.source is not None:
             cam.source = body.source
         if body.process_every is not None:
             cam.process_every = body.process_every
@@ -791,7 +808,7 @@ def create_cloud_app(
     def _camera_defaults_out(cfg: CameraDefaults | None) -> CameraDefaultsOut:
         if cfg is None:
             return CameraDefaultsOut(
-                username="", port=554, stream_path="/Streaming/Channels/101",
+                username="", port=554, stream_path=DEFAULT_STREAM_PATH,
                 password_set=False,
             )
         return CameraDefaultsOut(
@@ -820,10 +837,18 @@ def create_cloud_app(
             db.add(cfg)
         cfg.username = body.username.strip()
         cfg.port = body.port
-        cfg.stream_path = body.stream_path.strip() or "/Streaming/Channels/101"
+        cfg.stream_path = body.stream_path  # already normalized to a bare path
         password = body.password.strip()
         if password:  # an empty password in the request keeps the stored one
             cfg.password = password
+        # One login/password/port/path for every camera: re-point each camera
+        # that is addressed by IP so a changed password reaches all of them.
+        for cam in db.scalars(
+            select(Camera).where(Camera.tenant_id == owner.tenant_id)
+        ):
+            ip = camera_ip(cam.source)
+            if ip and _is_ip(ip):
+                cam.source = build_camera_source(ip, cfg)
         db.commit()
         return _camera_defaults_out(cfg)
 

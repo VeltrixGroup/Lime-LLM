@@ -351,9 +351,9 @@ class CameraDefaults(Base):
     #: Bot-token-style secret: write-only over the API, stored plaintext here.
     password: Mapped[str] = mapped_column(String(200), default="", nullable=False)
     port: Mapped[int] = mapped_column(default=554, nullable=False)
-    #: Path appended after host:port, e.g. "/Streaming/Channels/101".
+    #: Path appended after host:port, e.g. "/ch1/main/av_stream".
     stream_path: Mapped[str] = mapped_column(
-        String(200), default="/Streaming/Channels/101", nullable=False
+        String(200), default="/ch1/main/av_stream", nullable=False
     )
 
 

@@ -46,7 +46,7 @@ def test_camera_defaults_start_empty(owner: TestClient) -> None:
     assert owner.get("/api/settings/camera-defaults").json() == {
         "username": "",
         "port": 554,
-        "stream_path": "/Streaming/Channels/101",
+        "stream_path": "/ch1/main/av_stream",
         "password_set": False,
     }
 
@@ -110,12 +110,12 @@ def test_add_camera_by_ip_uses_saved_defaults(owner: TestClient) -> None:
     assert cam["name"] == "192.168.1.64"
 
 
-def test_add_camera_by_ip_without_saved_defaults_uses_hikvision_default(
+def test_add_camera_by_ip_without_saved_defaults_uses_default_path(
     owner: TestClient,
 ) -> None:
     res = owner.post("/api/cameras", json={"name": "Entrance", "ip": "10.0.0.5"})
     assert res.status_code == 201, res.text
-    assert res.json()["source"] == "rtsp://10.0.0.5:554/Streaming/Channels/101"
+    assert res.json()["source"] == "rtsp://10.0.0.5:554/ch1/main/av_stream"
 
 
 def test_add_camera_by_ip_encodes_special_characters_in_credentials(
@@ -128,7 +128,7 @@ def test_add_camera_by_ip_encodes_special_characters_in_credentials(
     res = owner.post("/api/cameras", json={"ip": "10.0.0.5"})
     assert res.status_code == 201, res.text
     source = res.json()["source"]
-    assert source == "rtsp://ad%20min:p%40ss%3Aw%2Frd@10.0.0.5:554/Streaming/Channels/101"
+    assert source == "rtsp://ad%20min:p%40ss%3Aw%2Frd@10.0.0.5:554/ch1/main/av_stream"
 
 
 def test_create_camera_requires_source_or_ip(owner: TestClient) -> None:
@@ -147,3 +147,29 @@ def test_explicit_source_wins_over_ip(owner: TestClient) -> None:
     )
     assert res.status_code == 201
     assert res.json()["source"] == "rtsp://other/1"
+
+
+def test_pasted_full_url_keeps_only_path(owner: TestClient) -> None:
+    out = owner.put(
+        "/api/settings/camera-defaults",
+        json={"username": "admin", "password": "pw", "port": 554,
+              "stream_path": "rtsp://192.168.0.1:554/ch1/main/av_stream"},
+    ).json()
+    assert out["stream_path"] == "/ch1/main/av_stream"
+    cam = owner.post("/api/cameras", json={"ip": "192.168.1.10"}).json()
+    assert cam["source"] == "rtsp://admin:pw@192.168.1.10:554/ch1/main/av_stream"
+    assert cam["ip"] == "192.168.1.10"
+
+
+def test_edit_camera_ip_and_defaults_apply_to_all(owner: TestClient) -> None:
+    owner.put("/api/settings/camera-defaults",
+              json={"username": "admin", "password": "old", "port": 554})
+    a = owner.post("/api/cameras", json={"ip": "192.168.1.10"}).json()
+    b = owner.post("/api/cameras", json={"ip": "192.168.1.11"}).json()
+    moved = owner.patch(f"/api/cameras/{a['id']}", json={"ip": "192.168.1.20"}).json()
+    assert moved["source"] == "rtsp://admin:old@192.168.1.20:554/ch1/main/av_stream"
+    owner.put("/api/settings/camera-defaults",
+              json={"username": "admin", "password": "new", "port": 8554})
+    sources = {c["id"]: c["source"] for c in owner.get("/api/cameras").json()["cameras"]}
+    assert sources[a["id"]] == "rtsp://admin:new@192.168.1.20:8554/ch1/main/av_stream"
+    assert sources[b["id"]] == "rtsp://admin:new@192.168.1.11:8554/ch1/main/av_stream"
