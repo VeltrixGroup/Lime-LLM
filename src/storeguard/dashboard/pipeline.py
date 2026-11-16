@@ -46,6 +46,11 @@ _COLOR_ZONE = (0, 200, 255)
 #: up fast with several cameras running at once — downscale before encoding.
 _PREVIEW_MAX_WIDTH = 960
 
+#: Live cameras are shown at most this many frames per second. A 25 fps camera
+#: would otherwise be resized, drawn and JPEG-encoded 25 times a second per
+#: camera, though nobody sees the difference past ~12 fps in a browser tile.
+_PREVIEW_MAX_FPS = 12
+
 
 def _resize_for_preview(frame: np.ndarray) -> np.ndarray:
     """Downscale ``frame`` for the live preview stream if it's wider than needed.
@@ -339,6 +344,10 @@ class DetectionSession:
         self._raw_jpeg: bytes | None = None
         #: Viewers that want raw frames + metadata (the cabinet "Камеры онлайн").
         self.meta_viewers = 0
+        #: Viewers of the annotated MJPEG / plain WebSocket stream. With none,
+        #: the boxes are not drawn and that JPEG is not encoded at all.
+        self.jpeg_viewers = 0
+        self._last_preview = 0.0
         self._paid_seen: set[int] = set()
         self._announced: set[tuple[str, int]] = set()
         self._crop_at: dict[int, float] = {}
@@ -642,6 +651,9 @@ class DetectionSession:
                 "people": people,
                 "counts": {"all": len(tracks), "staff": n_staff, "visitors": len(tracks) - n_staff},
                 "rec": any(p["rec"] for p in people),
+                # Frame width / height: the cabinet sizes its overlay to the
+                # picture itself, not to the letterboxed tile around it.
+                "ar": round(w / h, 4) if h else 16 / 9,
             }
         return events
 
@@ -823,47 +835,59 @@ class DetectionSession:
                         with self._lock:
                             self._stats.fps = round(inst_fps, 1)
 
-                # Downscale first, then draw: cheaper than copying and drawing
-                # on a multi-megapixel frame, and labels stay readable instead
-                # of shrinking along with the picture.
-                small = _resize_for_preview(frame)
-                scale = small.shape[1] / frame.shape[1]
-                preview = draw_person_overlays(
-                    small,
-                    _scale_tracks(tracks, scale),
-                    statuses=statuses,
-                    zones=self._zones or None,
+                # Preview frames: only what someone is watching, and for live
+                # cameras at most _PREVIEW_MAX_FPS. Downscale first, then draw:
+                # cheaper than drawing on a multi-megapixel frame, and labels
+                # stay readable instead of shrinking along with the picture.
+                want_annotated = self.jpeg_viewers > 0
+                want_raw = self.meta_viewers > 0
+                now_p = time.monotonic()
+                encode = (want_annotated or want_raw) and (
+                    is_file or now_p - self._last_preview >= 1.0 / _PREVIEW_MAX_FPS
                 )
-                ok_enc, buf = cv2.imencode(
-                    ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-                )
-                raw_jpeg = None
-                if self.meta_viewers > 0:
-                    ok_raw, raw_buf = cv2.imencode(
-                        ".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-                    )
-                    raw_jpeg = raw_buf.tobytes() if ok_raw else None
-                if ok_enc:
-                    jpeg = buf.tobytes()
-                    people_status = [
-                        PersonStatus(
-                            track_id=t.track_id,
-                            status=statuses.get(t.track_id, "not paid"),
+                jpeg = raw_jpeg = None
+                if encode:
+                    self._last_preview = now_p
+                    small = _resize_for_preview(frame)
+                    if want_annotated:
+                        scale = small.shape[1] / frame.shape[1]
+                        preview = draw_person_overlays(
+                            small,
+                            _scale_tracks(tracks, scale),
+                            statuses=statuses,
+                            zones=self._zones or None,
                         )
-                        for t in tracks
-                    ]
-                    n_paid = sum(1 for p in people_status if p.status == "paid")
-                    with self._frame_ready:
-                        self._jpeg = jpeg
-                        self._raw_jpeg = raw_jpeg
+                        ok_enc, buf = cv2.imencode(
+                            ".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                        )
+                        jpeg = buf.tobytes() if ok_enc else None
+                    if want_raw:
+                        ok_raw, raw_buf = cv2.imencode(
+                            ".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                        )
+                        raw_jpeg = raw_buf.tobytes() if ok_raw else None
+                people_status = [
+                    PersonStatus(
+                        track_id=t.track_id,
+                        status=statuses.get(t.track_id, "not paid"),
+                    )
+                    for t in tracks
+                ]
+                n_paid = sum(1 for p in people_status if p.status == "paid")
+                with self._frame_ready:
+                    if jpeg is not None or raw_jpeg is not None:
+                        if jpeg is not None:
+                            self._jpeg = jpeg
+                        if raw_jpeg is not None:
+                            self._raw_jpeg = raw_jpeg
                         self._jpeg_seq += 1
-                        self._stats.people = len(tracks)
-                        self._stats.frame = frame_idx
-                        self._stats.tracks = [t.track_id for t in tracks]
-                        self._stats.people_status = people_status
-                        self._stats.paid = n_paid
-                        self._stats.not_paid = len(tracks) - n_paid
-                        self._frame_ready.notify_all()
+                    self._stats.people = len(tracks)
+                    self._stats.frame = frame_idx
+                    self._stats.tracks = [t.track_id for t in tracks]
+                    self._stats.people_status = people_status
+                    self._stats.paid = n_paid
+                    self._stats.not_paid = len(tracks) - n_paid
+                    self._frame_ready.notify_all()
 
                 if is_file and frame_delay > 0:
                     elapsed = time.monotonic() - t0
