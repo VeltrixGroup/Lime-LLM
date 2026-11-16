@@ -120,14 +120,16 @@ onUnmounted(() => {
 
   <div v-else class="row" style="gap: 20px; align-items: flex-start">
     <div style="flex: 3 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 14px">
-      <div ref="viewer" class="video" style="height: 480px">
-        <img v-if="sel?.frame" class="frame" :src="sel.frame.url" alt="Видео с камеры" />
-        <template v-if="sel?.frame && showAi">
-          <div v-for="p in sel.frame.meta.people" :key="p.id" class="box"
-               :style="{ left: p.box[0] * 100 + '%', top: p.box[1] * 100 + '%', width: p.box[2] * 100 + '%', height: p.box[3] * 100 + '%', borderColor: p.color }">
-            <span class="tag" :style="{ background: p.color }">{{ p.label }}</span>
-          </div>
-        </template>
+      <div ref="viewer" class="video staged" style="height: 480px">
+        <div v-if="sel?.frame" class="stage" :style="{ '--ar': sel.frame.meta.ar || 16 / 9 }">
+          <img class="frame" :src="sel.frame.url" alt="Видео с камеры" />
+          <template v-if="showAi">
+            <div v-for="p in sel.frame.meta.people" :key="p.id" class="box"
+                 :style="{ left: p.box[0] * 100 + '%', top: p.box[1] * 100 + '%', width: p.box[2] * 100 + '%', height: p.box[3] * 100 + '%', borderColor: p.color }">
+              <span class="tag" :style="{ background: p.color }">{{ p.label }}</span>
+            </div>
+          </template>
+        </div>
         <div v-if="sel && !sel.online" style="position: absolute; inset: 0; background: #0f0f0d; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; text-align: center; padding: 16px" class="text-2">
           <Icon name="nosignal" :size="40" style="color: var(--alert)" />
           <span v-if="live.state.value === 'unavailable'">Детекция не запущена. Запустите <span class="mono">make serve</span> на ПК магазина.</span>
@@ -180,7 +182,7 @@ onUnmounted(() => {
       <div class="card" style="padding: 20px; gap: 4px">
         <div class="card-head" style="margin-bottom: 8px"><strong>События в реальном времени</strong>
           <router-link v-if="can('archive')" to="/incidents" style="font-size: 13px">Все</router-link></div>
-        <div v-for="(e, i) in live.feed.value" :key="e.seq" style="display: flex; gap: 10px; padding: 10px; border-radius: 10px; align-items: flex-start"
+        <div v-for="(e, i) in live.feed.value.slice(0, 5)" :key="e.seq" style="display: flex; gap: 10px; padding: 10px; border-radius: 10px; align-items: flex-start"
              :style="{ background: i === 0 ? 'var(--bg-accent-soft)' : 'transparent' }">
           <span class="dot" :style="{ background: e.color, marginTop: '7px' }"></span>
           <div style="flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.35">

@@ -714,26 +714,31 @@ def create_app(
         def generate():
             seq = 0
             idle_rounds = 0
-            while True:
-                result = session.wait_next_jpeg(after_seq=seq, timeout=1.0)
-                if result is None:
-                    idle_rounds += 1
-                    if not session.is_alive() and idle_rounds >= 2:
-                        break
-                    continue
-                idle_rounds = 0
-                jpeg, seq = result
-                yield (
-                    b"--"
-                    + boundary.encode()
-                    + b"\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: "
-                    + str(len(jpeg)).encode()
-                    + b"\r\n\r\n"
-                    + jpeg
-                    + b"\r\n"
-                )
+            # Counted so the pipeline only draws/encodes frames while watched.
+            session.jpeg_viewers = getattr(session, "jpeg_viewers", 0) + 1
+            try:
+                while True:
+                    result = session.wait_next_jpeg(after_seq=seq, timeout=1.0)
+                    if result is None:
+                        idle_rounds += 1
+                        if not session.is_alive() and idle_rounds >= 2:
+                            break
+                        continue
+                    idle_rounds = 0
+                    jpeg, seq = result
+                    yield (
+                        b"--"
+                        + boundary.encode()
+                        + b"\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: "
+                        + str(len(jpeg)).encode()
+                        + b"\r\n\r\n"
+                        + jpeg
+                        + b"\r\n"
+                    )
+            finally:
+                session.jpeg_viewers = max(0, getattr(session, "jpeg_viewers", 1) - 1)
 
         return StreamingResponse(
             generate(),
@@ -754,7 +759,12 @@ def create_app(
         # itself), plus the live event feed as text messages.
         meta_mode = ws.query_params.get("mode") == "meta"
         counted: set = set()
+        # Which frames this viewer needs: raw + metadata, or the annotated JPEG.
+        viewer_attr = "meta_viewers" if meta_mode else "jpeg_viewers"
         feed_seq: dict[str, int] = {}
+
+        def _count(session, delta: int) -> None:
+            setattr(session, viewer_attr, max(0, getattr(session, viewer_attr, 0) + delta))
 
         async def _watch_disconnect() -> None:
             # Reading is the only way to observe a client close while no frames
@@ -775,15 +785,15 @@ def create_app(
                     if known not in live_ids:
                         del last_sent[known]
                 sent_any = False
+                for session in sessions:
+                    if session not in counted:
+                        counted.add(session)
+                        _count(session, +1)
+                for session in list(counted):
+                    if session.id not in live_ids:
+                        counted.discard(session)
+                        _count(session, -1)
                 if meta_mode:
-                    for session in sessions:
-                        if session not in counted:
-                            counted.add(session)
-                            session.meta_viewers += 1
-                    for session in list(counted):
-                        if session.id not in live_ids:
-                            counted.discard(session)
-                            session.meta_viewers = max(0, session.meta_viewers - 1)
                     contexts = {id(x.context): x.context for x in sessions if x.context is not None}
                     for ctx in contexts.values():
                         items = ctx.feed_since(feed_seq.get(ctx.uid, 0))
@@ -818,7 +828,7 @@ def create_app(
         finally:
             recv_task.cancel()
             for session in counted:
-                session.meta_viewers = max(0, session.meta_viewers - 1)
+                _count(session, -1)
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
