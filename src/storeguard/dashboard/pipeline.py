@@ -581,6 +581,7 @@ class DetectionSession:
                 gid=gid, zones=zones, paid=statuses.get(gid) == "paid",
                 phone=phone_for is not None, idle=idle,
                 feature=self._registry.feature(gid), crop_jpeg=crop, area=area,
+                pos=(t.foot[0] / w, t.foot[1] / h) if w and h else None,
             ))
             # overlay label / colour as in the design
             if emp_id:

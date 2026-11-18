@@ -66,6 +66,55 @@ def test_visitor_funnel_and_dwell_deltas() -> None:
     assert [f["kind"] for f in act.take_feed()] == ["enter", "leave"]
 
 
+def _entered(act: StoreActivity) -> float:
+    return sum(row.get("entered", 0) for row in act.flush()["visitors"])
+
+
+def _seen(act, gid, t0, secs, pos, feat, cam="cam1", others=()):
+    for i in range(secs):
+        act.observe([Observation(gid=gid, camera=cam, pos=pos, feature=feat), *others], t0 + i)
+
+
+def test_lost_track_with_new_id_continues_the_visit() -> None:
+    act = StoreActivity(StaffGallery())
+    t0 = time.time()
+    look = _unit(7)
+    _seen(act, 1, t0, 6, (0.40, 0.70), look)            # person 1 enters
+    _seen(act, 2, t0 + 8, 6, (0.45, 0.72), look)        # lost 2 s, back as id 2
+    act.observe([], t0 + 14 + LEFT_AFTER_SEC + 1)       # everyone leaves
+    kinds = [f["kind"] for f in act.take_feed()]
+    assert kinds == ["enter", "leave"]                  # one visit, not two
+    assert act.label(1) == (None, "")  # old id merged away
+
+
+def test_two_people_are_not_merged() -> None:
+    t0 = time.time()
+    # Visible at the same time -> two people, even if they look alike.
+    act = StoreActivity(StaffGallery())
+    look = _unit(7)
+    for i in range(6):
+        act.observe([
+            Observation(gid=1, camera="cam1", pos=(0.4, 0.7), feature=look),
+            Observation(gid=2, camera="cam1", pos=(0.45, 0.7), feature=look),
+        ], t0 + i)
+    assert _entered(act) == 2
+    # Far from where the lost one was -> a different person.
+    act = StoreActivity(StaffGallery())
+    _seen(act, 1, t0, 6, (0.1, 0.7), look)
+    _seen(act, 2, t0 + 8, 6, (0.9, 0.7), look)
+    assert _entered(act) == 2
+    # Same spot but clearly different look -> a different person.
+    act = StoreActivity(StaffGallery())
+    _seen(act, 1, t0, 6, (0.4, 0.7), _unit(7))
+    _seen(act, 2, t0 + 8, 6, (0.4, 0.7), _unit(8))
+    assert _entered(act) == 2
+    # Too long gone -> a new visit.
+    act = StoreActivity(StaffGallery())
+    _seen(act, 1, t0, 6, (0.4, 0.7), look)
+    _seen(act, 2, t0 + 60, 6, (0.4, 0.7), look)
+    assert _entered(act) == 2
+
+
 def test_staff_are_not_visitors_and_get_time_split() -> None:
     g = StaffGallery()
     feat = _unit(3)

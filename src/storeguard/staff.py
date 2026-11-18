@@ -34,6 +34,17 @@ RECHECK_SEC = 10.0
 ENTER_AFTER_SEC = 3.0
 #: An identity unseen this long has left the store; its visit is closed.
 LEFT_AFTER_SEC = 120.0
+#: A new id that shows up within this many seconds of an unseen visitor, close
+#: to where that visitor was last seen and looking alike, is the same person
+#: whose track was lost (crowd, occlusion, night noise) — the visit continues
+#: instead of a new "вошёл" now and a stray "вышел" for the old id later.
+REJOIN_SEC = 20.0
+#: How far (fraction of the frame) the person may have moved during the gap.
+REJOIN_DIST = 0.25
+#: Appearance similarity needed for that (looser than re-id: the place and
+#: time already narrow it down to one or two candidates).
+REJOIN_SIM = 0.45
+
 #: Unknown person this long (cumulative) in staff zones -> staff candidate.
 CANDIDATE_AFTER_SEC = 30.0
 #: Zone-name prefixes that mark staff-only areas ("служебные зоны").
@@ -124,6 +135,9 @@ class Visit:
     camera: str = ""
     #: When each funnel flag was counted (to retract it in the same hour).
     flag_ts: dict = field(default_factory=dict)
+    #: Where (normalised feet point) the person was first / last seen.
+    first_pos: tuple[float, float] | None = None
+    last_pos: tuple[float, float] | None = None
 
 
 @dataclass
@@ -147,6 +161,7 @@ class Observation:
     crop_jpeg: bytes | None = None  # only offered occasionally (expensive)
     area: float = 0.0  # box area, to keep the best crop
     camera: str = ""  # who saw it (for the live feed)
+    pos: tuple[float, float] | None = None  # feet point, 0..1 of the frame
 
 
 def _hour_key(ts: float) -> str:
@@ -207,12 +222,16 @@ class StoreActivity:
             for o in obs:
                 v = self._visits.get(o.gid)
                 if v is None:
-                    v = self._visits[o.gid] = Visit(gid=o.gid, first=ts, last=ts)
+                    v = self._visits[o.gid] = Visit(
+                        gid=o.gid, first=ts, last=ts, camera=o.camera, first_pos=o.pos
+                    )
                 dt = max(0.0, min(ts - self._last_tick.get(o.gid, ts), 5.0))
                 self._last_tick[o.gid] = ts
                 v.last = max(v.last, ts)
                 if o.camera:
                     v.camera = o.camera
+                if o.pos is not None:
+                    v.last_pos = o.pos
                 if o.feature is not None:
                     v.feature = o.feature if v.feature is None else _blend(v.feature, o.feature)
                 if ts - v.checked_at >= RECHECK_SEC and v.feature is not None:
@@ -253,6 +272,14 @@ class StoreActivity:
                 # Count only after the staff check had a chance to run.
                 checked = v.checked_at > -1e9 or len(self.gallery) == 0
                 if not v.entered and checked and ts - v.first >= ENTER_AFTER_SEC:
+                    old = self._rejoin_candidate(v, {x.gid for x in obs})
+                    if old is not None:
+                        # Same person: already counted (no new "вошёл"), or an
+                        # employee whose shift time goes on next frame.
+                        v = self._merge_into(old, v)
+                        if v.staff_id is not None:
+                            continue
+                if not v.entered and checked and ts - v.first >= ENTER_AFTER_SEC:
                     v.entered = True
                     self._bump(v.first, "entered")
                     self.feed.append({"kind": "enter", "gid": o.gid, "ts": ts, "camera": o.camera})
@@ -286,6 +313,51 @@ class StoreActivity:
                             "crop": v.best_crop,
                         })
             self._close_visits(ts)
+
+    def _rejoin_candidate(self, new: Visit, visible: set[int]) -> Visit | None:
+        """An open visit the camera lost just before ``new`` appeared nearby.
+
+        Only people not visible right now qualify (two people in one frame are
+        two people), on the same camera, gone at most :data:`REJOIN_SEC`
+        before ``new`` showed up, last seen within :data:`REJOIN_DIST` of
+        where ``new`` appeared, and — when both have an appearance feature —
+        alike enough. The closest look-alike wins.
+        """
+        best, best_key = None, None
+        for v in self._visits.values():
+            if v.gid == new.gid or v.gid in visible or v.camera != new.camera:
+                continue
+            gap = new.first - v.last
+            if gap < -0.5 or gap > REJOIN_SEC:  # overlapped in time, or too long ago
+                continue
+            if v.last_pos is None or new.first_pos is None:
+                continue
+            dist = float(np.hypot(v.last_pos[0] - new.first_pos[0], v.last_pos[1] - new.first_pos[1]))
+            if dist > REJOIN_DIST:
+                continue
+            sim = None
+            if v.feature is not None and new.feature is not None and v.feature.shape == new.feature.shape:
+                sim = float(v.feature @ new.feature)
+                if sim < REJOIN_SIM:
+                    continue
+            key = (sim if sim is not None else 0.0, -dist)
+            if best_key is None or key > best_key:
+                best, best_key = v, key
+        return best
+
+    def _merge_into(self, old: Visit, new: Visit) -> Visit:
+        """Continue ``old``'s visit under ``new``'s id; ``old``'s id is dropped silently."""
+        self._visits.pop(old.gid, None)
+        self._last_tick.pop(old.gid, None)
+        old.gid = new.gid
+        old.last = max(old.last, new.last)
+        old.last_pos = new.last_pos or old.last_pos
+        if new.feature is not None:
+            old.feature = new.feature if old.feature is None else _blend(old.feature, new.feature)
+        if new.best_area > old.best_area:
+            old.best_crop, old.best_area = new.best_crop, new.best_area
+        self._visits[new.gid] = old
+        return old
 
     def _close_visits(self, ts: float) -> None:
         gone = [g for g, v in self._visits.items() if ts - v.last > LEFT_AFTER_SEC]
