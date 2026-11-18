@@ -64,6 +64,10 @@ class DetectorCfg(BaseModel):
     #: lost-and-found tracks, crowds) here, with the model's boxes, for later
     #: review and re-training. See :mod:`storeguard.hard_frames`. ``""`` = off.
     hard_frames_dir: str = "data/hard_frames"
+    #: Weights for *people* only. ``"auto"``: the model switched to with
+    #: ``storeguard model use`` (models/person_model.json), if any; ``""``:
+    #: always :attr:`model`. Phones are always detected with :attr:`model`.
+    person_model: str = "auto"
 
 
 class ActionCfg(BaseModel):

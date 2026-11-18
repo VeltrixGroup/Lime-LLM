@@ -269,6 +269,53 @@ def _cmd_finetune(args: argparse.Namespace) -> None:
     console.print(f"\nCandidate: {report.candidate}\nVerdict: {verdict}", soft_wrap=True)
 
 
+def _cmd_model(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard model status|use|rollback``."""
+    from . import person_model as pm
+
+    def show_active() -> None:
+        cur = pm.active()
+        if cur is None:
+            console.print("Cameras use: [bold]the original model[/bold] for people and phones.")
+        else:
+            console.print(f"Cameras use for people: [bold]{cur['weights']}[/bold] (since {cur.get('at', '?')})", soft_wrap=True)
+            console.print("Phones: the original model.")
+
+    if args.action == "status":
+        show_active()
+        cands = pm.candidates()
+        if not cands:
+            console.print("No trained candidates yet — run `.\\make.ps1 finetune`.")
+            return
+        console.print("\nCandidates (newest first):")
+        for c in cands:
+            o, n = c["old"], c["new"]
+            score = (f"F1 {o.get('f1', 0):.3f} -> {n.get('f1', 0):.3f} on {c['val_frames']} exam frames"
+                     if c["has_report"] else "no exam report")
+            mark = "[green]better[/green]" if c["better"] else "[yellow]not better[/yellow]"
+            console.print(f"  {c['weights']}  {score}  {mark}", soft_wrap=True)
+        return
+
+    try:
+        if args.action == "use":
+            target = args.weights
+            if target in (None, "latest"):
+                better = [c for c in pm.candidates() if c["better"] or args.force]
+                if not better:
+                    raise pm.SwitchError("no candidate passed its exam yet")
+                target = better[0]["weights"]
+            pm.use(target, force=args.force)
+            console.print(f"[green]Switched people detection to {target}.[/green]", soft_wrap=True)
+        else:
+            pm.rollback()
+            console.print("[green]Switched back.[/green]")
+    except pm.SwitchError as exc:
+        console.print(f"[red]Not switched:[/red] {exc}")
+        raise SystemExit(1) from None
+    show_active()
+    console.print("Restart the app to apply it: .\\make.ps1 bg-stop, then .\\make.ps1 bg-start")
+
+
 def _cmd_make_dataset(args: argparse.Namespace) -> None:
     """Handler for ``storeguard make-dataset``."""
     from .actions.dataset import make_dataset
@@ -577,7 +624,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="train the person detector on frames approved in «Обучение ИИ» (step 4 of re-training)",
     )
     p.add_argument("--dir", default="data/hard_frames", help="hard frames folder")
-    p.add_argument("--base", default="yolo26s.pt", help="model to start from (the one cameras use now)")
+    p.add_argument("--base", default="auto", help="model to start from; auto = the one the cameras use now")
     p.add_argument("--epochs", type=int, default=50, help="max passes over the data (stops early when it plateaus)")
     p.add_argument("--imgsz", type=int, default=640, help="training image size (same as the live detector)")
     p.add_argument("--conf", type=float, default=0.45, help="score threshold for the comparison (live default)")
@@ -585,6 +632,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-train", type=int, default=100, help="refuse to train with fewer approved frames")
     p.add_argument("--min-val", type=int, default=20, help="refuse with fewer exam frames")
     p.set_defaults(func=_cmd_finetune)
+
+    p = sub.add_parser(
+        "model",
+        help="which person model the cameras use: status / use a trained candidate / rollback (step 5)",
+    )
+    p.add_argument("action", choices=["status", "use", "rollback"])
+    p.add_argument("weights", nargs="?", help='for "use": a candidate .pt, or "latest" (default)')
+    p.add_argument("--force", action="store_true", help="switch even if its exam said it is not better")
+    p.set_defaults(func=_cmd_model)
 
     p = sub.add_parser(
         "annotate",

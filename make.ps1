@@ -62,6 +62,9 @@ function Show-Help {
     Write-Host "  .\make.ps1 optimize                  build the TensorRT engine (NVIDIA) and show the speed-up"
     Write-Host "  .\make.ps1 prelabel                  re-label saved hard frames with the big yolo26x model (run at night)"
     Write-Host "  .\make.ps1 finetune                  train the detector on frames approved in Obuchenie II (needs a GPU)"
+    Write-Host "  .\make.ps1 model-status              which person model the cameras use, and the trained candidates"
+    Write-Host "  .\make.ps1 model-use                 switch cameras to the newest candidate that passed its exam"
+    Write-Host "  .\make.ps1 model-rollback            switch back to the previous model"
     Write-Host "  .\make.ps1 test                      run pytest"
     Write-Host "  .\make.ps1 clean                     remove __pycache__ / pytest cache"
     Write-Host ""
@@ -241,6 +244,9 @@ switch ($Target) {
     "optimize" { Invoke-Optimize }
     "prelabel" { uv run storeguard prelabel --dir data\hard_frames --device $Device }
     "finetune" { uv run storeguard finetune --dir data\hard_frames --device $Device }
+    "model-status" { uv run storeguard model status }
+    "model-use" { uv run storeguard model use latest }
+    "model-rollback" { uv run storeguard model rollback }
     "test" { Invoke-Test }
     "clean" { Invoke-Clean }
     default {
