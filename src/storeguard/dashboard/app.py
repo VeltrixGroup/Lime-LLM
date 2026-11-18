@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 from starlette.websockets import WebSocketDisconnect
 
+from storeguard import review
 from storeguard.cloud.agent_client import CloudClient
 from storeguard.config import ActionCfg, DetectorCfg
 from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
@@ -207,6 +208,14 @@ def _stats_payload(session: DetectionSession) -> dict:
         "error": s.error,
         "camera_id": getattr(session, "camera_id", None),
     }
+
+
+class HardFrameReview(BaseModel):
+    """A reviewer's decision on one hard frame (boxes: normalised x1, y1, x2, y2)."""
+
+    id: str
+    status: str
+    boxes: list[list[float]] = Field(default_factory=list, max_length=200)
 
 
 def create_app(
@@ -829,6 +838,43 @@ def create_app(
             recv_task.cancel()
             for session in counted:
                 _count(session, -1)
+
+    # ---- hard frames review ("Обучение ИИ", re-training step 3) ----
+    # The frames live on this PC (storeguard.hard_frames); the cabinet only
+    # reaches them through /live, where writing needs the "cams_edit" right.
+
+    def _hard_root() -> Path:
+        return Path(app.state.detector.hard_frames_dir or "data/hard_frames")
+
+    @app.get("/api/hard-frames")
+    def hard_frames_list(status: str = "todo", limit: int = 100) -> JSONResponse:
+        if status not in ("todo", "approved", "rejected", "all"):
+            raise HTTPException(status_code=422, detail="bad status")
+        return JSONResponse(review.list_frames(_hard_root(), status, min(max(limit, 0), 500)))
+
+    @app.get("/api/hard-frames/frame")
+    def hard_frame(id: str) -> JSONResponse:  # noqa: A002 — the query parameter's name
+        try:
+            return JSONResponse(review.get_frame(_hard_root(), id))
+        except review.FrameNotFound:
+            raise HTTPException(status_code=404, detail="frame not found") from None
+
+    @app.get("/api/hard-frames/image")
+    def hard_frame_image(id: str) -> FileResponse:  # noqa: A002
+        try:
+            jpg = review.frame_path(_hard_root(), id)
+        except review.FrameNotFound:
+            raise HTTPException(status_code=404, detail="frame not found") from None
+        return FileResponse(jpg, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.post("/api/hard-frames/review")
+    def hard_frame_review(body: HardFrameReview) -> JSONResponse:
+        try:
+            return JSONResponse(review.save_review(_hard_root(), body.id, body.status, body.boxes))
+        except review.FrameNotFound:
+            raise HTTPException(status_code=404, detail="frame not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
 
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")

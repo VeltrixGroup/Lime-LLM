@@ -26,10 +26,26 @@ from storeguard.cloud.auth import permissions_of, require_perm
 from storeguard.cloud.models import Membership, User
 
 
-def live_access(session_factory, session: dict) -> tuple[bool, str | None]:
+#: Live-side API paths that also need a stronger right than "live".
+#: Reviewing hard frames writes the detector's future training labels.
+_EXTRA_PERMS = (("/api/hard-frames", "cams_edit"),)
+
+
+def extra_perm(path: str) -> str | None:
+    """The right a ``/live`` path needs on top of "live", if any."""
+    for prefix, perm in _EXTRA_PERMS:
+        if prefix in path:
+            return perm
+    return None
+
+
+def live_access(
+    session_factory, session: dict, need: str | None = None
+) -> tuple[bool, str | None]:
     """(allowed, tenant_id): an active user, a member of the session's store,
-    whose role holds "live". Checked on every request / socket, so a removed
-    or disabled user loses the live view immediately, not when the cookie ends."""
+    whose role holds "live" (and ``need``, if given). Checked on every request
+    / socket, so a removed or disabled user loses the live view immediately,
+    not when the cookie ends."""
     user_id, tenant_id = session.get("user_id"), session.get("tenant_id")
     if not user_id or not tenant_id or session_factory is None:
         return False, None
@@ -38,7 +54,10 @@ def live_access(session_factory, session: dict) -> tuple[bool, str | None]:
         if user is None or not user.is_active:
             return False, None
         m = db.query(Membership).filter_by(user_id=user_id, tenant_id=tenant_id).one_or_none()
-        if m is None or "live" not in permissions_of(db, m):
+        if m is None:
+            return False, None
+        perms = permissions_of(db, m)
+        if "live" not in perms or (need and need not in perms):
             return False, None
     return True, tenant_id
 
@@ -84,7 +103,7 @@ class LoginRequired:
         import anyio
 
         allowed, tenant_id = await anyio.to_thread.run_sync(
-            live_access, self.session_factory, dict(scope.get("session", {}))
+            live_access, self.session_factory, dict(scope.get("session", {})), extra_perm(path)
         )
         if allowed:
             # The dashboard runs cameras for *this* store (one-port mode).
@@ -158,6 +177,16 @@ def build_live_proxy_router(upstream_base: str, session_factory=None) -> APIRout
         # Built JS/CSS only — no user data, so no auth gate (same as the
         # cabinet's own /static/* assets, which are equally unauthenticated).
         return await _proxy_http(request, f"/assets/{path}")
+
+    @router.api_route("/live/api/hard-frames{path:path}", methods=["GET", "POST"])
+    async def live_hard_frames(
+        path: str,
+        request: Request,
+        _membership=Depends(require_perm("live")),
+        _edit=Depends(require_perm("cams_edit")),
+    ) -> Response:
+        # Registered before the catch-all below so it can't skip this check.
+        return await _proxy_http(request, f"/api/hard-frames{path}")
 
     @router.api_route(
         "/live/api/{path:path}",

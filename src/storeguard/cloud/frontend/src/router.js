@@ -6,6 +6,7 @@ import EmployeesPage from "./pages/EmployeesPage.vue";
 import AnalyticsPage from "./pages/AnalyticsPage.vue";
 import AccessPage from "./pages/AccessPage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
+import TrainingPage from "./pages/TrainingPage.vue";
 
 // `perm`: hidden from the sidebar (and redirected away) without it.
 export const NAV = [
@@ -14,6 +15,7 @@ export const NAV = [
   { path: "/incidents", label: "Инциденты", icon: "incident", perm: "archive" },
   { path: "/employees", label: "Сотрудники", icon: "user", perm: "staff_stats" },
   { path: "/analytics", label: "Аналитика", icon: "chart", perm: "analytics" },
+  { path: "/training", label: "Обучение ИИ", icon: "spark", perm: "cams_edit" },
   { path: "/access", label: "Доступ и роли", icon: "shield", perm: "users" },
   { path: "/settings", label: "Настройки", icon: "sliders", perm: "settings" },
 ];
@@ -27,6 +29,7 @@ export const router = createRouter({
     { path: "/incidents", component: IncidentsPage, meta: { perm: "archive", title: "Инциденты" } },
     { path: "/employees", component: EmployeesPage, meta: { perm: "staff_stats", title: "Сотрудники" } },
     { path: "/analytics", component: AnalyticsPage, meta: { perm: "analytics", title: "Аналитика" } },
+    { path: "/training", component: TrainingPage, meta: { perm: "cams_edit", title: "Обучение ИИ" } },
     { path: "/access", component: AccessPage, meta: { perm: "users", title: "Доступ и роли" } },
     { path: "/settings", component: SettingsPage, meta: { perm: "settings", title: "Настройки" } },
     // Pages of the previous cabinet.
