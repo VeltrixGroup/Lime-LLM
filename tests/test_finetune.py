@@ -86,7 +86,7 @@ def test_finetune_saves_candidate_and_compares(tmp_path) -> None:
         box = [20, 10, 60, 90, 0.9] if good else [120, 10, 160, 90, 0.9]
         return lambda ps: [np.array([box])] * len(ps)
 
-    r = finetune(root, min_train=5, min_val=1, datasets_dir=tmp_path / "ds",
+    r = finetune(root, base="yolo26s.pt", min_train=5, min_val=1, datasets_dir=tmp_path / "ds",
                  runs_dir=tmp_path / "runs", candidates_dir=tmp_path / "cand",
                  train_fn=fake_train, predictor_fn=fake_predictor, log=lambda m: None)
     assert trained["base"] == "yolo26s.pt" and trained["imgsz"] == 640

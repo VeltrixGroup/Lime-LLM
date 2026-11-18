@@ -288,10 +288,19 @@ class PersonTracker:
         """
         self.cfg = cfg
         self.device = pick_device(cfg.device)
+        #: The general COCO model: phones, and people unless a trained
+        #: person model was switched on (``storeguard model use``).
         self.weights = resolve_model(cfg.model, self.device)
+        from storeguard.person_model import resolve as resolve_person_model
+
+        self.person_weights = resolve_person_model(cfg.person_model) or self.weights
         self.half = self.device.startswith("cuda")
-        _log_device_once(self.device, self.weights)
-        self._engine = _get_engine(self.weights, self.device, cfg.imgsz, cfg.optimize)
+        _log_device_once(self.device, self.person_weights)
+        if self.person_weights != self.weights:
+            _console.print(f"[green]People: trained model {self.person_weights}[/green]")
+        self._engine = _get_engine(self.person_weights, self.device, cfg.imgsz, cfg.optimize)
+        # Loaded on first use only: the phone scenario is optional.
+        self._phone_engine = self._engine if self.person_weights == self.weights else None
         self._args = IterableSimpleNamespace(
             tracker_type="bytetrack",
             track_high_thresh=float(cfg.conf),
@@ -372,7 +381,9 @@ class PersonTracker:
         training data), so the 'on phone' scenario is a pure add-on. It is a
         second forward pass, so only call it when that scenario is enabled.
         """
-        dets = self._engine.detect(frame, (67,), float(self.cfg.conf))
+        if self._phone_engine is None:  # a person-only model knows no phones
+            self._phone_engine = _get_engine(self.weights, self.device, self.cfg.imgsz, self.cfg.optimize)
+        dets = self._phone_engine.detect(frame, (67,), float(self.cfg.conf))
         return [tuple(float(v) for v in row[:4]) for row in dets]  # type: ignore[misc]
 
     # -- false-positive filters -------------------------------------------

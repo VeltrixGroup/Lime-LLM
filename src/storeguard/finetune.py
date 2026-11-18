@@ -194,7 +194,7 @@ class NotEnoughFrames(RuntimeError):
 def finetune(
     hard_root: str | Path,
     *,
-    base: str = "yolo26s.pt",
+    base: str = "auto",
     epochs: int = 50,
     imgsz: int = 640,
     conf: float = 0.45,
@@ -209,6 +209,12 @@ def finetune(
     log: Callable[[str], None] = print,
 ) -> Report:
     """Build the dataset, train, compare old vs new on the fixed ``val`` frames."""
+    if base == "auto":
+        # Start from — and compare against — what the cameras run right now.
+        from storeguard.config import DetectorCfg, pick_device, resolve_model
+        from storeguard.person_model import resolve as resolve_person_model
+
+        base = resolve_person_model(DetectorCfg().person_model) or resolve_model("auto", pick_device(device))
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
     ds = build_dataset(hard_root, Path(datasets_dir) / stamp)
     log(f"Approved frames: {len(ds.train)} for training, {len(ds.val)} for the exam "
