@@ -195,6 +195,46 @@ def _cmd_annotate(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_prelabel(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard prelabel``."""
+    from .prelabel import pending_frames, prelabel, yolo_predictor
+
+    todo = len(pending_frames(args.dir, redo=args.redo))
+    if args.limit:
+        todo = min(todo, args.limit)
+    if not todo:
+        console.print(f"Nothing to pre-label in '{args.dir}'.")
+        return
+    console.print(
+        f"[bold]storeguard prelabel[/bold] — {todo} frame(s) in '{args.dir}' with "
+        f"{args.model} at {args.imgsz}px{' + TTA' if not args.no_tta else ''} "
+        "(the model is downloaded on first use)"
+    )
+    predict = yolo_predictor(
+        args.model, imgsz=args.imgsz, conf=args.conf, device=args.device,
+        augment=not args.no_tta,
+    )
+
+    def progress(done: int, total: int) -> None:
+        console.print(f"  {done}/{total}", end="\r")
+
+    summary = prelabel(
+        args.dir, predict, model_name=args.model, imgsz=args.imgsz, conf=args.conf,
+        batch=args.batch, redo=args.redo, limit=args.limit or None, on_progress=progress,
+    )
+    console.print()  # end the progress line
+    console.print(
+        f"[green]Pre-labelled {summary.done} frame(s)[/green]"
+        + (f", [red]{summary.failed} failed[/red]" if summary.failed else "")
+        + f". Mean disagreement with the live model: {summary.mean_disagreement:.2f}"
+    )
+    top = [(s, p) for s, p in summary.worst if s > 0][:10]
+    if top:
+        console.print("Review these first (live and teacher disagree most):")
+        for score, path in top:
+            console.print(f"  {score:.2f}  {path}", soft_wrap=True)
+
+
 def _cmd_make_dataset(args: argparse.Namespace) -> None:
     """Handler for ``storeguard make-dataset``."""
     from .actions.dataset import make_dataset
@@ -482,6 +522,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="output zones YAML path, e.g. configs/zones/cam1.yaml",
     )
     p.set_defaults(func=_cmd_draw_zones)
+
+    p = sub.add_parser(
+        "prelabel",
+        help="re-label saved hard frames with a large teacher model (step 2 of re-training)",
+    )
+    p.add_argument("--dir", default="data/hard_frames", help="hard frames folder")
+    p.add_argument("--model", default="yolo26x.pt", help="teacher weights (yolo26l.pt is ~2x faster)")
+    p.add_argument("--imgsz", type=int, default=1280, help="inference size (default 1280)")
+    p.add_argument("--conf", type=float, default=0.25, help="min box score (default 0.25)")
+    p.add_argument("--device", default="auto", help='"auto" | "cpu" | "cuda" | "mps"')
+    p.add_argument("--batch", type=int, default=4, help="frames per batch")
+    p.add_argument("--no-tta", action="store_true", help="skip test-time augmentation (~3x faster)")
+    p.add_argument("--redo", action="store_true", help="also re-label frames done before")
+    p.add_argument("--limit", type=int, default=0, help="stop after N frames (0 = all)")
+    p.set_defaults(func=_cmd_prelabel)
 
     p = sub.add_parser(
         "annotate",
