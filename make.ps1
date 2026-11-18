@@ -60,6 +60,7 @@ function Show-Help {
     Write-Host "  .\make.ps1 db-down                   stop Postgres (data stays)"
     Write-Host "  .\make.ps1 migrate                   apply database migrations"
     Write-Host "  .\make.ps1 optimize                  build the TensorRT engine (NVIDIA) and show the speed-up"
+    Write-Host "  .\make.ps1 prelabel                  re-label saved hard frames with the big yolo26x model (run at night)"
     Write-Host "  .\make.ps1 test                      run pytest"
     Write-Host "  .\make.ps1 clean                     remove __pycache__ / pytest cache"
     Write-Host ""
@@ -237,6 +238,7 @@ switch ($Target) {
     "db-shell" { docker compose exec db psql -U storeguard -d storeguard }
     "migrate" { Invoke-Install; Invoke-Migrate }
     "optimize" { Invoke-Optimize }
+    "prelabel" { uv run storeguard prelabel --dir data\hard_frames --device $Device }
     "test" { Invoke-Test }
     "clean" { Invoke-Clean }
     default {
