@@ -235,6 +235,40 @@ def _cmd_prelabel(args: argparse.Namespace) -> None:
             console.print(f"  {score:.2f}  {path}", soft_wrap=True)
 
 
+def _cmd_finetune(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard finetune``."""
+    from .config import pick_device
+    from .finetune import NotEnoughFrames, finetune
+
+    device = pick_device(args.device)
+    if device == "cpu":
+        console.print(
+            "[yellow]No GPU: training on CPU can take many hours. "
+            "An NVIDIA GPU (--device cuda) is 20-50x faster.[/yellow]"
+        )
+    try:
+        report = finetune(
+            args.dir, base=args.base, epochs=args.epochs, imgsz=args.imgsz, conf=args.conf,
+            device=device, min_train=args.min_train, min_val=args.min_val,
+            log=lambda m: console.print(m, soft_wrap=True),
+        )
+    except NotEnoughFrames as exc:
+        console.print(f"[red]Not enough reviewed frames yet:[/red] {exc}")
+        raise SystemExit(1) from None
+
+    o, n = report.old, report.new
+    console.print(f"\nExam: {report.val_frames} frames the model never trained on")
+    console.print(f"  {'':10}{'current':>10}{'new':>10}")
+    for key, label in (("precision", "precision"), ("recall", "recall"), ("f1", "F1")):
+        console.print(f"  {label:10}{o[key]:>10.3f}{n[key]:>10.3f}")
+    console.print(f"  {'missed':10}{o['fn']:>10}{n['fn']:>10}   people not found")
+    console.print(f"  {'false':10}{o['fp']:>10}{n['fp']:>10}   boxes on non-people")
+    verdict = "[green]better — worth switching to (step 5)[/green]" if report.better else (
+        "[yellow]not better — keep the current model; review more frames and try again[/yellow]"
+    )
+    console.print(f"\nCandidate: {report.candidate}\nVerdict: {verdict}", soft_wrap=True)
+
+
 def _cmd_make_dataset(args: argparse.Namespace) -> None:
     """Handler for ``storeguard make-dataset``."""
     from .actions.dataset import make_dataset
@@ -537,6 +571,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--redo", action="store_true", help="also re-label frames done before")
     p.add_argument("--limit", type=int, default=0, help="stop after N frames (0 = all)")
     p.set_defaults(func=_cmd_prelabel)
+
+    p = sub.add_parser(
+        "finetune",
+        help="train the person detector on frames approved in «Обучение ИИ» (step 4 of re-training)",
+    )
+    p.add_argument("--dir", default="data/hard_frames", help="hard frames folder")
+    p.add_argument("--base", default="yolo26s.pt", help="model to start from (the one cameras use now)")
+    p.add_argument("--epochs", type=int, default=50, help="max passes over the data (stops early when it plateaus)")
+    p.add_argument("--imgsz", type=int, default=640, help="training image size (same as the live detector)")
+    p.add_argument("--conf", type=float, default=0.45, help="score threshold for the comparison (live default)")
+    p.add_argument("--device", default="auto", help='"auto" | "cpu" | "cuda" | "mps"')
+    p.add_argument("--min-train", type=int, default=100, help="refuse to train with fewer approved frames")
+    p.add_argument("--min-val", type=int, default=20, help="refuse with fewer exam frames")
+    p.set_defaults(func=_cmd_finetune)
 
     p = sub.add_parser(
         "annotate",
