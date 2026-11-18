@@ -60,6 +60,10 @@ class DetectorCfg(BaseModel):
     reid_threshold: float = 0.6
     #: Seconds an identity stays matchable after it was last seen anywhere.
     reid_forget_sec: float = 900.0
+    #: Live cameras save a few frames the detector found hard (unsure scores,
+    #: lost-and-found tracks, crowds) here, with the model's boxes, for later
+    #: review and re-training. See :mod:`storeguard.hard_frames`. ``""`` = off.
+    hard_frames_dir: str = "data/hard_frames"
 
 
 class ActionCfg(BaseModel):

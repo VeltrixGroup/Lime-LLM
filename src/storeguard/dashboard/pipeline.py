@@ -26,6 +26,7 @@ from storeguard.dashboard.context import (
 from storeguard.dashboard.payment import PaymentStatusTracker
 from storeguard.detector import PersonTracker
 from storeguard.geometry import Zone
+from storeguard.hard_frames import HardFrameCollector
 from storeguard.reid import CameraIdentities, IdentityRegistry
 from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
 from storeguard.scenarios.idle import IdleScenario
@@ -308,6 +309,13 @@ class DetectionSession:
         self.detector_cfg = detector
         self.process_every = max(1, int(process_every))
         self._is_url = source.lower().startswith(("rtsp://", "http://", "https://"))
+        #: Hard frames for re-training — live cameras only (a looping test
+        #: video would just save the same frames again and again).
+        self._hard = (
+            HardFrameCollector(detector.hard_frames_dir, filename)
+            if detector.hard_frames_dir and self._is_url
+            else None
+        )
         # Live cameras never loop; files may.
         self.loop = False if self._is_url else loop
         self._zones = list(zones or [])
@@ -795,6 +803,11 @@ class DetectionSession:
                     with self._lock:
                         if self._stats.error and self._stats.error.startswith("detection error"):
                             self._stats.error = None
+                    if self._hard is not None:
+                        try:  # local tracker ids: a lost-and-found person shows as a switch
+                            self._hard.consider(frame, tracks, ts)
+                        except Exception:  # noqa: BLE001 — never stop the camera for this
+                            pass
                     tracks = self._identities.update(frame, tracks, ts)
                     statuses = self._payment.update(frame, tracks, ts)
                     # Paid anywhere (e.g. at the cashier camera) is paid everywhere.
