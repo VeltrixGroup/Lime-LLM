@@ -3,6 +3,7 @@
 Subcommands:
 
 * ``run`` — run the detection pipeline from a YAML config.
+* ``camera-check`` — check that cameras connect and send frames.
 * ``dashboard`` — local web UI to upload a video and watch person detection.
 * ``draw-zones`` — interactively draw polygon zones over a camera frame.
 * ``annotate`` — keyboard labeler producing a labels CSV from raw videos.
@@ -112,6 +113,55 @@ def _dashboard_kwargs(args: argparse.Namespace, url: str) -> dict:
         "agent_key": agent_key or None,
         "action": action,
     }
+
+
+def _cmd_camera_check(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard camera-check``: do the cameras work?"""
+    from rich.table import Table
+
+    from .camera_check import check_camera, show_live
+
+    cams: list[tuple[str, str]] = []
+    if args.config:
+        import yaml
+
+        with open(args.config, encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh) or {}
+        for i, cam in enumerate(raw.get("cameras") or []):
+            cams.append((str(cam.get("name") or f"camera{i + 1}"), str(cam.get("source", ""))))
+    for i, src in enumerate(args.source or []):
+        cams.append((f"source{i + 1}", src))
+    if not cams:
+        console.print("[red]Give --source URL (repeatable) or --config YAML.[/red]")
+        raise SystemExit(2)
+
+    snap = Path(args.snapshot) if args.snapshot else None
+    table = Table(title="Camera check")
+    for col in ("camera", "status", "resolution", "fps", "first frame", "details"):
+        table.add_column(col)
+    failed = 0
+    working: list[tuple[str, str]] = []
+    for name, src in cams:
+        with console.status(f"checking {name}..."):
+            r = check_camera(name, src, seconds=args.seconds, timeout=args.timeout, snapshot_dir=snap)
+        if r.ok:
+            working.append((name, src))
+            table.add_row(
+                name, "[green]OK[/green]", f"{r.width}x{r.height}", f"{r.fps:.1f}",
+                f"{r.first_frame_sec:.1f}s", r.snapshot or r.source,
+            )
+        else:
+            failed += 1
+            table.add_row(name, "[red]FAIL[/red]", "-", "-", "-", f"{r.error}\n{r.source}")
+    console.print(table)
+    if not args.no_show:
+        for name, src in working:
+            console.print(f"Showing [bold]{name}[/bold] live — press q to close.")
+            show_live(name, src, timeout=args.timeout)
+    if failed:
+        console.print(f"[red]{failed} of {len(cams)} camera(s) not working.[/red]")
+        raise SystemExit(1)
+    console.print(f"[green]All {len(cams)} camera(s) working.[/green]")
 
 
 def _cmd_dashboard(args: argparse.Namespace) -> None:
@@ -581,6 +631,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765, help="HTTP port (default: 8765)")
     _add_dashboard_args(p)
     p.set_defaults(func=_cmd_dashboard)
+
+    p = sub.add_parser(
+        "camera-check",
+        help="check that cameras connect and send frames (RTSP URL, file or webcam index)",
+    )
+    p.add_argument("--source", action="append", help="RTSP URL, video file or webcam index like 0 (repeatable)")
+    p.add_argument("--config", help="check every camera listed in this app config YAML")
+    p.add_argument("--seconds", type=float, default=3.0, help="how long to read frames per camera (default: 3)")
+    p.add_argument("--timeout", type=float, default=10.0, help="give up connecting after N seconds (default: 10)")
+    p.add_argument("--snapshot", metavar="DIR", help="save one frame per camera as DIR/<name>.jpg")
+    p.add_argument("--no-show", action="store_true", help="only print the check result, don't open the live video window")
+    p.set_defaults(func=_cmd_camera_check)
 
     p = sub.add_parser(
         "gpu-check",
