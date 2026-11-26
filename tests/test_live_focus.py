@@ -102,6 +102,33 @@ def test_only_the_focused_camera_gets_every_frame(client) -> None:
         assert 1 <= seen.get(a, 0) <= 1.5 * _TILE_FPS + 1
 
 
+def test_tiles_get_thumbnails_when_the_camera_has_them(client) -> None:
+    a, b = _two_cameras(client)
+    session_b = client.app.state.sessions[b]
+    thumbs = {"seq": 0}
+
+    def peek_thumb(after_seq: int):
+        thumbs["seq"] += 1
+        return b"\xff\xd8thumb", {"people": [], "counts": {"all": 0}}, thumbs["seq"]
+
+    session_b.peek_thumb = peek_thumb
+    with client.websocket_connect("/api/ws/frames?mode=meta") as ws:
+        ws.send_text(json.dumps({"focus": a}))
+        deadline = time.monotonic() + 2.0
+        pictures: dict[str, set[bytes]] = {a: set(), b: set()}
+        skipped_first = False
+        while time.monotonic() < deadline:
+            message = ws.receive_bytes()
+            sid = message[:12].decode("ascii")
+            (meta_len,) = struct.unpack(">I", message[12:16])
+            if not skipped_first and time.monotonic() < deadline - 1.6:
+                continue  # frames sent before the focus message arrived
+            skipped_first = True
+            pictures[sid].add(message[16 + meta_len :])
+    assert pictures[a] == {b"\xff\xd8frame"}  # the camera shown large: full pictures
+    assert pictures[b] == {b"\xff\xd8thumb"}  # the tile: thumbnails only
+
+
 def test_no_camera_focused_means_all_are_tiles(client) -> None:
     """The overview page shows tiles only."""
     a, b = _two_cameras(client)

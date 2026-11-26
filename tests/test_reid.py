@@ -126,3 +126,23 @@ def test_histogram_fallback_matches_same_crop() -> None:
     a = cam1.update(frame, [_track(1, 10.0)], 1.0)[0].track_id
     b = cam2.update(frame, [_track(1, 10.0)], 2.0)[0].track_id
     assert a == b
+
+
+def test_settled_tracks_are_refreshed_together_in_one_call() -> None:
+    """Three people on one camera: one batched encoder call per refresh, not three."""
+    calls: list[int] = []
+
+    def counting(frame, boxes):
+        calls.append(len(boxes))
+        return _encoder(frame, boxes)
+
+    cam = CameraIdentities(IdentityRegistry(), counting)
+    tracks = [_track(1, 10.0), _track(2, 50.0), _track(3, 70.0)]
+    for i in range(cam.provisional_frames):
+        cam.update(_FRAME, tracks, float(i))
+    calls.clear()
+
+    frames = 4 * cam.refresh_every
+    for i in range(frames):
+        cam.update(_FRAME, tracks, 10.0 + i)
+    assert calls == [3] * (frames // cam.refresh_every)

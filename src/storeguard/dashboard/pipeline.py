@@ -58,10 +58,74 @@ _PREVIEW_MIN_GAP = min_frame_gap(_PREVIEW_MAX_FPS)
 #: as they are, to the cabinet's live view).
 _FRAME_JPEG_QUALITY = 85
 
+#: A camera shown as a small tile in the cabinet gets a thumbnail this wide,
+#: a couple of times a second, instead of the full preview picture: a tenth
+#: of the bytes, and the browser has far less to decode.
+_THUMB_WIDTH = 320
+_THUMB_JPEG_QUALITY = 70
+_THUMB_MIN_GAP = 0.4
+
 #: Frame rate the frame-counted settings were tuned at (track_buffer, the
 #: action model's clip stride). With ``DetectorCfg.max_fps`` a live camera
 #: is analysed less often, so those counts are scaled to mean the same time.
 _NOMINAL_CAMERA_FPS = 25.0
+
+
+#: Idle cameras (``DetectorCfg.skip_idle``). A camera with nobody in view and
+#: nothing moving for this long stops going through the detector on every
+#: frame...
+_IDLE_AFTER_SEC = 3.0
+#: ...and is looked at once in this long instead, in case the motion check
+#: missed someone (far away, low contrast).
+_IDLE_CHECK_SEC = 1.0
+
+
+class MotionGate:
+    """Did anything change in the picture? A cheap check on a tiny grey copy.
+
+    Each frame is compared with a slowly updated average of the recent ones,
+    so sensor noise and compression flicker (averaged away, and well under
+    :attr:`threshold`) don't count, while a person walking in changes far
+    more than :attr:`min_pixels`. It errs towards "moved": a missed person
+    costs an alert, a false "moved" only a detector pass.
+    """
+
+    #: Size of the grey copy the comparison runs on.
+    size: tuple[int, int] = (320, 180)
+    #: Grey levels a pixel must differ by to count as changed.
+    threshold: int = 15
+    #: Changed pixels (of 57 600) that count as movement.
+    min_pixels: int = 20
+    #: Share of each new frame blended into the average. At 0.1 the place
+    #: where somebody just stood stops counting as "changed" after ~2 s.
+    blend: float = 0.1
+
+    def __init__(self) -> None:
+        self._average: np.ndarray | None = None
+
+    def moved(self, image: np.ndarray) -> bool:
+        """True if ``image`` (BGR) differs from the recent average; updates it."""
+        grey = cv2.cvtColor(
+            cv2.resize(image, self.size, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY
+        )
+        grey = cv2.blur(grey, (3, 3))
+        if self._average is None:
+            self._average = grey.astype(np.float32)
+            return True
+        diff = cv2.absdiff(grey, cv2.convertScaleAbs(self._average))
+        changed = cv2.countNonZero(cv2.threshold(diff, self.threshold, 255, cv2.THRESH_BINARY)[1])
+        cv2.accumulateWeighted(grey, self._average, self.blend)
+        return changed >= self.min_pixels
+
+
+def _thumbnail(image: np.ndarray) -> np.ndarray:
+    """``image`` scaled down to :data:`_THUMB_WIDTH` (unchanged if already small)."""
+    h, w = image.shape[:2]
+    if w <= _THUMB_WIDTH:
+        return image
+    return cv2.resize(
+        image, (_THUMB_WIDTH, max(1, round(h * _THUMB_WIDTH / w))), interpolation=cv2.INTER_AREA
+    )
 
 
 def _encode_jpeg(image: np.ndarray, quality: int = _FRAME_JPEG_QUALITY) -> bytes | None:
@@ -318,6 +382,13 @@ class SessionStats:
 
     people: int = 0
     fps: float = 0.0
+    #: Frames a second the camera itself sends (0 until known).
+    camera_fps: float = 0.0
+    #: Frames a second that really went through the detector.
+    detect_fps: float = 0.0
+    #: Frames that went through the detector since this stream was opened
+    #: (``frame`` counts all frames handled).
+    detected: int = 0
     frame: int = 0
     total_frames: int = 0
     tracks: list[int] = field(default_factory=list)
@@ -407,12 +478,19 @@ class DetectionSession:
         #: Per-frame overlay data for the cabinet's live view (drawn client-side).
         self._meta: dict = {"people": [], "counts": {"all": 0, "staff": 0, "visitors": 0}}
         self._raw_jpeg: bytes | None = None
+        #: Small picture (+ the overlay data of that same frame) for tiles.
+        self._thumb_jpeg: bytes | None = None
+        self._thumb_meta: dict = self._meta
+        self._thumb_seq = 0
+        self._last_thumb = 0.0
         #: Viewers that want raw frames + metadata (the cabinet "Камеры онлайн").
         self.meta_viewers = 0
         #: Viewers of the annotated MJPEG / plain WebSocket stream. With none,
         #: the boxes are not drawn and that JPEG is not encoded at all.
         self.jpeg_viewers = 0
         self._last_preview = 0.0
+        #: Motion check of an idle-skipping live camera (None: every frame is detected).
+        self._gate: MotionGate | None = None
         self._paid_seen: set[int] = set()
         self._announced: set[tuple[str, int]] = set()
         self._crop_at: dict[int, float] = {}
@@ -443,6 +521,9 @@ class DetectionSession:
             return SessionStats(
                 people=self._stats.people,
                 fps=self._stats.fps,
+                camera_fps=self._stats.camera_fps,
+                detect_fps=self._stats.detect_fps,
+                detected=self._stats.detected,
                 frame=self._stats.frame,
                 total_frames=self._stats.total_frames,
                 tracks=list(self._stats.tracks),
@@ -518,6 +599,17 @@ class DetectionSession:
         with self._lock:
             if self._raw_jpeg is not None and self._jpeg_seq > after_seq:
                 return self._raw_jpeg, self._meta, self._jpeg_seq
+            return None
+
+    def peek_thumb(self, after_seq: int) -> tuple[bytes, dict, int] | None:
+        """Latest thumbnail + its overlay metadata if newer than ``after_seq``.
+
+        Thumbnails have their own sequence numbers (they are made a couple of
+        times a second, not on every frame).
+        """
+        with self._lock:
+            if self._thumb_jpeg is not None and self._thumb_seq > after_seq:
+                return self._thumb_jpeg, self._thumb_meta, self._thumb_seq
             return None
 
     def snapshot(self) -> bytes | None:
@@ -744,6 +836,13 @@ class DetectionSession:
             self._action_scenarios = build_action_scenarios(
                 self.filename, self._zones, self._action_cfg, self._rate
             )
+            # Idle skipping needs a tracker that can account for skipped
+            # frames; files are always analysed frame by frame.
+            self._gate = (
+                MotionGate()
+                if self._is_url and self.detector_cfg.skip_idle and hasattr(self._tracker, "skip")
+                else None
+            )
             detect_phones = getattr(self._tracker, "detect_phones", None)
             if detect_phones is not None:
                 self._phone = PhoneScenario(self.filename, detect_phones)
@@ -805,6 +904,9 @@ class DetectionSession:
         self._ring.clear()
         frame_idx = 0
         t_fps = time.monotonic()
+        last_active = last_look = t_fps  # idle skipping: a new stream starts awake
+        received_at_fps = 0
+        detected = detected_total = 0
         t0_wall = time.time()
         play_start = time.monotonic()
         processed = 0
@@ -860,8 +962,30 @@ class DetectionSession:
                 every = self.process_every
                 if (frame_idx - 1) % every == 0:
                     assert self._tracker is not None and self._identities is not None
+                    small = _resize_for_preview(frame)
+                    # Nobody in view and nothing moving: the detector looks
+                    # only now and then; the frame still counts for tracking,
+                    # the evidence ring and the live view as "nobody there".
+                    look = True
+                    if self._gate is not None:
+                        mono = time.monotonic()
+                        if self._gate.moved(small):
+                            last_active = mono
+                        look = (
+                            mono - last_active < _IDLE_AFTER_SEC
+                            or mono - last_look >= _IDLE_CHECK_SEC
+                        )
                     try:
-                        tracks = self._tracker.update(frame)
+                        if look:
+                            tracks = self._tracker.update(frame)
+                            if self._gate is not None:
+                                last_look = time.monotonic()
+                                if getattr(self._tracker, "saw_someone", True):
+                                    last_active = last_look
+                            detected += 1
+                            detected_total += 1
+                        else:
+                            tracks = self._tracker.skip(frame)
                     except Exception as exc:  # noqa: BLE001
                         if is_file:
                             raise
@@ -898,7 +1022,6 @@ class DetectionSession:
                     # Evidence ring: preview-size JPEGs (see JpegFrames); keep
                     # the newest raw frame for full-quality snapshots.
                     self._last_raw = frame
-                    small = _resize_for_preview(frame)
                     small_jpeg = _encode_jpeg(small)
                     if small_jpeg is not None:
                         self._append_ring(ts, small_jpeg)
@@ -916,10 +1039,19 @@ class DetectionSession:
                     dt = now - t_fps
                     if dt >= 0.5:
                         inst_fps = processed / dt
+                        detect_fps = detected / dt
+                        received = getattr(stream, "received", None)
+                        camera_fps = None
+                        if received is not None:
+                            camera_fps = (received - received_at_fps) / dt
+                            received_at_fps = received
                         t_fps = now
-                        processed = 0
+                        processed = detected = 0
                         with self._lock:
                             self._stats.fps = round(inst_fps, 1)
+                            self._stats.detect_fps = round(detect_fps, 1)
+                            if camera_fps is not None:
+                                self._stats.camera_fps = round(camera_fps, 1)
 
                 # Preview frames: only what someone is watching, and for live
                 # cameras at most _PREVIEW_MAX_FPS. Downscale first, then draw:
@@ -931,7 +1063,7 @@ class DetectionSession:
                 encode = (want_annotated or want_raw) and (
                     is_file or now_p - self._last_preview >= _PREVIEW_MIN_GAP
                 )
-                jpeg = raw_jpeg = None
+                jpeg = raw_jpeg = thumb_jpeg = None
                 if encode:
                     self._last_preview = now_p
                     if small is None:
@@ -950,6 +1082,9 @@ class DetectionSession:
                         jpeg = buf.tobytes() if ok_enc else None
                     if want_raw:
                         raw_jpeg = small_jpeg if small_jpeg is not None else _encode_jpeg(small)
+                        if now_p - self._last_thumb >= _THUMB_MIN_GAP:
+                            self._last_thumb = now_p
+                            thumb_jpeg = _encode_jpeg(_thumbnail(small), _THUMB_JPEG_QUALITY)
                 people_status = [
                     PersonStatus(
                         track_id=t.track_id,
@@ -965,8 +1100,13 @@ class DetectionSession:
                         if raw_jpeg is not None:
                             self._raw_jpeg = raw_jpeg
                         self._jpeg_seq += 1
+                    if thumb_jpeg is not None:
+                        self._thumb_jpeg = thumb_jpeg
+                        self._thumb_meta = self._meta
+                        self._thumb_seq += 1
                     self._stats.people = len(tracks)
                     self._stats.frame = frame_idx
+                    self._stats.detected = detected_total
                     self._stats.tracks = [t.track_id for t in tracks]
                     self._stats.people_status = people_status
                     self._stats.paid = n_paid

@@ -22,7 +22,7 @@ DASHBOARD_FRONTEND := src/storeguard/dashboard/frontend
 
 .PHONY: help install sync dev serve frontend-dev dashboard cloud frontend-build cloud-frontend-build \
 	dashboard-frontend-build run run-show test clean data \
-	db-up db-down db-logs db-shell migrate optimize
+	db-up db-down db-logs db-shell migrate optimize load
 
 help:
 	@echo "StoreGuard targets:"
@@ -38,6 +38,7 @@ help:
 	@echo "  make dashboard-frontend-build  rebuild only the dashboard's Vue frontend into dashboard/static/"
 	@echo "  make run                    run pipeline (CONFIG=$(CONFIG))"
 	@echo "  make run-show               run pipeline with preview windows"
+	@echo "  make load                   how hard the PC is working for the cameras, and what limits it"
 	@echo "  make test                   run pytest"
 	@echo "  make db-up                  start Postgres in Docker (data kept in a volume)"
 	@echo "  make db-down                stop Postgres (data stays)"
@@ -103,6 +104,9 @@ run: install
 
 run-show: install
 	$(UV) run storeguard run --config $(CONFIG) --show
+
+load:
+	$(UV) run storeguard load --data $(DATA)
 
 test: install
 	$(UV) run pytest -q

@@ -213,9 +213,11 @@ class CameraIdentities:
         self._encoder = encoder
         self._threshold = None if encoder is not None else HISTOGRAM_THRESHOLD
         self._locals: dict[int, _Local] = {}
+        self._updates = 0
 
     def reset(self) -> None:
         self._locals.clear()
+        self._updates = 0
 
     def update(self, frame: np.ndarray, tracks: list[Track], ts: float) -> list[Track]:
         """Return ``tracks`` with ``track_id`` replaced by global ids."""
@@ -223,12 +225,19 @@ class CameraIdentities:
             self._forget(ts)
             return []
 
+        # Settled tracks are refreshed together, every ``refresh_every``-th
+        # frame of this camera: one encoder call for all of them. Counting per
+        # track ("every 8th sighting of each person") spread the same crops
+        # over several one-crop calls, and with many cameras those calls queue
+        # for the shared encoder.
+        self._updates += 1
+        refresh = self._updates % self.refresh_every == 0
         need = [
             i
             for i, t in enumerate(tracks)
             if (loc := self._locals.get(t.track_id)) is None
             or loc.seen < self.provisional_frames
-            or loc.seen % self.refresh_every == 0
+            or refresh
         ]
         feats: dict[int, np.ndarray | None] = {}
         if need:

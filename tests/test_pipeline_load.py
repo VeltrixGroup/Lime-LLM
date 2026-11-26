@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 
+import cv2
 import numpy as np
 
 import storeguard.dashboard.pipeline as pipeline
@@ -131,9 +132,18 @@ def test_live_view_reuses_the_ring_jpeg(monkeypatch) -> None:
             if session.stats.frame >= 8:
                 break
             time.sleep(0.05)
-        assert len(encoded) == 8  # one per frame
+        full = [shape for shape in encoded if shape == (540, 960)]
+        assert len(full) == 8  # one per frame
         jpeg, meta, seq = session.peek_meta(0)
         assert jpeg == session._ring[-1][1]
+
+        # tiles get a thumbnail, a couple of times a second at most
+        thumbs = [shape for shape in encoded if shape == (180, 320)]
+        assert 1 <= len(thumbs) < 8 and len(full) + len(thumbs) == len(encoded)
+        thumb, thumb_meta, thumb_seq = session.peek_thumb(0)
+        assert cv2.imdecode(np.frombuffer(thumb, np.uint8), cv2.IMREAD_COLOR).shape == (180, 320, 3)
+        assert len(thumb) < len(jpeg) and "people" in thumb_meta
+        assert session.peek_thumb(thumb_seq) is None
     finally:
         session.stop()
 

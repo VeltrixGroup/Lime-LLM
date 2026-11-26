@@ -213,6 +213,19 @@ The store PC is on the same LAN/WiFi as the cameras, so RTSP works there.
    build by itself (one-time ~3 GB download). `.\make.ps1 serve`, `dashboard` and
    `.\make.ps1 run` run the same check before starting. In the dashboard
    log, look for `Detector device: cuda (...)`.
+5. **Is the PC keeping up with the cameras?** While StoreGuard runs
+   (`serve` or in the background), in another terminal:
+
+   ```powershell
+   .\make.ps1 load
+   ```
+
+   It prints how busy the CPU, memory, graphics card and detector are, and
+   per camera how many frames a second it sends, how many are looked at and
+   how many go through the detector — and says what is at its limit, if
+   anything. (`uv run storeguard load --watch` keeps refreshing; the same
+   numbers go to the log every 5 minutes.) A camera that shows nobody and
+   where nothing moves goes through the detector only about once a second.
 
 **Linux**: same idea — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 (this installs `uv` into `~/.local/bin` of the current user), copy the

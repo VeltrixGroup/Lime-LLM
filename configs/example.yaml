@@ -5,6 +5,7 @@ detector:
   imgsz: 640
   device: auto
   max_fps: 12          # live cameras: analyse ~12 frames/s (lower = lighter on the PC; 0 = every frame)
+  skip_idle: true      # empty, motionless cameras go through the detector ~once a second
 action:
   weights: models/action.pt
   clip_len: 16

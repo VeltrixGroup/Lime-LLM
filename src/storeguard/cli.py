@@ -4,6 +4,7 @@ Subcommands:
 
 * ``run`` — run the detection pipeline from a YAML config.
 * ``camera-check`` — check that cameras connect and send frames.
+* ``load`` — how hard the PC is working for the cameras, and what limits it.
 * ``dashboard`` — local web UI to upload a video and watch person detection.
 * ``draw-zones`` — interactively draw polygon zones over a camera frame.
 * ``annotate`` — keyboard labeler producing a labels CSV from raw videos.
@@ -170,6 +171,88 @@ def _cmd_dashboard(args: argparse.Namespace) -> None:
 
     kwargs = _dashboard_kwargs(args, f"http://{args.host}:{args.port}")
     serve(host=args.host, port=args.port, **kwargs)
+
+
+def _print_load(report: dict) -> None:
+    """Render one load reading (see :mod:`storeguard.dashboard.load`)."""
+    import time
+
+    from rich.table import Table
+
+    age = time.time() - float(report.get("ts", 0))
+    console.print(
+        f"[bold]StoreGuard load[/bold] — {time.strftime('%d.%m %H:%M:%S', time.localtime(report.get('ts', 0)))}"
+        f" (measured over {report.get('window_sec', 0):g} s, {age:.0f} s ago)"
+    )
+    pc, process = report.get("pc") or {}, report.get("process") or {}
+    line = f"PC          {pc.get('cpu_cores', '?')} CPU cores"
+    if "cpu_percent" in pc:
+        line += f", {pc['cpu_percent']:g}% busy"
+    if "ram_used_gb" in pc:
+        line += f" · memory {pc['ram_used_gb']:g} of {pc['ram_total_gb']:g} GB used"
+    console.print(line)
+    line = "StoreGuard  "
+    if "cpu_cores_used" in process:
+        line += f"uses {process['cpu_cores_used']:g} CPU cores"
+    if "ram_gb" in process:
+        line += f" · {process['ram_gb']:g} GB of memory"
+    console.print(line)
+    gpu = report.get("gpu")
+    if gpu:
+        console.print(
+            f"Graphics    {gpu['name']} · {gpu['util_percent']:g}% busy · "
+            f"memory {gpu['mem_used_gb']:g} of {gpu['mem_total_gb']:g} GB used"
+        )
+    for d in report.get("detectors") or []:
+        line = f"Detector    {d['model']} on {d['device']} ({d['runtime']})"
+        if "busy_percent" in d:
+            line += (
+                f" · busy {d['busy_percent']}% of the time, resting {d['rest_percent']}% · "
+                f"{d['frames_per_sec']:g} frames/s in batches of {d['frames_per_batch']:g}"
+            )
+        console.print(line)
+
+    cameras = report.get("cameras") or []
+    if cameras:
+        table = Table(title=f"{len(cameras)} cameras (frames per second)")
+        for col in ("camera", "camera sends", "looked at", "detector ran", "people", "state"):
+            table.add_column(col)
+        for c in cameras:
+            state = "[red]" + str(c["error"]) + "[/red]" if c.get("error") else (
+                "[green]running[/green]" if c.get("running") else "stopped"
+            )
+            table.add_row(
+                str(c["name"]), f"{c['camera_fps']:g}" if c.get("camera_fps") else "-",
+                f"{c['handled_fps']:g}", f"{c['detect_fps']:g}", str(c["people"]), state,
+            )
+        console.print(table)
+    for note in report.get("notes") or []:
+        console.print(f"[bold]→[/bold] {note}")
+
+
+def _cmd_load(args: argparse.Namespace) -> None:
+    """Handler for ``storeguard load``: how hard is the PC working for the cameras?"""
+    import time
+
+    from .dashboard.load import REPORT_NAME, STALE_AFTER_SEC, read_report
+
+    while True:
+        report = read_report(args.data)
+        if report is None or time.time() - float(report.get("ts", 0)) > STALE_AFTER_SEC:
+            console.print(
+                f"[yellow]No current reading in {Path(args.data) / REPORT_NAME}.[/yellow] "
+                "StoreGuard writes one every 10 seconds while it runs "
+                "(.\\make.ps1 serve, or bg-start) — start it, wait a little and try again."
+            )
+            if not args.watch:
+                raise SystemExit(1)
+        else:
+            if args.watch:
+                console.clear()
+            _print_load(report)
+        if not args.watch:
+            return
+        time.sleep(5)
 
 
 def _cmd_gpu_check(args: argparse.Namespace) -> None:
@@ -643,6 +726,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--snapshot", metavar="DIR", help="save one frame per camera as DIR/<name>.jpg")
     p.add_argument("--no-show", action="store_true", help="only print the check result, don't open the live video window")
     p.set_defaults(func=_cmd_camera_check)
+
+    p = sub.add_parser(
+        "load",
+        help="show how hard the PC is working for the cameras and what limits it",
+    )
+    p.add_argument("--data", default="data", help="StoreGuard's data folder (default: data)")
+    p.add_argument("--watch", action="store_true", help="keep refreshing every 5 seconds")
+    p.set_defaults(func=_cmd_load)
 
     p = sub.add_parser(
         "gpu-check",
