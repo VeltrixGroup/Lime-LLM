@@ -1,6 +1,8 @@
 // Live camera frames + overlay metadata + event feed from the detection
 // process (mounted at /live on the same port). One WebSocket for all
 // cameras: binary = 12-byte session id + 4-byte JSON length + JSON + JPEG.
+// The page tells the server which camera it shows large ({focus: id}): that
+// one comes at full rate, the small tiles at a couple of frames a second.
 import { onUnmounted, reactive, ref } from "vue";
 import { api } from "../api";
 
@@ -15,6 +17,18 @@ export function useLive({ autostart = false, withFeed = false } = {}) {
   let poll = null;
   let closed = false;
   let retry = null;
+  let focus = null; // session id of the camera shown large (null: tiles only)
+
+  function sendFocus() {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ focus }));
+  }
+
+  function setFocus(id) {
+    const next = id || null;
+    if (next === focus) return;
+    focus = next;
+    sendFocus();
+  }
 
   async function loadSessions() {
     try {
@@ -52,7 +66,10 @@ export function useLive({ autostart = false, withFeed = false } = {}) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/live/api/ws/frames?mode=meta`);
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => { state.value = "live"; };
+    ws.onopen = () => {
+      state.value = "live";
+      sendFocus(); // also after a reconnect: the server starts from scratch
+    };
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         try {
@@ -105,5 +122,5 @@ export function useLive({ autostart = false, withFeed = false } = {}) {
     for (const f of Object.values(frames)) URL.revokeObjectURL(f.url);
   });
 
-  return { sessions, frames, feed, state, init, start, loadSessions };
+  return { sessions, frames, feed, state, init, start, loadSessions, setFocus };
 }

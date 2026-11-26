@@ -7,6 +7,7 @@ import queue
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,6 +43,13 @@ MAX_CAMERAS = 16
 #: WebSocket frame protocol relies on this: every binary message is the
 #: 12-byte session id followed by the JPEG bytes.
 _SESSION_ID_LEN = 12
+
+#: Frames per second sent for a camera the viewer only sees as a small tile.
+#: The cabinet says which camera it shows large (``{"focus": id}``); only that
+#: one needs every frame. Sending all of them — 16 cameras at 12 fps is ~150
+#: pictures and ~20 MB a second — kept the browser busy decoding pictures
+#: nobody could tell apart at tile size.
+_TILE_FPS = 2.0
 
 
 def _list_videos(data_dir: Path) -> list[dict[str, str | int]]:
@@ -764,9 +772,13 @@ def create_app(
         """
         await ws.accept()
         last_sent: dict[str, int] = {}
+        sent_at: dict[str, float] = {}
         # ?mode=meta: raw frames + overlay metadata (the cabinet draws boxes
         # itself), plus the live event feed as text messages.
         meta_mode = ws.query_params.get("mode") == "meta"
+        # What the viewer told us it shows large. Until it says anything (an
+        # older page), every camera is sent at full rate, as before.
+        focus: dict = {"known": False, "id": None}
         counted: set = set()
         # Which frames this viewer needs: raw + metadata, or the annotated JPEG.
         viewer_attr = "meta_viewers" if meta_mode else "jpeg_viewers"
@@ -777,10 +789,24 @@ def create_app(
 
         async def _watch_disconnect() -> None:
             # Reading is the only way to observe a client close while no frames
-            # are flowing (an idle/down grid). Ignore any payload; just wait.
+            # are flowing (an idle/down grid). The only message that means
+            # anything is {"focus": <session id or null>}; the rest is ignored.
             try:
                 while True:
-                    await ws.receive()
+                    message = await ws.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        return
+                    text = message.get("text")
+                    if not text:
+                        continue
+                    try:
+                        data = json.loads(text)
+                    except ValueError:
+                        continue
+                    if isinstance(data, dict) and "focus" in data:
+                        value = data["focus"]
+                        focus["known"] = True
+                        focus["id"] = value if isinstance(value, str) else None
             except Exception:  # noqa: BLE001
                 return
 
@@ -793,6 +819,8 @@ def create_app(
                 for known in list(last_sent):
                     if known not in live_ids:
                         del last_sent[known]
+                        sent_at.pop(known, None)
+                now = time.monotonic()
                 sent_any = False
                 for session in sessions:
                     if session not in counted:
@@ -811,11 +839,17 @@ def create_app(
                             await ws.send_text(json.dumps({"type": "feed", "items": items}))
                 for session in sessions:
                     if meta_mode:
+                        # A camera shown as a small tile gets a few frames a
+                        # second; the one shown large gets every frame.
+                        is_tile = focus["known"] and session.id != focus["id"]
+                        if is_tile and now - sent_at.get(session.id, -1e9) < 1.0 / _TILE_FPS:
+                            continue
                         res = session.peek_meta(last_sent.get(session.id, 0))
                         if res is None:
                             continue
                         jpeg, meta, seq = res
                         last_sent[session.id] = seq
+                        sent_at[session.id] = now
                         blob = json.dumps(meta).encode("utf-8")
                         await ws.send_bytes(
                             session.id.encode("ascii") + struct.pack(">I", len(blob)) + blob + jpeg

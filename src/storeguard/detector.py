@@ -23,6 +23,7 @@ from __future__ import annotations
 import concurrent.futures
 import queue
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +45,15 @@ _logged_devices: set[str] = set()
 _LOW_CONF = 0.1
 #: Largest number of queued frames run through YOLO in one batch.
 _MAX_BATCH = 16
+#: After a batch shared by several cameras, the detector rests for this share
+#: of the time the batch took (at most :data:`_MAX_REST_SEC`). With many
+#: cameras it would otherwise run back to back, the GPU at 100% — and the GPU
+#: also draws the screen and the browser that shows the control panel. The
+#: rest costs little: the cameras that just got their result need those few
+#: milliseconds to send their next frame anyway, so the next batch is full
+#: instead of two half-batches taking turns.
+_REST_SHARE = 0.25
+_MAX_REST_SEC = 0.05
 
 
 class _MicroBatcher:
@@ -55,9 +65,20 @@ class _MicroBatcher:
     while the model is busy, and a lone camera never waits for company.
     """
 
-    def __init__(self, fn: Callable[[list[Any]], list[Any]], name: str, max_batch: int) -> None:
+    def __init__(
+        self,
+        fn: Callable[[list[Any]], list[Any]],
+        name: str,
+        max_batch: int,
+        rest_share: float = 0.0,
+    ) -> None:
         self._fn = fn
         self._max_batch = max_batch
+        #: Rest after a shared batch, as a share of its run time (0 = never).
+        self._rest_share = rest_share
+        #: Seconds spent running batches / resting between them (for stats).
+        self.busy_sec = 0.0
+        self.rest_sec = 0.0
         self._q: queue.Queue[tuple[Any, concurrent.futures.Future]] = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._thread.start()
@@ -75,6 +96,7 @@ class _MicroBatcher:
                     batch.append(self._q.get_nowait())
                 except queue.Empty:
                     break
+            started = time.monotonic()
             try:
                 results = self._fn([item for item, _ in batch])
             except BaseException as exc:  # noqa: BLE001 — hand it to every waiter
@@ -83,6 +105,14 @@ class _MicroBatcher:
                 continue
             for (_, fut), result in zip(batch, results):
                 fut.set_result(result)
+            took = time.monotonic() - started
+            self.busy_sec += took
+            # One frame at a time means the model is keeping up: no rest then,
+            # so a lone camera never waits.
+            if self._rest_share > 0 and len(batch) > 1:
+                rest = min(_MAX_REST_SEC, took * self._rest_share)
+                time.sleep(rest)
+                self.rest_sec += rest
 
 
 class _DetectionEngine:
@@ -98,7 +128,9 @@ class _DetectionEngine:
         self.runtime = "pytorch"
         if optimize == "auto":
             self._use_optimized()
-        self._batcher = _MicroBatcher(self._run, name=f"yolo-{weights}", max_batch=_MAX_BATCH)
+        self._batcher = _MicroBatcher(
+            self._run, name=f"yolo-{weights}", max_batch=_MAX_BATCH, rest_share=_REST_SHARE
+        )
 
     def _use_optimized(self) -> None:
         """Load the cached TensorRT engine, or build it in the background."""
