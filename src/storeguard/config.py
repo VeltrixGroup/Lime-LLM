@@ -46,6 +46,13 @@ class DetectorCfg(BaseModel):
     static_suppress_sec: float = 20.0
     imgsz: int = 640
     device: str = "auto"  # "auto" | "cpu" | "cuda" | "mps"
+    #: Live cameras are analysed about this many times a second at most
+    #: (video files always use every frame). A 25 fps camera at the default
+    #: gets every second frame: tracking people does not need more, and
+    #: analysing all 25 kept one CPU core and the GPU busy per camera, which
+    #: made the whole PC — the control panel in the browser too — slow.
+    #: Lower it (e.g. 8) on a weak PC or with many cameras; ``0`` = every frame.
+    max_fps: float = 12.0
     #: ``"auto"``: on an NVIDIA GPU with TensorRT installed, build (once, in
     #: the background) and use a TensorRT FP16 engine. ``"off"``: always the
     #: PyTorch model. See :mod:`storeguard.optimize`.

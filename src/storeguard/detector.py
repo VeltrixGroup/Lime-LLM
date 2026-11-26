@@ -434,6 +434,44 @@ class PersonTracker:
             del self._info[tid]
 
 
+def _reid_threads() -> int:
+    """CPU threads for the ReID model: a few are plenty for a handful of crops."""
+    import os
+
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
+def _calm_onnx_session(reid: Any) -> bool:
+    """Swap the ReID model's ONNX Runtime session for one that idles quietly.
+
+    Ultralytics opens the session with ONNX Runtime's defaults: one thread
+    per CPU core, each busy-waiting ("spinning") for more work after every
+    call. The ReID model is called a few times a second for a few small
+    crops, so those threads spun nearly all the time — measured at half a
+    CPU core for one camera and 1.5 cores for four, for no faster results.
+    A small pool that sleeps between calls gives the same embeddings for a
+    third of the CPU. Returns False (and keeps the original session) when
+    this ultralytics / onnxruntime layout isn't the one expected.
+    """
+    try:
+        import onnxruntime as ort
+
+        backend = getattr(reid.model, "backend", None)
+        session = getattr(backend, "session", None)
+        path = getattr(session, "_model_path", None)
+        if session is None or not path or getattr(backend, "use_io_binding", False):
+            return False
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = _reid_threads()
+        opts.inter_op_num_threads = 1
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        backend.session = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
+        return True
+    except Exception:  # noqa: BLE001 — an optimisation only: the default session works
+        return False
+
+
 class AppearanceEncoder:
     """Person appearance embeddings for cross-camera re-identification.
 
@@ -448,6 +486,7 @@ class AppearanceEncoder:
 
         self.model_name = model
         self._reid = ReID(model, device="cpu")
+        _calm_onnx_session(self._reid)
         self._lock = threading.Lock()
 
     def encode(
