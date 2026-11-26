@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
 import { can, clock, setStatus } from "../store";
@@ -43,6 +43,8 @@ const cams = computed(() =>
   })
 );
 const sel = computed(() => cams.value.find((c) => c.id === selected.value) || cams.value[0] || null);
+// Only the camera in the big player needs every frame; the rest are tiles.
+watch(() => sel.value?.session?.id || null, (id) => live.setFocus(id), { immediate: true });
 const onlineCount = computed(() => cams.value.filter((c) => c.online).length);
 const counts = computed(() => sel.value?.frame?.meta.counts || { all: 0, staff: 0, visitors: 0 });
 const statusLine = computed(() => {
