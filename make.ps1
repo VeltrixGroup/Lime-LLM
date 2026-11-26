@@ -52,6 +52,7 @@ function Show-Help {
     Write-Host "  .\make.ps1 run                       run pipeline (Config=$Config)"
     Write-Host "  .\make.ps1 run-show                  run pipeline with preview windows"
     Write-Host "  .\make.ps1 gpu-check                 check (and fix) that detection runs on the NVIDIA GPU"
+    Write-Host "  .\make.ps1 load                      how hard the PC is working for the cameras, and what limits it"
     Write-Host "  .\make.ps1 autostart-install         run everything in the background and start it at every sign-in"
     Write-Host "  .\make.ps1 autostart-remove          remove that autostart"
     Write-Host "  .\make.ps1 bg-start / bg-stop        start / stop the background app"
@@ -223,6 +224,7 @@ switch ($Target) {
     "run" { Invoke-Run }
     "run-show" { Invoke-RunShow }
     "gpu-check" { Invoke-Install; Invoke-GpuCheck }
+    "load" { uv run storeguard load --data $Data }
     "autostart-install" { & "$PSScriptRoot\scripts\windows\install-autostart.ps1" -BindHost $BindHost -Port $CloudPort -Device $Device }
     "autostart-remove" { & "$PSScriptRoot\scripts\windows\uninstall-autostart.ps1" }
     "bg-start" {

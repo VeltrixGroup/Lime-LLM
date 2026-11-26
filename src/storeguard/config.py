@@ -53,6 +53,12 @@ class DetectorCfg(BaseModel):
     #: made the whole PC — the control panel in the browser too — slow.
     #: Lower it (e.g. 8) on a weak PC or with many cameras; ``0`` = every frame.
     max_fps: float = 12.0
+    #: A live camera that shows nobody and where nothing moves is put through
+    #: the detector about once a second instead of on every frame; the moment
+    #: something moves it is looked at in full again. An empty aisle then
+    #: costs almost nothing, which is most cameras most of the day.
+    #: ``False``: always every frame.
+    skip_idle: bool = True
     #: ``"auto"``: on an NVIDIA GPU with TensorRT installed, build (once, in
     #: the background) and use a TensorRT FP16 engine. ``"off"``: always the
     #: PyTorch model. See :mod:`storeguard.optimize`.

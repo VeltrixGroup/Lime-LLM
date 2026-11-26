@@ -94,6 +94,9 @@ class VideoStream:
         self._is_file = Path(source).is_file()
         self._is_rtsp = source.lower().startswith("rtsp://")
         self._min_gap = 0.0 if self._is_file else min_frame_gap(max_fps)
+        #: Frames received from the source so far, the skipped ones included
+        #: (so the load report can show what the camera really sends).
+        self.received = 0
         self._last_frame_at = -1e18  # monotonic time of the last frame handed out
         self._cap: cv2.VideoCapture | None = None
         self._next_reconnect: float = 0.0  # monotonic deadline for next reopen
@@ -210,10 +213,14 @@ class VideoStream:
         assert self._cap is not None
         if not self._min_gap:
             ok, frame = self._cap.read()
-            return frame if ok and frame is not None else None
+            if not ok or frame is None:
+                return None
+            self.received += 1
+            return frame
         while True:
             if not self._cap.grab():
                 return None
+            self.received += 1
             now = time.monotonic()
             if now - self._last_frame_at < self._min_gap:
                 continue

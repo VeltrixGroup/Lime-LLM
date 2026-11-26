@@ -76,9 +76,12 @@ class _MicroBatcher:
         self._max_batch = max_batch
         #: Rest after a shared batch, as a share of its run time (0 = never).
         self._rest_share = rest_share
-        #: Seconds spent running batches / resting between them (for stats).
+        #: Seconds spent running batches / resting between them, and how many
+        #: batches / items went through (for the load report).
         self.busy_sec = 0.0
         self.rest_sec = 0.0
+        self.batches = 0
+        self.items = 0
         self._q: queue.Queue[tuple[Any, concurrent.futures.Future]] = queue.Queue()
         self._thread = threading.Thread(target=self._loop, name=name, daemon=True)
         self._thread.start()
@@ -107,6 +110,8 @@ class _MicroBatcher:
                 fut.set_result(result)
             took = time.monotonic() - started
             self.busy_sec += took
+            self.batches += 1
+            self.items += len(batch)
             # One frame at a time means the model is keeping up: no rest then,
             # so a lone camera never waits.
             if self._rest_share > 0 and len(batch) > 1:
@@ -215,6 +220,28 @@ def _get_engine(weights: str, device: str, imgsz: int, optimize: str = "off") ->
             engine = _DetectionEngine(weights, device, imgsz, optimize)
             _ENGINES[key] = engine
         return engine
+
+
+def engine_stats() -> list[dict[str, Any]]:
+    """Running totals of every shared detector in this process.
+
+    The load report turns two readings of these into "busy 76% of the time,
+    9 batches a second of 14 frames" (see :mod:`storeguard.dashboard.load`).
+    """
+    with _ENGINES_LOCK:
+        engines = list(_ENGINES.values())
+    return [
+        {
+            "model": engine.weights,
+            "device": engine.device,
+            "runtime": engine.runtime,
+            "busy_sec": engine._batcher.busy_sec,
+            "rest_sec": engine._batcher.rest_sec,
+            "batches": engine._batcher.batches,
+            "frames": engine._batcher.items,
+        }
+        for engine in engines
+    ]
 
 
 def _log_device_once(device: str, weights: str) -> None:
@@ -348,6 +375,10 @@ class PersonTracker:
         self._static_boxes: list[tuple[float, tuple[float, float, float, float]]] = []
         self._frame_no = 0
         self._clock = 0.0
+        #: Did the last frame show anyone who might be a person? True for a
+        #: track that isn't a suppressed static object (even before
+        #: ``min_hits``) and for a fresh confident detection.
+        self.saw_someone = True
 
     @property
     def model(self) -> YOLO:
@@ -381,26 +412,61 @@ class PersonTracker:
             Tracks younger than ``min_hits`` frames, and tracks judged to be
             static objects, are skipped.
         """
-        import time
-
         now = time.monotonic() if ts is None else float(ts)
-        self._frame_no += 1
         dets = self._engine.detect(frame, (0,), _LOW_CONF)
         dets = self._drop_tiny(dets, frame.shape[:2])
+        return self._advance(dets, frame, now)
+
+    def skip(self, frame: np.ndarray, ts: float | None = None) -> list[Track]:
+        """Account for a frame the detector was *not* shown.
+
+        Used when a camera is idle (``DetectorCfg.skip_idle``): nobody in
+        view, nothing moving. The frame counts exactly as one on which the
+        detector found nobody, so lost tracks keep ageing and are forgotten
+        on schedule — a track kept alive across a long idle stretch could
+        hand its id (and the identity behind it) to the next person who walks
+        in at the same spot.
+        """
+        now = time.monotonic() if ts is None else float(ts)
+        return self._advance(np.zeros((0, 6), dtype=np.float32), frame, now)
+
+    def _advance(self, dets: np.ndarray, frame: np.ndarray, now: float) -> list[Track]:
+        self._frame_no += 1
         boxes = Boxes(dets, frame.shape[:2])
         with _TRACK_LOCK:
             out = self._tracker.update(boxes, frame)
 
         tracks: list[Track] = []
+        live = False
         for row in out:
             x1, y1, x2, y2, tid, score = (float(v) for v in row[:6])
             box = (x1, y1, x2, y2)
             info = self._observe(int(tid), box, score, now)
+            live = live or not info.suppressed
             if info.suppressed or info.hits < max(1, self.cfg.min_hits):
                 continue
             tracks.append(Track(track_id=int(tid), box=box, conf=score))
         self._forget_old()
+        self.saw_someone = live or self._fresh_detection(dets)
         return tracks
+
+    def _fresh_detection(self, dets: np.ndarray) -> bool:
+        """A confident detection that is not one of the remembered static objects.
+
+        Tells "someone may be there" a frame or two before a track exists.
+        A mediocre box right where a static false positive sits (a mannequin,
+        a bottle) doesn't count, or such a camera would never be idle.
+        """
+        for row in dets:
+            score = float(row[4])
+            if score < float(self.cfg.conf):
+                continue
+            if score >= self.static_max_conf:
+                return True
+            box = (float(row[0]), float(row[1]), float(row[2]), float(row[3]))
+            if not any(_iou(box, sbox) >= self.static_iou for _, sbox in self._static_boxes):
+                return True
+        return False
 
     def appearance_encoder(self) -> "AppearanceEncoder | None":
         """The shared cross-camera ReID encoder (``None`` if unavailable)."""

@@ -29,6 +29,7 @@ from storeguard.cloud.agent_client import CloudClient
 from storeguard.config import ActionCfg, DetectorCfg
 from storeguard.dashboard.alerting import DashboardAlertSink, build_cloud_client, delivery_loop
 from storeguard.dashboard.context import StoreContext
+from storeguard.dashboard.load import LoadMonitor, one_line, write_report
 from storeguard.dashboard.pipeline import DetectionSession, SessionStats
 from storeguard.geometry import Zone
 from storeguard.reid import IdentityRegistry
@@ -43,6 +44,11 @@ MAX_CAMERAS = 16
 #: WebSocket frame protocol relies on this: every binary message is the
 #: 12-byte session id followed by the JPEG bytes.
 _SESSION_ID_LEN = 12
+
+#: The load report (``storeguard load``) is refreshed this often, and written
+#: to the log every :data:`_LOAD_LOG_EVERY`-th time while cameras run.
+_LOAD_EVERY_SEC = 10.0
+_LOAD_LOG_EVERY = 30
 
 #: Frames per second sent for a camera the viewer only sees as a small tile.
 #: The cabinet says which camera it shows large (``{"focus": id}``); only that
@@ -204,6 +210,8 @@ def _stats_payload(session: DetectionSession) -> dict:
         "filename": s.filename,
         "people": s.people,
         "fps": s.fps,
+        "camera_fps": getattr(s, "camera_fps", 0.0),
+        "detect_fps": getattr(s, "detect_fps", 0.0),
         "frame": s.frame,
         "total_frames": s.total_frames,
         "tracks": s.tracks,
@@ -267,9 +275,30 @@ def create_app(
     videos_root.mkdir(parents=True, exist_ok=True)
     zone_list = list(zones or [])
 
+    def _load_loop() -> None:
+        """Keep the load report fresh (see :mod:`storeguard.dashboard.load`)."""
+        monitor = LoadMonitor()
+        rounds = 0
+        while not app.state.load_stop.wait(_LOAD_EVERY_SEC):
+            with app.state.session_lock:
+                sessions = list(app.state.sessions.values())
+            try:
+                report = monitor.sample(sessions)
+                app.state.load_report = report
+                write_report(app.state.data_dir, report)
+            except Exception:  # noqa: BLE001 — a report must never hurt detection
+                continue
+            rounds += 1
+            if sessions and rounds % _LOAD_LOG_EVERY == 0:
+                print(one_line(report), flush=True)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        app.state.load_stop.clear()
+        load_thread = threading.Thread(target=_load_loop, name="dashboard-load", daemon=True)
+        load_thread.start()
         yield
+        app.state.load_stop.set()
         # Stopping sessions joins worker threads (up to 5s each); do it off the
         # event loop so shutdown doesn't block the loop.
         await run_in_threadpool(_replace_sessions, [])
@@ -295,6 +324,8 @@ def create_app(
     # All live sessions keyed by id, in creation order (up to MAX_CAMERAS).
     app.state.sessions: dict[str, DetectionSession] = {}
     app.state.session_lock = threading.Lock()
+    app.state.load_stop = threading.Event()
+    app.state.load_report = None
 
     # Shoplifting-event delivery: every session hands raised events to this
     # queue; one shared thread drains it so clip encoding + cloud/Telegram
@@ -430,6 +461,11 @@ def create_app(
                 "sessions": [_stats_payload(s) for s in sessions],
             }
         )
+
+    @app.get("/api/load")
+    def load_report() -> JSONResponse:
+        """The newest load reading (what ``storeguard load`` prints)."""
+        return JSONResponse(app.state.load_report or {"cameras": [], "notes": ["No reading yet."]})
 
     @app.post("/api/sessions/stop")
     def stop_all_sessions() -> JSONResponse:
@@ -772,6 +808,7 @@ def create_app(
         """
         await ws.accept()
         last_sent: dict[str, int] = {}
+        thumb_sent: dict[str, int] = {}
         sent_at: dict[str, float] = {}
         # ?mode=meta: raw frames + overlay metadata (the cabinet draws boxes
         # itself), plus the live event feed as text messages.
@@ -820,6 +857,7 @@ def create_app(
                     if known not in live_ids:
                         del last_sent[known]
                         sent_at.pop(known, None)
+                        thumb_sent.pop(known, None)
                 now = time.monotonic()
                 sent_any = False
                 for session in sessions:
@@ -844,11 +882,19 @@ def create_app(
                         is_tile = focus["known"] and session.id != focus["id"]
                         if is_tile and now - sent_at.get(session.id, -1e9) < 1.0 / _TILE_FPS:
                             continue
-                        res = session.peek_meta(last_sent.get(session.id, 0))
-                        if res is None:
-                            continue
-                        jpeg, meta, seq = res
-                        last_sent[session.id] = seq
+                        # ...and a thumbnail is all a tile needs.
+                        peek_thumb = getattr(session, "peek_thumb", None) if is_tile else None
+                        if peek_thumb is not None:
+                            res = peek_thumb(thumb_sent.get(session.id, 0))
+                            if res is None:
+                                continue
+                            jpeg, meta, thumb_sent[session.id] = res
+                        else:
+                            res = session.peek_meta(last_sent.get(session.id, 0))
+                            if res is None:
+                                continue
+                            jpeg, meta, seq = res
+                            last_sent[session.id] = seq
                         sent_at[session.id] = now
                         blob = json.dumps(meta).encode("utf-8")
                         await ws.send_bytes(
