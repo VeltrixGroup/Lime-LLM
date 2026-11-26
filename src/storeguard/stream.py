@@ -9,6 +9,12 @@ and :meth:`VideoStream.read` returns the newest decoded frame, dropping any
 the caller was too slow for. Without it, a consumer slower than the camera
 (detection on a busy machine) reads from FFmpeg's ever-growing backlog, so
 the picture falls further and further behind real time.
+
+With ``max_fps`` a live source hands out only about that many frames a
+second. Nobody needs a person detected 25 times a second, and every frame
+handed out costs a full detection pass (CPU and GPU) — at the camera's own
+rate one camera could keep a whole CPU core and the graphics card busy, and
+the rest of the PC (the browser showing the control panel included) crawled.
 """
 
 from __future__ import annotations
@@ -23,6 +29,18 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 import cv2
 import numpy as np
+
+
+def min_frame_gap(max_fps: float) -> float:
+    """Seconds that must pass between two frames for a ``max_fps`` limit.
+
+    A quarter shorter than ``1 / max_fps`` on purpose: frames arrive on the
+    camera's own clock, so with an exact gap a 25 fps camera limited to 12
+    would pass only every *third* frame (80 ms is just under 83 ms). With the
+    slack it passes every second one — evenly spaced, 12.5 a second. ``0``
+    (or less) means no limit.
+    """
+    return 0.75 / max_fps if max_fps and max_fps > 0 else 0.0
 
 
 def _open_ffmpeg(source: str) -> cv2.VideoCapture:
@@ -54,7 +72,11 @@ class VideoStream:
     """cv2.VideoCapture wrapper: RTSP (with auto-reconnect) or video file."""
 
     def __init__(
-        self, source: str, reconnect_sec: float = 5.0, latest_only: bool = False
+        self,
+        source: str,
+        reconnect_sec: float = 5.0,
+        latest_only: bool = False,
+        max_fps: float = 0.0,
     ) -> None:
         """Open ``source`` (RTSP URL or video file path).
 
@@ -62,12 +84,17 @@ class VideoStream:
         reopen is attempted no sooner than ``reconnect_sec`` seconds later;
         meanwhile :meth:`read` returns ``None``. ``latest_only`` (ignored for
         files) decodes on a background thread and always hands out the
-        newest frame — see the module docstring.
+        newest frame — see the module docstring. ``max_fps`` (ignored for
+        files, ``0`` = no limit) hands out about that many frames a second
+        at most; the frames in between are decoded but never converted to
+        an image, so skipping them is cheap.
         """
         self.source = source
         self.reconnect_sec = reconnect_sec
         self._is_file = Path(source).is_file()
         self._is_rtsp = source.lower().startswith("rtsp://")
+        self._min_gap = 0.0 if self._is_file else min_frame_gap(max_fps)
+        self._last_frame_at = -1e18  # monotonic time of the last frame handed out
         self._cap: cv2.VideoCapture | None = None
         self._next_reconnect: float = 0.0  # monotonic deadline for next reopen
         self._open()
@@ -159,8 +186,8 @@ class VideoStream:
             if self._cap is None:
                 return None
 
-        ok, frame = self._cap.read()
-        if ok and frame is not None:
+        frame = self._next_frame()
+        if frame is not None:
             return frame
 
         if self._is_file:
@@ -171,6 +198,30 @@ class VideoStream:
         self._cap = None
         self._next_reconnect = time.monotonic() + self.reconnect_sec
         return None
+
+    def _next_frame(self) -> np.ndarray | None:
+        """The next frame of the open capture (``None``: read failed / EOF).
+
+        Under a ``max_fps`` limit, frames that come too soon after the last
+        one are only *grabbed*: the decoder has to see every frame to stay in
+        step with the stream, but the costly part — converting the picture
+        to a BGR image, megabytes per frame — is skipped for them.
+        """
+        assert self._cap is not None
+        if not self._min_gap:
+            ok, frame = self._cap.read()
+            return frame if ok and frame is not None else None
+        while True:
+            if not self._cap.grab():
+                return None
+            now = time.monotonic()
+            if now - self._last_frame_at < self._min_gap:
+                continue
+            ok, frame = self._cap.retrieve()
+            if not ok or frame is None:
+                return None
+            self._last_frame_at = now
+            return frame
 
     def release(self) -> None:
         """Release the underlying capture (safe to call more than once)."""

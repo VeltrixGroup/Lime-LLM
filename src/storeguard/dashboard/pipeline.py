@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import cv2
@@ -32,7 +33,7 @@ from storeguard.scenarios.exit_no_pay import ExitNoPayScenario
 from storeguard.scenarios.idle import IdleScenario
 from storeguard.scenarios.phone import PhoneScenario
 from storeguard.staff import Observation, zone_kind
-from storeguard.stream import VideoStream
+from storeguard.stream import VideoStream, min_frame_gap
 from storeguard.types import Event, Track
 
 # BGR colors
@@ -51,6 +52,42 @@ _PREVIEW_MAX_WIDTH = 960
 #: would otherwise be resized, drawn and JPEG-encoded 25 times a second per
 #: camera, though nobody sees the difference past ~12 fps in a browser tile.
 _PREVIEW_MAX_FPS = 12
+_PREVIEW_MIN_GAP = min_frame_gap(_PREVIEW_MAX_FPS)
+
+#: JPEG quality of the preview-size frames kept for evidence clips (and sent,
+#: as they are, to the cabinet's live view).
+_FRAME_JPEG_QUALITY = 85
+
+#: Frame rate the frame-counted settings were tuned at (track_buffer, the
+#: action model's clip stride). With ``DetectorCfg.max_fps`` a live camera
+#: is analysed less often, so those counts are scaled to mean the same time.
+_NOMINAL_CAMERA_FPS = 25.0
+
+
+def _encode_jpeg(image: np.ndarray, quality: int = _FRAME_JPEG_QUALITY) -> bytes | None:
+    ok, buf = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return buf.tobytes() if ok else None
+
+
+class JpegFrames(Sequence):
+    """Frames kept as JPEG bytes; each one is decoded only when it is read.
+
+    The evidence ring holds the last ~15 s of every camera. As raw images
+    that was ~600 MB of RAM per camera, all the time, for clips that are
+    written a few times a day; as JPEG it is ~20 MB. Reads like a list of BGR
+    frames, so the clip writer needs no changes.
+    """
+
+    def __init__(self, jpegs: list[bytes]) -> None:
+        self._jpegs = jpegs
+
+    def __len__(self) -> int:
+        return len(self._jpegs)
+
+    def __getitem__(self, index):  # noqa: ANN001, ANN204 — int or slice, like a list
+        if isinstance(index, slice):
+            return JpegFrames(self._jpegs[index])
+        return cv2.imdecode(np.frombuffer(self._jpegs[index], dtype=np.uint8), cv2.IMREAD_COLOR)
 
 
 def _resize_for_preview(frame: np.ndarray) -> np.ndarray:
@@ -82,7 +119,14 @@ def _scale_tracks(tracks: list[Track], scale: float) -> list[Track]:
 _ACTION_CLASSIFY_EVERY = 4
 
 
-def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | None) -> list:
+def _scaled(count: int, rate: float) -> int:
+    """A frame count tuned for every frame, for a camera analysed at ``rate``."""
+    return max(1, round(count * rate))
+
+
+def build_action_scenarios(
+    camera: str, zones: list[Zone], action: ActionCfg | None, rate: float = 1.0
+) -> list:
     """``pocket`` / ``take_cash`` scenarios for one live camera, if a model exists.
 
     Live-view cameras come from the cabinet with zones but no scenario list,
@@ -93,6 +137,11 @@ def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | N
       (everyone is checked);
     * ``take_cash`` (cash out of the register) — only on cameras with a
       ``register*`` zone, so ordinary shoppers are never classified as that.
+
+    ``rate`` is how often this camera is analysed compared to every frame
+    (0.5 = every second frame): the clip stride and the classify interval are
+    counted in analysed frames, so they shrink with it and a clip still covers
+    the same stretch of time the model was trained on.
 
     Returns ``[]`` when ``models/action.pt`` (``action.weights``) is missing;
     the model itself is loaded once per process and shared by all cameras.
@@ -115,8 +164,11 @@ def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | N
     def buf() -> ClipBuffer:
         # One buffer per scenario: a shared one would be fed twice per frame
         # and its stride would silently halve.
-        return ClipBuffer(clip_len=action.clip_len, stride=action.stride, size=action.size)
+        return ClipBuffer(
+            clip_len=action.clip_len, stride=_scaled(action.stride, rate), size=action.size
+        )
 
+    classify_every = _scaled(_ACTION_CLASSIFY_EVERY, rate)
     scenarios: list = []
     if want_pocket:
         scenarios.append(
@@ -124,7 +176,7 @@ def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | N
                 camera, model, buf(),
                 threshold=action.thresholds.get("pocket", 0.75),
                 zones=zones or None,
-                classify_every=_ACTION_CLASSIFY_EVERY,
+                classify_every=classify_every,
             )
         )
     if has_register:
@@ -133,7 +185,7 @@ def build_action_scenarios(camera: str, zones: list[Zone], action: ActionCfg | N
                 camera, model, buf(),
                 threshold=action.thresholds.get("take_cash", 0.80),
                 zones=zones,
-                classify_every=_ACTION_CLASSIFY_EVERY,
+                classify_every=classify_every,
             )
         )
     return scenarios
@@ -309,6 +361,11 @@ class DetectionSession:
         self.detector_cfg = detector
         self.process_every = max(1, int(process_every))
         self._is_url = source.lower().startswith(("rtsp://", "http://", "https://"))
+        #: Live cameras are analysed at most ``detector.max_fps`` times a
+        #: second (files: every frame). ``_rate`` is that as a share of a
+        #: usual 25 fps camera, for settings counted in frames.
+        self._max_fps = float(detector.max_fps) if self._is_url else 0.0
+        self._rate = min(1.0, self._max_fps / _NOMINAL_CAMERA_FPS) if self._max_fps > 0 else 1.0
         #: Hard frames for re-training — live cameras only (a looping test
         #: video would just save the same frames again and again).
         self._hard = (
@@ -377,8 +434,8 @@ class DetectionSession:
             is_paid=self._registry.is_paid,
         )
         self._alert_queue = alert_queue
-        # (ts, raw frame) pairs from the last ~_CLIP_SECONDS, for evidence clips.
-        self._ring: deque[tuple[float, np.ndarray]] = deque()
+        # (ts, preview-size JPEG) pairs from the last ~_CLIP_SECONDS, for evidence clips.
+        self._ring: deque[tuple[float, bytes]] = deque()
 
     @property
     def stats(self) -> SessionStats:
@@ -465,16 +522,16 @@ class DetectionSession:
 
     def snapshot(self) -> bytes | None:
         """The newest raw frame as JPEG (the "Снимок" button)."""
-        if not self._ring and self._last_raw is None:
-            return None
-        raw = self._last_raw if self._last_raw is not None else self._ring[-1][1]
-        ok, buf = cv2.imencode(".jpg", raw, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-        return buf.tobytes() if ok else None
+        raw = self._last_raw
+        if raw is not None:
+            return _encode_jpeg(raw, 92)
+        ring = list(self._ring)
+        return ring[-1][1] if ring else None
 
-    def recent_frames(self) -> tuple[list[np.ndarray], float | None]:
-        """The buffered last ~15 s of raw frames and their real fps."""
+    def recent_frames(self) -> tuple[Sequence[np.ndarray], float | None]:
+        """The buffered last ~15 s of frames and their real fps."""
         snapshot = list(self._ring)
-        frames = [f for _, f in snapshot]
+        frames = JpegFrames([j for _, j in snapshot])
         fps = None
         if len(snapshot) >= 2 and snapshot[-1][0] > snapshot[0][0]:
             fps = (len(snapshot) - 1) / (snapshot[-1][0] - snapshot[0][0])
@@ -489,9 +546,9 @@ class DetectionSession:
             return text.replace(self.source, self.filename)
         return text
 
-    def _append_ring(self, ts: float, frame: np.ndarray) -> None:
-        """Buffer one processed frame, trimmed to the last ``_CLIP_SECONDS``."""
-        self._ring.append((ts, frame))
+    def _append_ring(self, ts: float, jpeg: bytes) -> None:
+        """Buffer one processed frame (as JPEG), trimmed to the last ``_CLIP_SECONDS``."""
+        self._ring.append((ts, jpeg))
         while len(self._ring) > 1 and (
             ts - self._ring[0][0] > _CLIP_SECONDS or len(self._ring) > _RING_MAX_FRAMES
         ):
@@ -510,7 +567,8 @@ class DetectionSession:
         if self._alert_queue is None:
             return
         snapshot = list(self._ring)
-        frames = [f for _, f in snapshot]
+        # Decoded by the delivery thread while it writes the clip, not here.
+        frames = JpegFrames([j for _, j in snapshot])
         fps = None
         if len(snapshot) >= 2:
             duration = snapshot[-1][0] - snapshot[0][0]
@@ -668,7 +726,13 @@ class DetectionSession:
 
     def _run(self) -> None:
         try:
-            self._tracker = _build_tracker(self.detector_cfg)
+            # track_buffer counts analysed frames: keep it the same in seconds.
+            tracker_cfg = self.detector_cfg
+            if self._rate < 1.0:
+                tracker_cfg = tracker_cfg.model_copy(
+                    update={"track_buffer": _scaled(tracker_cfg.track_buffer, self._rate)}
+                )
+            self._tracker = _build_tracker(tracker_cfg)
             self._tracker.reset()
             # Test doubles and older trackers have no ReID model: fall back
             # to colour histograms inside CameraIdentities.
@@ -678,7 +742,7 @@ class DetectionSession:
                 self._registry, encoder.encode if encoder is not None else None
             )
             self._action_scenarios = build_action_scenarios(
-                self.filename, self._zones, self._action_cfg
+                self.filename, self._zones, self._action_cfg, self._rate
             )
             detect_phones = getattr(self._tracker, "detect_phones", None)
             if detect_phones is not None:
@@ -723,7 +787,9 @@ class DetectionSession:
         # Live cameras: always detect on the newest frame instead of working
         # through a backlog that grows whenever detection is slower than the
         # camera (which made the view lag further and further behind).
-        stream = VideoStream(self.source, latest_only=self._is_url)
+        # ...and at most max_fps of them a second: analysing every frame of a
+        # 25 fps camera doubled the CPU and GPU load for no better tracking.
+        stream = VideoStream(self.source, latest_only=self._is_url, max_fps=self._max_fps)
         is_file = stream.is_file and not self._is_url
         src_fps = stream.fps
         frame_delay = 1.0 / src_fps if is_file else 0.0
@@ -787,6 +853,10 @@ class DetectionSession:
                 else:
                     ts = time.time()
 
+                # This frame at preview size, raw and as JPEG — made once, used
+                # by the evidence ring and by the live view.
+                small: np.ndarray | None = None
+                small_jpeg: bytes | None = None
                 every = self.process_every
                 if (frame_idx - 1) % every == 0:
                     assert self._tracker is not None and self._identities is not None
@@ -825,11 +895,13 @@ class DetectionSession:
                             with self._lock:
                                 self._stats.error = f"{sc.kind} detection failed: {exc}"
                     new_events += self._analyse(frame, tracks, statuses, ts)
-                    # Evidence ring: preview-size frames (full 1080p frames
-                    # would cost ~3 GB per camera); keep the newest raw frame
-                    # for full-quality snapshots.
+                    # Evidence ring: preview-size JPEGs (see JpegFrames); keep
+                    # the newest raw frame for full-quality snapshots.
                     self._last_raw = frame
-                    self._append_ring(ts, _resize_for_preview(frame))
+                    small = _resize_for_preview(frame)
+                    small_jpeg = _encode_jpeg(small)
+                    if small_jpeg is not None:
+                        self._append_ring(ts, small_jpeg)
                     if new_events:
                         for ev in new_events:
                             if ev.kind in ("exit_no_pay", "pocket", "take_cash"):
@@ -857,12 +929,13 @@ class DetectionSession:
                 want_raw = self.meta_viewers > 0
                 now_p = time.monotonic()
                 encode = (want_annotated or want_raw) and (
-                    is_file or now_p - self._last_preview >= 1.0 / _PREVIEW_MAX_FPS
+                    is_file or now_p - self._last_preview >= _PREVIEW_MIN_GAP
                 )
                 jpeg = raw_jpeg = None
                 if encode:
                     self._last_preview = now_p
-                    small = _resize_for_preview(frame)
+                    if small is None:
+                        small = _resize_for_preview(frame)
                     if want_annotated:
                         scale = small.shape[1] / frame.shape[1]
                         preview = draw_person_overlays(
@@ -876,10 +949,7 @@ class DetectionSession:
                         )
                         jpeg = buf.tobytes() if ok_enc else None
                     if want_raw:
-                        ok_raw, raw_buf = cv2.imencode(
-                            ".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-                        )
-                        raw_jpeg = raw_buf.tobytes() if ok_raw else None
+                        raw_jpeg = small_jpeg if small_jpeg is not None else _encode_jpeg(small)
                 people_status = [
                     PersonStatus(
                         track_id=t.track_id,
